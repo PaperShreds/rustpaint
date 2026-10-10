@@ -1,4 +1,5 @@
-use crate::mesh::{Mesh, Vertex, primitives};
+use crate::mesh::{primitives, Material, Mesh, SubMesh, Vertex};
+use crate::renderer::texture;
 use eframe::egui;
 use eframe::egui_wgpu::wgpu::util::DeviceExt as _;
 use eframe::egui_wgpu::{self, wgpu};
@@ -13,14 +14,21 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+struct GpuMaterial {
+    bind_group: wgpu::BindGroup,
+}
+
 /// GPU resources for the viewport. Lives inside egui's callback resources.
 pub struct ViewportRenderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    material_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    index_count: u32,
+    submeshes: Vec<SubMesh>,
+    materials: Vec<GpuMaterial>,
 }
 
 fn create_mesh_buffers(device: &wgpu::Device, mesh: &Mesh) -> (wgpu::Buffer, wgpu::Buffer) {
@@ -37,16 +45,60 @@ fn create_mesh_buffers(device: &wgpu::Device, mesh: &Mesh) -> (wgpu::Buffer, wgp
     (vertex_buffer, index_buffer)
 }
 
-/// Replaces the mesh shown in the viewport.
+fn create_gpu_materials(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    materials: &[Material],
+) -> Vec<GpuMaterial> {
+    materials
+        .iter()
+        .map(|material| {
+            let texture = texture::create_texture(device, queue, &material.base_color);
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("material_bind_group"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+            GpuMaterial { bind_group }
+        })
+        .collect()
+}
+
+/// Replaces the mesh (and its materials) shown in the viewport.
 pub fn upload_mesh(render_state: &egui_wgpu::RenderState, mesh: &Mesh) {
-    let (vertex_buffer, index_buffer) = create_mesh_buffers(&render_state.device, mesh);
+    let device = &render_state.device;
+    let queue = &render_state.queue;
+    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, mesh);
 
     let mut renderer = render_state.renderer.write();
-    if let Some(viewport) = renderer.callback_resources.get_mut::<ViewportRenderer>() {
-        viewport.vertex_buffer = vertex_buffer;
-        viewport.index_buffer = index_buffer;
-        viewport.index_count = mesh.indices.len() as u32;
-    }
+    let Some(viewport) = renderer.callback_resources.get_mut::<ViewportRenderer>() else {
+        return;
+    };
+
+    let materials = create_gpu_materials(
+        device,
+        queue,
+        &viewport.material_layout,
+        &viewport.sampler,
+        &mesh.materials,
+    );
+
+    viewport.vertex_buffer = vertex_buffer;
+    viewport.index_buffer = index_buffer;
+    viewport.submeshes = mesh.submeshes.clone();
+    viewport.materials = materials;
 }
 
 /// Call once at startup, from the eframe creation closure.
@@ -56,13 +108,10 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
         return;
     };
     let device = &render_state.device;
+    let queue = &render_state.queue;
 
     let depth_format = egui_wgpu::depth_format_from_bits(DEPTH_BUFFER_BITS, 0)
         .expect("unsupported depth buffer bit count");
-
-    // --- Mesh data on the GPU ---
-    let mesh = primitives::cube();
-    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, &mesh);
 
     // --- Camera uniform ---
     let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -96,6 +145,30 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
         }],
     });
 
+    // --- Material layout: one texture + one sampler per material ---
+    let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("material_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let sampler = texture::create_sampler(device);
+
     // --- Pipeline ---
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mesh_shader"),
@@ -104,7 +177,7 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("viewport_pipeline_layout"),
-        bind_group_layouts: &[Some(&camera_layout)],
+        bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
         immediate_size: 0,
     });
 
@@ -113,6 +186,12 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &attributes,
+    };
+
+    let fragment_entry = if render_state.target_format.is_srgb() {
+        "fs_main_linear_framebuffer"
+    } else {
+        "fs_main_gamma_framebuffer"
     };
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -126,7 +205,7 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry),
             targets: &[Some(render_state.target_format.into())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
@@ -146,6 +225,11 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
         cache: None,
     });
 
+    // --- Initial mesh: the checkerboard cube ---
+    let mesh = primitives::cube();
+    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, &mesh);
+    let materials = create_gpu_materials(device, queue, &material_layout, &sampler, &mesh.materials);
+
     render_state
         .renderer
         .write()
@@ -154,9 +238,12 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
             pipeline,
             camera_buffer,
             camera_bind_group,
+            material_layout,
+            sampler,
             vertex_buffer,
             index_buffer,
-            index_count: mesh.indices.len() as u32,
+            submeshes: mesh.submeshes,
+            materials,
         });
 }
 
@@ -199,6 +286,12 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         render_pass.set_bind_group(0, &renderer.camera_bind_group, &[]);
         render_pass.set_vertex_buffer(0, renderer.vertex_buffer.slice(..));
         render_pass.set_index_buffer(renderer.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        render_pass.draw_indexed(0..renderer.index_count, 0, 0..1);
+
+        for submesh in &renderer.submeshes {
+            if let Some(material) = renderer.materials.get(submesh.material) {
+                render_pass.set_bind_group(1, &material.bind_group, &[]);
+                render_pass.draw_indexed(submesh.indices.clone(), 0, 0..1);
+            }
+        }
     }
 }

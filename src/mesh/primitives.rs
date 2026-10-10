@@ -1,7 +1,7 @@
-use super::{Mesh, Vertex};
+use super::{Image, Material, Mesh, SubMesh, Vertex};
 use glam::Vec3;
 
-/// A unit cube with 24 vertices (4 per face, so each face gets its own normals and UVs).
+/// A unit cube with 24 vertices and one checkerboard material.
 pub fn cube() -> Mesh {
     // (normal, u axis, v axis). u × v == normal gives counter-clockwise winding.
     let faces = [
@@ -12,7 +12,6 @@ pub fn cube() -> Mesh {
         (Vec3::Y, Vec3::X, Vec3::NEG_Z),
         (Vec3::NEG_Y, Vec3::X, Vec3::Z),
     ];
-    // (u sign, v sign, uv coordinate); image-style UVs have v pointing down.
     let corners = [
         (-1.0_f32, -1.0_f32, [0.0_f32, 1.0_f32]),
         (1.0, -1.0, [1.0, 1.0]),
@@ -36,5 +35,34 @@ pub fn cube() -> Mesh {
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
-    Mesh { vertices, indices }
+    let index_count = indices.len() as u32;
+    Mesh {
+        vertices,
+        indices,
+        submeshes: vec![SubMesh {
+            indices: 0..index_count,
+            material: 0,
+        }],
+        materials: vec![Material {
+            name: "Checker".to_string(),
+            base_color: checker_image(256, 8),
+        }],
+    }
+}
+
+fn checker_image(size: u32, cells: u32) -> Image {
+    let cell = size / cells;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let light = (x / cell + y / cell) % 2 == 0;
+            let v = if light { 217 } else { 115 };
+            rgba.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    Image {
+        width: size,
+        height: size,
+        rgba,
+    }
 }
