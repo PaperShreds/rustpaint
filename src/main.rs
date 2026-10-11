@@ -1,4 +1,6 @@
 mod app;
+mod document;
+mod export;
 mod mesh;
 mod painting;
 mod project;

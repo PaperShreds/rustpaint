@@ -10,8 +10,10 @@
 //! blended from the image as it was when the stroke started. Overlapping
 //! segments of one stroke therefore never darken each other.
 
+use crate::document::{CLEAR, Change, Document, Layer, Tile};
 use crate::mesh::{Image, ImageRegion, Mesh, linear_to_srgb, srgb_to_linear};
 use crate::painting::brush::Brush;
+use crate::painting::history;
 use crate::renderer::camera::OrbitCamera;
 use egui::{Pos2, Rect};
 use glam::{Mat4, Vec2, Vec3, Vec4};
@@ -73,31 +75,103 @@ struct SurfaceHit {
     normal: Vec3,
 }
 
-/// One continuous brush stroke on one texture set.
-pub struct Stroke {
-    material: usize,
-    /// The texture as it was before the stroke started.
+/// What a stroke remembers about one material slot it painted on.
+struct SlotStroke {
+    width: u32,
+    height: u32,
+    /// The layer texture as it was before the stroke started.
     original: Vec<u8>,
+    /// Which history tiles the stroke changed, row by row.
+    touched_tiles: Vec<bool>,
     /// Highest brush coverage (0..1) each texel received during this stroke.
     coverage: Vec<f32>,
+}
+
+impl SlotStroke {
+    fn new(image: &Image) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            original: image.rgba.clone(),
+            touched_tiles: vec![false; (tiles_x(image.width) * tiles_y(image.height)) as usize],
+            coverage: vec![0.0; image.rgba.len() / 4],
+        }
+    }
+
+    /// The pixels of every touched tile, as they were before the stroke.
+    fn into_tiles(self) -> Vec<Tile> {
+        let columns = tiles_x(self.width);
+        self.touched_tiles
+            .iter()
+            .enumerate()
+            .filter(|(_, touched)| **touched)
+            .map(|(index, _)| {
+                let (tile_x, tile_y) = (index as u32 % columns, index as u32 / columns);
+                let region = ImageRegion {
+                    x: tile_x * history::TILE_SIZE,
+                    y: tile_y * history::TILE_SIZE,
+                    width: history::TILE_SIZE.min(self.width - tile_x * history::TILE_SIZE),
+                    height: history::TILE_SIZE.min(self.height - tile_y * history::TILE_SIZE),
+                };
+                let row_bytes = (region.width * 4) as usize;
+                let mut pixels = Vec::with_capacity(row_bytes * region.height as usize);
+                for y in region.y..region.y + region.height {
+                    let start = ((y * self.width + region.x) * 4) as usize;
+                    pixels.extend_from_slice(&self.original[start..start + row_bytes]);
+                }
+                Tile { region, pixels }
+            })
+            .collect()
+    }
+}
+
+/// One continuous brush stroke into one layer, on every slot the layer targets.
+pub struct Stroke {
+    layer: u64,
+    /// Per material slot, created when the stroke first reaches that slot.
+    slots: Vec<Option<SlotStroke>>,
     /// When the brush may not paint over edges: which triangles belong to the
     /// face the stroke started on. Found on the first segment that hits the model.
     face: Option<Vec<bool>>,
 }
 
 impl Stroke {
-    pub fn begin(mesh: &Mesh, material: usize) -> Option<Self> {
-        let image = &mesh.materials.get(material)?.base_color;
+    /// Starts a stroke on the layer at `layer_index`. The base layer can't be painted.
+    pub fn begin(document: &Document, layer_index: usize) -> Option<Self> {
+        let layer = document.layers.get(layer_index)?;
+        if layer.is_base() {
+            return None;
+        }
         Some(Self {
-            material,
-            original: image.rgba.clone(),
-            coverage: vec![0.0; image.rgba.len() / 4],
+            layer: layer.id,
+            slots: (0..document.mesh.materials.len()).map(|_| None).collect(),
             face: None,
         })
     }
 
-    pub fn material(&self) -> usize {
-        self.material
+    /// Whether the stroke has changed any pixels yet.
+    pub fn has_changes(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.touched_tiles.contains(&true))
+    }
+
+    /// Ends the stroke. Returns the changes that undo it (empty if nothing changed).
+    pub fn finish(self) -> Vec<Change> {
+        let layer = self.layer;
+        self.slots
+            .into_iter()
+            .enumerate()
+            .filter_map(|(material, slot)| {
+                let tiles = slot?.into_tiles();
+                (!tiles.is_empty()).then_some(Change::Pixels {
+                    layer,
+                    material,
+                    tiles,
+                })
+            })
+            .collect()
     }
 
     fn allows(&self, triangle: u32) -> bool {
@@ -194,35 +268,40 @@ impl StrokePainter {
         self.viewport == viewport && self.view_proj == camera.view_proj(aspect(viewport))
     }
 
-    /// Paints one segment of `stroke` between two screen positions (in points)
-    /// and returns the texel region that changed.
+    /// Paints one segment of `stroke` into `layer` between two screen
+    /// positions (in points). `slot_sizes` gives each slot's texture size.
+    /// Returns the texel region that changed in each slot.
     pub fn paint_segment(
         &self,
         stroke: &mut Stroke,
-        mesh: &mut Mesh,
+        layer: &mut Layer,
+        slot_sizes: &[(u32, u32)],
         from: Pos2,
         to: Pos2,
         brush: &Brush,
-    ) -> Option<ImageRegion> {
-        let image = &mut mesh.materials.get_mut(stroke.material)?.base_color;
-        if image.rgba.len() != stroke.original.len() || self.viewport.height() <= 0.0 {
-            return None;
+    ) -> Vec<(usize, ImageRegion)> {
+        if layer.id != stroke.layer || self.viewport.height() <= 0.0 {
+            return Vec::new();
         }
         let from = self.to_local(from);
         let to = self.to_local(to);
         if brush.paint_over_edges {
             stroke.face = None;
         } else if stroke.face.is_none() {
-            let start = self.surface_hit(from).or_else(|| self.surface_hit(to))?;
+            let Some(start) = self.surface_hit(from).or_else(|| self.surface_hit(to)) else {
+                return Vec::new();
+            };
             stroke.face = Some(self.connected_face(start.triangle));
         }
         let radius = (brush.size * 0.5).max(0.5);
-        let mut target = PaintTarget {
-            image,
+        let mut target = LayerTarget {
+            layer,
             stroke,
+            slot_sizes,
             color: brush.color.map(srgb_float_to_linear),
             opacity: brush.opacity.clamp(0.0, 1.0),
-            region: None,
+            erase: brush.erase,
+            regions: vec![None; slot_sizes.len()],
         };
 
         if brush.screen_space {
@@ -230,7 +309,12 @@ impl StrokePainter {
         } else {
             self.paint_surface_segment(&mut target, from, to, radius, brush.hardness);
         }
-        target.region
+        target
+            .regions
+            .into_iter()
+            .enumerate()
+            .filter_map(|(material, region)| Some((material, region?)))
+            .collect()
     }
 
     /// Outline of the surface brush under the cursor: a disc lying on the
@@ -261,7 +345,7 @@ impl StrokePainter {
     /// whatever is visible under it.
     fn paint_screen_segment(
         &self,
-        target: &mut PaintTarget,
+        target: &mut LayerTarget,
         from: Vec2,
         to: Vec2,
         radius: f32,
@@ -274,9 +358,12 @@ impl StrokePainter {
 
         for index in self.triangles_in_screen_rect(min, max) {
             let triangle = &self.triangles[index as usize];
-            if triangle.material != target.stroke.material || !target.stroke.allows(index) {
+            if !target.stroke.allows(index) {
                 continue;
             }
+            let Some(mut slot) = target.slot(triangle.material) else {
+                continue;
+            };
             // Where the brush rectangle lands on this triangle's plane, in UV.
             let bounds = corner_rays
                 .iter()
@@ -291,7 +378,7 @@ impl StrokePainter {
                 .collect::<Option<Vec<_>>>()
                 .map(|uvs| uv_bounds(&uvs));
 
-            target.paint_triangle(triangle, bounds, |position, texel_reach| {
+            slot.paint_triangle(triangle, bounds, |position, texel_reach| {
                 let clip = self.view_proj * position.extend(1.0);
                 if clip.w <= 0.0 || clip.z < 0.0 {
                     return 0.0;
@@ -314,7 +401,7 @@ impl StrokePainter {
     /// size on the model and wraps around edges.
     fn paint_surface_segment(
         &self,
-        target: &mut PaintTarget,
+        target: &mut LayerTarget,
         from: Vec2,
         to: Vec2,
         radius: f32,
@@ -326,7 +413,7 @@ impl StrokePainter {
         };
         let (end, normal) = (end_hit.position, end_hit.normal);
         let world_radius = self.world_radius(end, radius);
-        let mut start = start_hit.map_or(end, |hit| hit.position);
+        let mut start = start_hit.as_ref().map_or(end, |hit| hit.position);
         // Sweeping across a silhouette can make the two ends far apart in 3D;
         // a capsule between them would cut through empty space. Use a dab.
         let screen_length = self.world_radius(end, from.distance(to));
@@ -334,22 +421,15 @@ impl StrokePainter {
             start = end;
         }
 
-        let lo = start.min(end) - Vec3::splat(world_radius);
-        let hi = start.max(end) + Vec3::splat(world_radius);
-        for (index, triangle) in self.triangles.iter().enumerate() {
-            if triangle.material != target.stroke.material
-                || triangle.normal.dot(normal) < SURFACE_MIN_FACING
-                || !target.stroke.allows(index as u32)
+        let mut seeds = vec![end_hit.triangle];
+        if let Some(hit) = start_hit.filter(|_| start != end) {
+            seeds.push(hit.triangle);
+        }
+        for index in self.surface_patch(&seeds, start, end, world_radius, normal) {
+            let triangle = &self.triangles[index as usize];
+            if !target.stroke.allows(index)
+                || target.layer.targets.get(triangle.material) != Some(&true)
             {
-                continue;
-            }
-            let tri_lo = triangle.position[0]
-                .min(triangle.position[1])
-                .min(triangle.position[2]);
-            let tri_hi = triangle.position[0]
-                .max(triangle.position[1])
-                .max(triangle.position[2]);
-            if tri_lo.cmpgt(hi).any() || tri_hi.cmplt(lo).any() {
                 continue;
             }
 
@@ -372,7 +452,10 @@ impl StrokePainter {
                 .collect::<Option<Vec<_>>>()
                 .map(|uvs| uv_bounds(&uvs));
 
-            target.paint_triangle(triangle, bounds, |position, texel_reach| {
+            let Some(mut slot) = target.slot(triangle.material) else {
+                continue;
+            };
+            slot.paint_triangle(triangle, bounds, |position, texel_reach| {
                 let distance = distance_to_segment_3d(position, start, end) - texel_reach;
                 falloff(distance.max(0.0), world_radius, hardness)
             });
@@ -381,6 +464,65 @@ impl StrokePainter {
 
     /// All triangles reachable from `start` without crossing a hard edge.
     fn connected_face(&self, start: u32) -> Vec<bool> {
+        let mut inside = vec![false; self.triangles.len()];
+        let mut pending = vec![start];
+        inside[start as usize] = true;
+        while let Some(current) = pending.pop() {
+            self.for_each_neighbour(current, |neighbour, a, b| {
+                if !inside[neighbour as usize] && self.is_smooth_edge(current, neighbour, a, b) {
+                    inside[neighbour as usize] = true;
+                    pending.push(neighbour);
+                }
+            });
+        }
+        inside
+    }
+
+    /// Triangles the surface brush may paint: those reachable from `seeds`
+    /// across shared edges without leaving the brush, and facing the same way
+    /// as the surface under the cursor. Keeps a big brush from jumping to
+    /// separate or hidden parts of the model that happen to be nearby.
+    fn surface_patch(
+        &self,
+        seeds: &[u32],
+        start: Vec3,
+        end: Vec3,
+        radius: f32,
+        normal: Vec3,
+    ) -> Vec<u32> {
+        let near = |index: u32| {
+            let triangle = &self.triangles[index as usize];
+            let center = interpolate(triangle.position, [1.0 / 3.0; 3]);
+            let reach = triangle
+                .position
+                .iter()
+                .map(|corner| corner.distance(center))
+                .fold(0.0, f32::max);
+            triangle.normal.dot(normal) >= SURFACE_MIN_FACING
+                && distance_to_segment_3d(center, start, end) <= radius + reach
+        };
+        let mut patch: Vec<u32> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut pending: Vec<u32> = seeds
+            .iter()
+            .copied()
+            .filter(|&seed| seen.insert(seed))
+            .collect();
+        while let Some(current) = pending.pop() {
+            patch.push(current);
+            self.for_each_neighbour(current, |neighbour, _, _| {
+                if !seen.contains(&neighbour) && near(neighbour) {
+                    seen.insert(neighbour);
+                    pending.push(neighbour);
+                }
+            });
+        }
+        patch
+    }
+
+    /// Calls `visit(neighbour, edge start, edge end)` for every triangle
+    /// sharing an edge (by position) with `index`.
+    fn for_each_neighbour(&self, index: u32, mut visit: impl FnMut(u32, Vec3, Vec3)) {
         let edges = self.edges.get_or_init(|| {
             let mut edges: Vec<(EdgeKey, u32)> = self
                 .triangles
@@ -397,29 +539,20 @@ impl StrokePainter {
             edges.sort_unstable();
             edges
         });
-
-        let mut inside = vec![false; self.triangles.len()];
-        let mut pending = vec![start];
-        inside[start as usize] = true;
-        while let Some(current) = pending.pop() {
-            let triangle = &self.triangles[current as usize];
-            for corner in 0..3 {
-                let (a, b) = (
-                    triangle.position[corner],
-                    triangle.position[(corner + 1) % 3],
-                );
-                let key = edge_key(a, b);
-                let first = edges.partition_point(|(edge, _)| *edge < key);
-                for &(_, neighbour) in edges[first..].iter().take_while(|(edge, _)| *edge == key) {
-                    if !inside[neighbour as usize] && self.is_smooth_edge(current, neighbour, a, b)
-                    {
-                        inside[neighbour as usize] = true;
-                        pending.push(neighbour);
-                    }
+        let triangle = &self.triangles[index as usize];
+        for corner in 0..3 {
+            let (a, b) = (
+                triangle.position[corner],
+                triangle.position[(corner + 1) % 3],
+            );
+            let key = edge_key(a, b);
+            let first = edges.partition_point(|(edge, _)| *edge < key);
+            for &(_, neighbour) in edges[first..].iter().take_while(|(edge, _)| *edge == key) {
+                if neighbour != index {
+                    visit(neighbour, a, b);
                 }
             }
         }
-        inside
     }
 
     /// Whether the shading is continuous across the edge `a`-`b` shared by two triangles.
@@ -583,16 +716,61 @@ impl StrokePainter {
     }
 }
 
-/// The texture being painted plus the stroke's bookkeeping.
-struct PaintTarget<'a> {
-    image: &'a mut Image,
+/// The layer being painted plus the stroke's bookkeeping.
+struct LayerTarget<'a> {
+    layer: &'a mut Layer,
     stroke: &'a mut Stroke,
+    slot_sizes: &'a [(u32, u32)],
     color: [f32; 3],
     opacity: f32,
-    region: Option<ImageRegion>,
+    erase: bool,
+    /// Changed region per slot.
+    regions: Vec<Option<ImageRegion>>,
 }
 
-impl PaintTarget<'_> {
+impl LayerTarget<'_> {
+    /// The texture of `material` to paint into, created on first use.
+    /// `None` if the layer doesn't paint on that slot.
+    fn slot(&mut self, material: usize) -> Option<SlotTarget<'_>> {
+        if self.layer.targets.get(material) != Some(&true) {
+            return None;
+        }
+        let (width, height) = *self.slot_sizes.get(material)?;
+        let image = self
+            .layer
+            .textures
+            .get_mut(material)?
+            .get_or_insert_with(|| Image::filled(width, height, CLEAR));
+        if (image.width, image.height) != (width, height) {
+            return None;
+        }
+        let stroke = self
+            .stroke
+            .slots
+            .get_mut(material)?
+            .get_or_insert_with(|| SlotStroke::new(image));
+        Some(SlotTarget {
+            image,
+            stroke,
+            region: self.regions.get_mut(material)?,
+            color: self.color,
+            opacity: self.opacity,
+            erase: self.erase,
+        })
+    }
+}
+
+/// One slot's texture being painted.
+struct SlotTarget<'a> {
+    image: &'a mut Image,
+    stroke: &'a mut SlotStroke,
+    region: &'a mut Option<ImageRegion>,
+    color: [f32; 3],
+    opacity: f32,
+    erase: bool,
+}
+
+impl SlotTarget<'_> {
     /// Applies `coverage(world position, texel reach)` to every texel of
     /// `triangle` inside `bounds` (UV), or the whole triangle when bounds
     /// couldn't be computed. Texel reach is the world distance from a texel
@@ -655,16 +833,36 @@ impl PaintTarget<'_> {
         }
         self.stroke.coverage[texel] = amount;
 
+        // Blend from the pixel as it was before the stroke, with straight alpha.
         let alpha = amount * self.opacity;
         let offset = texel * 4;
-        for (channel, color) in self.color.iter().enumerate() {
-            let original = srgb_to_linear(self.stroke.original[offset + channel]);
-            self.image.rgba[offset + channel] =
-                linear_to_srgb(original + (color - original) * alpha);
+        let original = &self.stroke.original[offset..offset + 4];
+        let original_alpha = original[3] as f32 / 255.0;
+        let out = &mut self.image.rgba[offset..offset + 4];
+        if self.erase {
+            out.copy_from_slice(original);
+            out[3] = (original_alpha * (1.0 - alpha) * 255.0).round() as u8;
+        } else {
+            let out_alpha = alpha + original_alpha * (1.0 - alpha);
+            for (channel, color) in self.color.iter().enumerate() {
+                let below = srgb_to_linear(original[channel]) * original_alpha * (1.0 - alpha);
+                out[channel] = linear_to_srgb((color * alpha + below) / out_alpha);
+            }
+            out[3] = (out_alpha * 255.0).round() as u8;
         }
+        let tile = (y / history::TILE_SIZE) * tiles_x(self.image.width) + x / history::TILE_SIZE;
+        self.stroke.touched_tiles[tile as usize] = true;
         let pixel = ImageRegion::pixel(x, y);
-        self.region = Some(self.region.map_or(pixel, |region| region.union(pixel)));
+        *self.region = Some(self.region.map_or(pixel, |region| region.union(pixel)));
     }
+}
+
+fn tiles_x(width: u32) -> u32 {
+    width.div_ceil(history::TILE_SIZE)
+}
+
+fn tiles_y(height: u32) -> u32 {
+    height.div_ceil(history::TILE_SIZE)
 }
 
 fn aspect(viewport: Rect) -> f32 {
@@ -818,6 +1016,7 @@ fn srgb_float_to_linear(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{Stroke, StrokePainter};
+    use crate::document::Document;
     use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
     use crate::painting::brush::Brush;
     use crate::renderer::camera::OrbitCamera;
@@ -915,9 +1114,12 @@ mod tests {
             color: [1.0, 0.0, 0.0],
             screen_space,
             paint_over_edges: true,
+            erase: false,
         }
     }
 
+    /// Paints through a `Document` (new layer, slot 0 only), then writes the
+    /// composites back into `mesh` so tests can inspect the result there.
     fn paint(
         mesh: &mut Mesh,
         camera: &OrbitCamera,
@@ -925,7 +1127,18 @@ mod tests {
         brush: &Brush,
     ) -> Option<ImageRegion> {
         let painter = StrokePainter::new(mesh, camera, viewport());
-        let mut stroke = Stroke::begin(mesh, 0).unwrap();
+        let empty = Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            submeshes: Vec::new(),
+            materials: Vec::new(),
+        };
+        let mut document = Document::new(std::mem::replace(mesh, empty));
+        for (slot, target) in document.layers[1].targets.iter_mut().enumerate() {
+            *target = slot == 0;
+        }
+        let sizes = document.slot_sizes();
+        let mut stroke = Stroke::begin(&document, 1).unwrap();
         let mut region: Option<ImageRegion> = None;
         let segments: Vec<_> = if points.len() == 1 {
             vec![(points[0], points[0])]
@@ -933,9 +1146,18 @@ mod tests {
             points.windows(2).map(|pair| (pair[0], pair[1])).collect()
         };
         for (from, to) in segments {
-            if let Some(changed) = painter.paint_segment(&mut stroke, mesh, from, to, brush) {
+            let layer = &mut document.layers[1];
+            for (_, changed) in painter.paint_segment(&mut stroke, layer, &sizes, from, to, brush) {
                 region = Some(region.map_or(changed, |r| r.union(changed)));
             }
+        }
+
+        let composites: Vec<_> = (0..document.mesh.materials.len())
+            .map(|material| document.composite(material).unwrap())
+            .collect();
+        *mesh = document.mesh;
+        for (material, composite) in mesh.materials.iter_mut().zip(composites) {
+            material.base_color = composite;
         }
         region
     }
@@ -987,7 +1209,8 @@ mod tests {
             .collect();
         paint(&mut mesh, &test_camera(), &points, &soft);
 
-        let half = crate::mesh::linear_to_srgb(0.5);
+        // Alpha is stored in 8 bits, so allow one step of rounding.
+        let half = crate::mesh::linear_to_srgb(0.5) + 1;
         let max_red = painted(&mesh).iter().map(|t| t.2).max().unwrap();
         assert!(
             max_red <= half,
@@ -1211,5 +1434,121 @@ mod tests {
         let width = outline.iter().map(|p| p.x).fold(f32::MIN, f32::max)
             - outline.iter().map(|p| p.x).fold(f32::MAX, f32::min);
         assert!(height < width * 0.5, "outline {width} x {height}");
+    }
+
+    #[test]
+    fn finished_stroke_undoes_to_the_original_texture() {
+        let mut document = Document::new(crate::mesh::primitives::cube());
+        let before = document.composite(0).unwrap().rgba.clone();
+        let camera = OrbitCamera {
+            yaw: 0.6,
+            ..test_camera()
+        };
+        let painter = StrokePainter::new(&document.mesh, &camera, viewport());
+        let sizes = document.slot_sizes();
+        let mut stroke = Stroke::begin(&document, 1).unwrap();
+        for (from, to) in [
+            ((90.0, 128.0), (140.0, 110.0)),
+            ((140.0, 110.0), (190.0, 140.0)),
+        ] {
+            painter.paint_segment(
+                &mut stroke,
+                &mut document.layers[1],
+                &sizes,
+                Pos2::new(from.0, from.1),
+                Pos2::new(to.0, to.1),
+                &brush(40.0, false),
+            );
+        }
+        let after = document.composite(0).unwrap().rgba.clone();
+        assert_ne!(before, after);
+
+        let mut history = crate::painting::history::History::default();
+        history.push(stroke.finish());
+        history.undo(&mut document);
+        assert_eq!(document.composite(0).unwrap().rgba, before);
+        history.redo(&mut document);
+        assert_eq!(document.composite(0).unwrap().rgba, after);
+    }
+
+    #[test]
+    fn eraser_removes_paint_from_the_layer() {
+        let mut document = Document::new(test_mesh());
+        let painter = StrokePainter::new(&document.mesh, &test_camera(), viewport());
+        let sizes = document.slot_sizes();
+        let point = Pos2::new(91.0, 128.0);
+        let mut paint_brush = brush(20.0, false);
+        for erase in [false, true] {
+            paint_brush.erase = erase;
+            let mut stroke = Stroke::begin(&document, 1).unwrap();
+            painter.paint_segment(
+                &mut stroke,
+                &mut document.layers[1],
+                &sizes,
+                point,
+                point,
+                &paint_brush,
+            );
+        }
+        let layer = document.layers[1].textures[0].as_ref().unwrap();
+        assert!(layer.rgba.chunks_exact(4).any(|pixel| pixel[0] == 255));
+        assert!(layer.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn base_layer_cannot_be_painted() {
+        let document = Document::new(test_mesh());
+        assert!(Stroke::begin(&document, 0).is_none());
+    }
+
+    #[test]
+    fn stroke_that_misses_the_model_leaves_no_undo_step() {
+        let mut document = Document::new(test_mesh());
+        let painter = StrokePainter::new(&document.mesh, &test_camera(), viewport());
+        let sizes = document.slot_sizes();
+        let mut stroke = Stroke::begin(&document, 1).unwrap();
+        let corner = Pos2::new(3.0, 3.0);
+        painter.paint_segment(
+            &mut stroke,
+            &mut document.layers[1],
+            &sizes,
+            corner,
+            corner,
+            &brush(10.0, false),
+        );
+        assert!(stroke.finish().is_empty());
+    }
+
+    #[test]
+    fn big_surface_brush_does_not_reach_separate_surfaces_behind() {
+        // A front panel, and a smaller separate panel 0.1 behind it (fully
+        // hidden) in its own UV island.
+        // The brush sphere is far bigger than the gap, but the hidden panel isn't
+        // connected to the painted surface, so it must stay clean.
+        let mut mesh = mesh_from_triangles(&[
+            (
+                [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
+                [[0.0, 0.0], [0.45, 0.0], [0.225, 1.0]],
+            ),
+            (
+                [[-0.8, -0.8, -0.1], [0.8, -0.8, -0.1], [0.0, 0.8, -0.1]],
+                [[0.55, 0.0], [1.0, 0.0], [0.775, 1.0]],
+            ),
+        ]);
+        for screen_space in [false, true] {
+            let region = paint(
+                &mut mesh,
+                &test_camera(),
+                &[Pos2::new(128.0, 140.0)],
+                &brush(120.0, screen_space),
+            );
+            assert!(region.is_some());
+            let texels = painted(&mesh);
+            assert!(texels.iter().any(|t| t.0 < 58), "front panel painted");
+            assert!(
+                !texels.iter().any(|t| t.0 >= 70),
+                "hidden panel painted (screen_space={screen_space})"
+            );
+        }
     }
 }

@@ -1,8 +1,11 @@
-use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
+use crate::document::{Dirty, Document};
+use crate::mesh::{Mesh, SubMesh, Vertex};
+use crate::renderer::compositor::{Compositor, GpuSlot};
 use crate::renderer::texture;
 use eframe::egui;
 use eframe::egui_wgpu::wgpu::util::DeviceExt as _;
 use eframe::egui_wgpu::{self, wgpu};
+use std::collections::{BTreeSet, HashSet};
 
 /// Depth buffer bits requested from eframe (see `main.rs`).
 /// The pipeline's depth format is derived from the same value, so they can't drift apart.
@@ -14,8 +17,10 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+/// One material slot: its layers and composite on the GPU, and the bind
+/// group the mesh shader samples the composite through.
 struct GpuMaterial {
-    texture: texture::PaintableTexture,
+    slot: GpuSlot,
     bind_group: wgpu::BindGroup,
 }
 
@@ -26,6 +31,7 @@ pub struct ViewportRenderer {
     camera_bind_group: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    compositor: Compositor,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     submeshes: Vec<SubMesh>,
@@ -47,24 +53,28 @@ fn create_mesh_buffers(device: &wgpu::Device, mesh: &Mesh) -> (wgpu::Buffer, wgp
 }
 
 fn create_gpu_materials(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    render_state: &egui_wgpu::RenderState,
+    compositor: &Compositor,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
-    materials: &[Material],
+    document: &Document,
 ) -> Vec<GpuMaterial> {
-    materials
-        .iter()
-        .map(|material| {
-            let texture = texture::PaintableTexture::new(device, queue, &material.base_color);
-            let view = texture.create_view();
+    let device = &render_state.device;
+    document
+        .slot_sizes()
+        .into_iter()
+        .enumerate()
+        .map(|(material, (width, height))| {
+            let mut slot = compositor.create_slot(device, width, height);
+            sync_slot(render_state, compositor, &mut slot, document, material);
+            composite_slot(render_state, compositor, &slot, document, material);
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("material_bind_group"),
                 layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
+                        resource: wgpu::BindingResource::TextureView(&slot.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -72,67 +82,129 @@ fn create_gpu_materials(
                     },
                 ],
             });
-            GpuMaterial {
-                texture,
-                bind_group,
-            }
+            GpuMaterial { slot, bind_group }
         })
         .collect()
 }
 
-/// Replaces the mesh (and its materials) shown in the viewport.
-pub fn upload_mesh(render_state: &egui_wgpu::RenderState, mesh: &Mesh) {
-    let device = &render_state.device;
-    let queue = &render_state.queue;
-    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, mesh);
+/// Makes the slot hold exactly the layers that have pixels on `material`
+/// (hidden ones too, so showing them again needs no upload).
+fn sync_slot(
+    render_state: &egui_wgpu::RenderState,
+    compositor: &Compositor,
+    slot: &mut GpuSlot,
+    document: &Document,
+    material: usize,
+) {
+    let mut keep = HashSet::new();
+    for layer in &document.layers {
+        if let Some(image) = document.layer_image(layer, material) {
+            keep.insert(layer.id);
+            if !compositor.has_layer(slot, layer.id) {
+                let (device, queue) = (&render_state.device, &render_state.queue);
+                compositor.upload_layer(device, queue, slot, layer.id, image, None);
+            }
+        }
+    }
+    compositor.retain_layers(slot, &keep);
+}
+
+fn composite_slot(
+    render_state: &egui_wgpu::RenderState,
+    compositor: &Compositor,
+    slot: &GpuSlot,
+    document: &Document,
+    material: usize,
+) {
+    let draws: Vec<(u64, f32)> = document
+        .visible_layers(material)
+        .into_iter()
+        .map(|(id, _, opacity)| (id, opacity))
+        .collect();
+    compositor.composite(&render_state.device, &render_state.queue, slot, &draws);
+}
+
+/// Replaces the model shown in the viewport.
+pub fn show_document(render_state: &egui_wgpu::RenderState, document: &Document) {
+    let (vertex_buffer, index_buffer) = create_mesh_buffers(&render_state.device, &document.mesh);
 
     let mut renderer = render_state.renderer.write();
     let Some(viewport) = renderer.callback_resources.get_mut::<ViewportRenderer>() else {
         return;
     };
-
-    let materials = create_gpu_materials(
-        device,
-        queue,
+    viewport.materials = create_gpu_materials(
+        render_state,
+        &viewport.compositor,
         &viewport.material_layout,
         &viewport.sampler,
-        &mesh.materials,
+        document,
     );
-
     viewport.vertex_buffer = vertex_buffer;
     viewport.index_buffer = index_buffer;
-    viewport.submeshes = mesh.submeshes.clone();
-    viewport.materials = materials;
+    viewport.submeshes = document.mesh.submeshes.clone();
 }
 
-/// Uploads a painted `region` of material `material`'s base colour to the GPU.
-pub fn update_material_texture(
-    render_state: &egui_wgpu::RenderState,
-    material: usize,
-    image: &Image,
-    region: ImageRegion,
-) {
+/// Brings the GPU copy of `document` up to date after `dirty` changes and
+/// recomposites the slots they touched.
+pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document, dirty: &[Dirty]) {
+    if dirty.is_empty() {
+        return;
+    }
     let mut renderer = render_state.renderer.write();
-    let Some(gpu_material) = renderer
-        .callback_resources
-        .get_mut::<ViewportRenderer>()
-        .and_then(|viewport| viewport.materials.get_mut(material))
-    else {
+    let Some(viewport) = renderer.callback_resources.get_mut::<ViewportRenderer>() else {
         return;
     };
-    gpu_material
-        .texture
-        .update_region(&render_state.queue, image, region);
+    let compositor = &viewport.compositor;
+    let (device, queue) = (&render_state.device, &render_state.queue);
+
+    if dirty.iter().any(|change| matches!(change, Dirty::Layers)) {
+        for (material, gpu) in viewport.materials.iter_mut().enumerate() {
+            sync_slot(render_state, compositor, &mut gpu.slot, document, material);
+        }
+    }
+    let mut touched = BTreeSet::new();
+    for change in dirty {
+        match change {
+            Dirty::Pixels {
+                layer,
+                material,
+                region,
+            } => {
+                let Some(gpu) = viewport.materials.get_mut(*material) else {
+                    continue;
+                };
+                let image = document
+                    .layer_index(*layer)
+                    .and_then(|index| document.layer_image(&document.layers[index], *material));
+                if let Some(image) = image {
+                    compositor.upload_layer(
+                        device,
+                        queue,
+                        &mut gpu.slot,
+                        *layer,
+                        image,
+                        Some(*region),
+                    );
+                    touched.insert(*material);
+                }
+            }
+            Dirty::Layers => touched.extend(0..viewport.materials.len()),
+        }
+    }
+    for material in touched {
+        if let Some(gpu) = viewport.materials.get(material) {
+            composite_slot(render_state, compositor, &gpu.slot, document, material);
+        }
+    }
 }
 
-/// Call once at startup, from the eframe creation closure, with the initial mesh.
-pub fn init(cc: &eframe::CreationContext<'_>, mesh: &Mesh) {
+/// Call once at startup, from the eframe creation closure, with the initial document.
+pub fn init(cc: &eframe::CreationContext<'_>, document: &Document) {
     let Some(render_state) = cc.wgpu_render_state.as_ref() else {
         eprintln!("No wgpu render state available - is eframe's wgpu feature enabled?");
         return;
     };
     let device = &render_state.device;
-    let queue = &render_state.queue;
 
     let depth_format = egui_wgpu::depth_format_from_bits(DEPTH_BUFFER_BITS, 0)
         .expect("unsupported depth buffer bit count");
@@ -250,9 +322,15 @@ pub fn init(cc: &eframe::CreationContext<'_>, mesh: &Mesh) {
     });
 
     // --- Initial mesh ---
-    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, mesh);
-    let materials =
-        create_gpu_materials(device, queue, &material_layout, &sampler, &mesh.materials);
+    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, &document.mesh);
+    let compositor = Compositor::new(device);
+    let materials = create_gpu_materials(
+        render_state,
+        &compositor,
+        &material_layout,
+        &sampler,
+        document,
+    );
 
     render_state
         .renderer
@@ -264,9 +342,10 @@ pub fn init(cc: &eframe::CreationContext<'_>, mesh: &Mesh) {
             camera_bind_group,
             material_layout,
             sampler,
+            compositor,
             vertex_buffer,
             index_buffer,
-            submeshes: mesh.submeshes.clone(),
+            submeshes: document.mesh.submeshes.clone(),
             materials,
         });
 }

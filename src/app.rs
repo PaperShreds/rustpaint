@@ -1,13 +1,18 @@
+use crate::document::{Change, Dirty, Document, LayerProps};
+use crate::export;
 use crate::mesh::{self, Image, Mesh};
 use crate::painting::brush::Brush;
+use crate::painting::history::History;
 use crate::painting::stroke::{Stroke, StrokePainter};
 use crate::project;
 use crate::renderer;
 use crate::renderer::camera::OrbitCamera;
 use crate::ui;
-use crate::ui::menu_bar::MenuAction;
+use crate::ui::layers_panel::{LayerAction, LayersPanelState};
+use crate::ui::menu_bar::{MenuAction, MenuState};
 use crate::ui::viewport::BrushCursor;
 use eframe::egui;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const PROJECT_EXTENSION: &str = "rustpaint";
@@ -16,57 +21,76 @@ const DEFAULT_CANVAS_SIZE: u32 = 2048;
 
 pub struct RustPaintApp {
     pub brush: Brush,
-    pub layers: Vec<String>,
-    pub selected_layer: usize,
-    pub material_names: Vec<String>,
-    pub selected_material: usize,
     pub camera: OrbitCamera,
     pub status: String,
-    /// CPU copy of the model and its textures; painting edits this, then uploads changes.
-    mesh: Mesh,
+    /// The model and its layers; painting edits this, then uploads the composites.
+    document: Document,
+    /// Id of the layer strokes go into.
+    selected_layer: u64,
+    layers_panel: LayersPanelState,
+    thumbnails: HashMap<u64, egui::TextureHandle>,
+    /// Bumped on every document change, so thumbnails know when to refresh.
+    revision: u64,
+    thumbnails_revision: Option<u64>,
+    /// Settings of a layer before an opacity drag started, for its undo step.
+    opacity_drag: Option<(u64, LayerProps)>,
     /// Screen-space acceleration structure for painting; rebuilt when the view changes.
     painter: Option<StrokePainter>,
     /// The stroke in progress while the mouse button is held.
     stroke: Option<Stroke>,
+    history: History,
+    /// Name of the loaded model or project, used to name exported files.
+    model_name: String,
+    /// Where textures were last exported, or the loaded file's folder.
+    export_directory: Option<PathBuf>,
     project_path: Option<PathBuf>,
-    unsaved_changes: bool,
+    /// `history.state()` when the project was last saved or loaded.
+    saved_state: u64,
     window_title: String,
 }
 
 impl RustPaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mesh = mesh::primitives::cube();
-        renderer::viewport::init(cc, &mesh);
+        let document = Document::new(mesh::primitives::cube());
+        renderer::viewport::init(cc, &document);
         Self {
             brush: Brush::default(),
-            layers: vec!["Layer 1".to_string()],
-            selected_layer: 0,
-            material_names: mesh.materials.iter().map(|m| m.name.clone()).collect(),
-            selected_material: 0,
             camera: OrbitCamera::default(),
             status: "Use File > Open model... to load a .glb / .gltf file.".to_string(),
-            mesh,
+            selected_layer: document.layers[document.layers.len() - 1].id,
+            document,
+            layers_panel: LayersPanelState::default(),
+            thumbnails: HashMap::new(),
+            revision: 0,
+            thumbnails_revision: None,
+            opacity_drag: None,
             painter: None,
             stroke: None,
+            history: History::default(),
+            model_name: "cube".to_string(),
+            export_directory: None,
             project_path: None,
-            unsaved_changes: false,
+            saved_state: 0,
             window_title: String::new(),
         }
     }
 
-    /// Replaces the current model (and its textures) everywhere.
-    fn set_mesh(&mut self, mesh: Mesh, frame: &eframe::Frame) {
+    /// Replaces the open document everywhere.
+    fn set_document(&mut self, document: Document, frame: &eframe::Frame) {
         if let Some(render_state) = frame.wgpu_render_state() {
-            renderer::viewport::upload_mesh(render_state, &mesh);
+            renderer::viewport::show_document(render_state, &document);
         }
-        let (center, radius) = mesh.bounds();
+        let (center, radius) = document.mesh.bounds();
         self.camera.frame(center, radius);
-        self.material_names = mesh.materials.iter().map(|m| m.name.clone()).collect();
-        self.selected_material = 0;
-        self.mesh = mesh;
+        self.selected_layer = document.layers[document.layers.len() - 1].id;
+        self.document = document;
+        self.thumbnails.clear();
+        self.revision += 1;
+        self.opacity_drag = None;
         self.painter = None;
         self.stroke = None;
-        self.unsaved_changes = false;
+        self.history.clear();
+        self.saved_state = self.history.state();
     }
 
     fn open(&mut self, path: &Path, frame: &eframe::Frame) {
@@ -91,7 +115,8 @@ impl RustPaintApp {
                     mesh.indices.len() / 3,
                     mesh.materials.len()
                 );
-                self.set_mesh(mesh, frame);
+                self.set_document(Document::new(mesh), frame);
+                self.remember_source(path);
                 // A model isn't a project yet; the first save asks where to put it.
                 self.project_path = None;
             }
@@ -104,8 +129,9 @@ impl RustPaintApp {
     fn load_project(&mut self, path: &Path, frame: &eframe::Frame) {
         let name = file_name(path);
         match project::load(path) {
-            Ok(mesh) => {
-                self.set_mesh(mesh, frame);
+            Ok(document) => {
+                self.set_document(document, frame);
+                self.remember_source(path);
                 self.project_path = Some(path.to_path_buf());
                 self.status = format!("Opened project {name}");
             }
@@ -115,7 +141,70 @@ impl RustPaintApp {
         }
     }
 
+    /// Names exports after the opened file and suggests its folder for them.
+    fn remember_source(&mut self, path: &Path) {
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+            self.model_name = stem.to_string();
+        }
+        self.export_directory = path.parent().map(Path::to_path_buf);
+    }
+
+    fn export_textures(&mut self) {
+        self.finish_stroke();
+        let mut dialog = rfd::FileDialog::new().set_title("Export textures to folder");
+        if let Some(directory) = &self.export_directory {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(directory) = dialog.pick_folder() else {
+            return;
+        };
+
+        let files = export::plan(&directory, &self.model_name, &self.document);
+        let existing: Vec<String> = files
+            .iter()
+            .filter(|file| file.path.exists())
+            .map(|file| file_name(&file.path))
+            .collect();
+        if !existing.is_empty() {
+            let answer = rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Replace existing textures?")
+                .set_description(format!(
+                    "{} already exist in {}:\n\n{}\n\nReplace them?",
+                    if existing.len() == 1 {
+                        "This file"
+                    } else {
+                        "These files"
+                    },
+                    directory.display(),
+                    existing.join("\n"),
+                ))
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if answer != rfd::MessageDialogResult::Yes {
+                self.status = "Export cancelled".to_string();
+                return;
+            }
+        }
+
+        match export::write(&files, &self.document) {
+            Ok(()) => {
+                self.status = format!(
+                    "Exported {} texture{} to {}",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" },
+                    directory.display()
+                );
+                self.export_directory = Some(directory);
+            }
+            Err(error) => {
+                self.status = format!("Export failed: {error}");
+            }
+        }
+    }
+
     fn save_project(&mut self, ask_for_path: bool) {
+        self.finish_stroke();
         let path = match (&self.project_path, ask_for_path) {
             (Some(path), false) => path.clone(),
             _ => {
@@ -135,10 +224,10 @@ impl RustPaintApp {
         };
 
         let name = file_name(&path);
-        match project::save(&path, &self.mesh) {
+        match project::save(&path, &self.document) {
             Ok(()) => {
                 self.project_path = Some(path);
-                self.unsaved_changes = false;
+                self.saved_state = self.history.state();
                 self.status = format!("Saved {name}");
             }
             Err(error) => {
@@ -157,8 +246,18 @@ impl RustPaintApp {
             self.painter = None;
         }
         if self.painter.is_none() {
-            self.painter = Some(StrokePainter::new(&self.mesh, &self.camera, viewport));
+            self.painter = Some(StrokePainter::new(
+                &self.document.mesh,
+                &self.camera,
+                viewport,
+            ));
         }
+    }
+
+    fn selected_index(&self) -> usize {
+        self.document
+            .layer_index(self.selected_layer)
+            .unwrap_or(self.document.layers.len() - 1)
     }
 
     fn paint(
@@ -172,28 +271,188 @@ impl RustPaintApp {
         let Some(painter) = self.painter.as_ref() else {
             return;
         };
+        let index = self.selected_index();
         if self.stroke.is_none() {
-            self.stroke = Stroke::begin(&self.mesh, self.selected_material);
+            self.stroke = Stroke::begin(&self.document, index);
+            if self.stroke.is_none() {
+                self.status = "The base layer can't be painted on. Select or add a layer.".into();
+                return;
+            }
         }
         let Some(stroke) = self.stroke.as_mut() else {
             return;
         };
 
-        let Some(region) = painter.paint_segment(stroke, &mut self.mesh, from, to, &self.brush)
-        else {
-            return;
-        };
-        let material = stroke.material();
-        self.unsaved_changes = true;
-
-        if let Some(render_state) = frame.wgpu_render_state() {
-            renderer::viewport::update_material_texture(
-                render_state,
+        let sizes = self.document.slot_sizes();
+        let layer = &mut self.document.layers[index];
+        let id = layer.id;
+        let changed = painter.paint_segment(stroke, layer, &sizes, from, to, &self.brush);
+        let dirty: Vec<Dirty> = changed
+            .into_iter()
+            .map(|(material, region)| Dirty::Pixels {
+                layer: id,
                 material,
-                &self.mesh.materials[material].base_color,
                 region,
-            );
+            })
+            .collect();
+        self.show_changes(&dirty, frame);
+    }
+
+    /// Ends the current stroke and records it for undo.
+    fn finish_stroke(&mut self) {
+        if let Some(stroke) = self.stroke.take() {
+            self.history.push(stroke.finish());
         }
+    }
+
+    fn step_history(&mut self, frame: &eframe::Frame, redo: bool) {
+        self.finish_stroke();
+        self.opacity_drag = None;
+        let dirty = if redo {
+            self.history.redo(&mut self.document)
+        } else {
+            self.history.undo(&mut self.document)
+        };
+        self.show_changes(&dirty, frame);
+    }
+
+    /// Applies `change`, shows it, and records it for undo.
+    fn commit(&mut self, mut change: Change, frame: &eframe::Frame) {
+        if let Some(dirty) = self.document.apply(&mut change) {
+            self.history.push(vec![change]);
+            self.show_changes(&[dirty], frame);
+        }
+    }
+
+    /// Updates the viewport after document changes and marks thumbnails stale.
+    fn show_changes(&mut self, dirty: &[Dirty], frame: &eframe::Frame) {
+        if dirty.is_empty() {
+            return;
+        }
+        self.revision += 1;
+        if let Some(render_state) = frame.wgpu_render_state() {
+            renderer::viewport::apply_changes(render_state, &self.document, dirty);
+        }
+    }
+
+    fn handle_layer_action(&mut self, action: LayerAction, frame: &eframe::Frame) {
+        self.finish_stroke();
+        let props_change = |layer: usize, document: &Document, edit: &dyn Fn(&mut LayerProps)| {
+            let layer = document.layers.get(layer)?;
+            let mut props = layer.props();
+            edit(&mut props);
+            (props != layer.props()).then_some(Change::Props {
+                layer: layer.id,
+                props,
+            })
+        };
+        match action {
+            LayerAction::Select(index) => {
+                if let Some(layer) = self.document.layers.get(index) {
+                    self.selected_layer = layer.id;
+                }
+            }
+            LayerAction::Add => {
+                let index = self.selected_index() + 1;
+                let change = self.document.insert_new_layer(index);
+                self.history.push(vec![change]);
+                self.selected_layer =
+                    self.document.layers[index.min(self.document.layers.len() - 1)].id;
+                self.show_changes(&[Dirty::Layers], frame);
+            }
+            LayerAction::Delete(index) => {
+                // The base layer (index 0) can't be deleted.
+                let Some(below) = index.checked_sub(1) else {
+                    return;
+                };
+                let below = self.document.layers.get(below).map(|layer| layer.id);
+                self.commit(
+                    Change::Layer {
+                        index,
+                        stored: None,
+                    },
+                    frame,
+                );
+                if let Some(id) = below {
+                    self.selected_layer = id;
+                }
+            }
+            LayerAction::Move { from, to } => self.commit(Change::Move { from, to }, frame),
+            LayerAction::SetVisible(index, visible) => {
+                if let Some(change) = props_change(index, &self.document, &|p| p.visible = visible)
+                {
+                    self.commit(change, frame);
+                }
+            }
+            LayerAction::SetTarget { layer, slot, on } => {
+                let edit = |p: &mut LayerProps| {
+                    if let Some(target) = p.targets.get_mut(slot) {
+                        *target = on;
+                    }
+                };
+                if let Some(change) = props_change(layer, &self.document, &edit) {
+                    self.commit(change, frame);
+                }
+            }
+            LayerAction::Rename(index, name) => {
+                if let Some(change) =
+                    props_change(index, &self.document, &|p| p.name = name.clone())
+                {
+                    self.commit(change, frame);
+                }
+            }
+            LayerAction::Opacity { layer, value, done } => {
+                let Some(current) = self.document.layers.get_mut(layer) else {
+                    return;
+                };
+                // Show the new opacity live; record one undo step when the drag ends.
+                let before = match self.opacity_drag.take() {
+                    Some((id, props)) if id == current.id => props,
+                    _ => current.props(),
+                };
+                current.opacity = value;
+                let id = current.id;
+                self.show_changes(&[Dirty::Layers], frame);
+                if done {
+                    if before.opacity != value {
+                        self.history.push(vec![Change::Props {
+                            layer: id,
+                            props: before,
+                        }]);
+                    }
+                } else {
+                    self.opacity_drag = Some((id, before));
+                }
+            }
+        }
+    }
+
+    /// Regenerates layer thumbnails after the document changed.
+    fn update_thumbnails(&mut self, ctx: &egui::Context) {
+        if self.thumbnails_revision == Some(self.revision) {
+            return;
+        }
+        self.thumbnails_revision = Some(self.revision);
+        let mut fresh = HashMap::new();
+        for index in 0..self.document.layers.len() {
+            let id = self.document.layers[index].id;
+            let image = ui::layers_panel::thumbnail(&self.document, index);
+            let options = egui::TextureOptions::LINEAR;
+            let handle = match self.thumbnails.remove(&id) {
+                Some(mut handle) => {
+                    handle.set(image, options);
+                    handle
+                }
+                None => ctx.load_texture(format!("layer-thumbnail-{id}"), image, options),
+            };
+            fresh.insert(id, handle);
+        }
+        self.thumbnails = fresh;
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.history.state() != self.saved_state
+            || self.stroke.as_ref().is_some_and(Stroke::has_changes)
     }
 
     /// The surface brush shows as a disc lying on the model; otherwise a screen circle.
@@ -220,7 +479,7 @@ impl RustPaintApp {
             .project_path
             .as_deref()
             .map_or_else(|| "Untitled".to_string(), file_name);
-        let marker = if self.unsaved_changes { "*" } else { "" };
+        let marker = if self.has_unsaved_changes() { "*" } else { "" };
         let title = format!("{document}{marker} - RustPaint");
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -231,7 +490,11 @@ impl RustPaintApp {
 
 impl eframe::App for RustPaintApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        match ui::menu_bar::show(ui) {
+        let menu_state = MenuState {
+            can_undo: self.history.can_undo() || self.stroke.is_some(),
+            can_redo: self.history.can_redo(),
+        };
+        match ui::menu_bar::show(ui, &menu_state) {
             Some(MenuAction::OpenModel) => {
                 let picked = rfd::FileDialog::new()
                     .add_filter("glTF", &["glb", "gltf"])
@@ -250,6 +513,9 @@ impl eframe::App for RustPaintApp {
             }
             Some(MenuAction::SaveProject) => self.save_project(false),
             Some(MenuAction::SaveProjectAs) => self.save_project(true),
+            Some(MenuAction::ExportTextures) => self.export_textures(),
+            Some(MenuAction::Undo) => self.step_history(frame, false),
+            Some(MenuAction::Redo) => self.step_history(frame, true),
             None => {}
         }
 
@@ -262,19 +528,24 @@ impl eframe::App for RustPaintApp {
         // Outer panels first, central panel last.
         ui::status_bar::show(ui, &self.status);
         ui::tools_panel::show(ui, &mut self.brush);
-        ui::layers_panel::show(
+        self.update_thumbnails(ui.ctx());
+        let selected = self.selected_index();
+        let actions = ui::layers_panel::show(
             ui,
-            &self.material_names,
-            &mut self.selected_material,
-            &mut self.layers,
-            &mut self.selected_layer,
+            &self.document,
+            selected,
+            &self.thumbnails,
+            &mut self.layers_panel,
         );
+        for action in actions {
+            self.handle_layer_action(action, frame);
+        }
         let input = ui::viewport::show(ui, &mut self.camera);
         if let Some((from, to)) = input.paint {
             self.paint(input.rect, from, to, frame);
         }
         if input.stroke_finished {
-            self.stroke = None;
+            self.finish_stroke();
         }
         if let Some(pointer) = input.cursor {
             let cursor = self.brush_cursor(input.rect, pointer, input.camera_moved);

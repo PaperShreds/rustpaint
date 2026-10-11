@@ -8,6 +8,8 @@ pub struct Brush {
     /// Let a stroke continue across hard edges, instead of staying on the
     /// face (the area bounded by hard edges) where it started.
     pub paint_over_edges: bool,
+    /// Remove paint from the layer instead of adding it.
+    pub erase: bool,
 }
 
 impl Default for Brush {
@@ -19,6 +21,7 @@ impl Default for Brush {
             color: [1.0, 1.0, 1.0],
             screen_space: false,
             paint_over_edges: true,
+            erase: false,
         }
     }
 }

@@ -2640,6 +2640,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "pollster 1.0.1",
  "rfd",
  "wgpu",
 ]

@@ -34,7 +34,9 @@ fn shade(in: VertexOutput) -> vec3<f32> {
     let diffuse = max(dot(n, light_dir), 0.0);
     let light = 0.25 + 0.75 * diffuse;
 
-    let albedo = textureSample(base_color_texture, base_color_sampler, in.uv).rgb;
+    // The layer composite holds premultiplied colour; show the straight colour.
+    let texel = textureSample(base_color_texture, base_color_sampler, in.uv);
+    let albedo = select(texel.rgb / texel.a, vec3<f32>(0.0), texel.a <= 0.0);
     return albedo * light;
 }
 

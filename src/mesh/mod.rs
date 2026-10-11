@@ -14,6 +14,7 @@ pub struct Vertex {
 }
 
 /// 8-bit RGBA, tightly packed, sRGB-encoded colour.
+#[derive(Clone)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -118,12 +119,18 @@ impl Mesh {
 }
 
 pub fn srgb_to_linear(value: u8) -> f32 {
-    let c = value as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
+    // Called per channel per layer when compositing, so use a table.
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let c = i as f32 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })[value as usize]
 }
 
 pub fn linear_to_srgb(linear: f32) -> u8 {

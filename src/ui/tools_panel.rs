@@ -9,6 +9,12 @@ pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
             ui.heading("Brush");
             ui.separator();
 
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut brush.erase, false, "Paint");
+                ui.selectable_value(&mut brush.erase, true, "Erase")
+                    .on_hover_text("Remove paint from the selected layer");
+            });
+
             ui.add(egui::Slider::new(&mut brush.size, 1.0..=512.0).text("Size"));
             ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
             ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));

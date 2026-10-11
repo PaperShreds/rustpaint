@@ -1,9 +1,24 @@
-use crate::mesh::{Image, Material, Mesh, SubMesh, Vertex};
+//! The `.rustpaint` project file.
+//!
+//! Layout: magic, the mesh with its own textures (the base layer), then the
+//! paint layers. Layer textures are mostly transparent, so only their 64x64
+//! tiles that contain paint are stored. Version 1 files have no layer section.
+//! All counts are validated before allocating, so a damaged or hostile file
+//! produces an error instead of a crash.
+
+use crate::document::{CLEAR, Document, Layer, LayerProps};
+use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
+use crate::painting::history::TILE_SIZE;
 use std::io::{Read, Write};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"RPAINT01";
-const MAX_PROJECT_BYTES: u64 = 512 * 1024 * 1024;
+const MAGIC_V1: &[u8; 8] = b"RPAINT01";
+const MAGIC_V2: &[u8; 8] = b"RPAINT02";
+const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const SIZE_LIMIT_ERROR: &str = "project file exceeds the 4 GiB size limit";
+const MAX_LAYERS: usize = 4096;
+/// Memory all decoded layer textures may take together.
+const MAX_LAYER_TEXTURE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_VERTICES: usize = 20_000_000;
 const MAX_INDICES: usize = 60_000_000;
 const MAX_SUBMESHES: usize = MAX_INDICES / 3;
@@ -11,11 +26,11 @@ const MAX_MATERIALS: usize = 4096;
 const MAX_TEXTURE_DIMENSION: u32 = 16_384;
 const MAX_NAME_BYTES: usize = 1024 * 1024;
 
-pub fn load(path: &Path) -> Result<Mesh, String> {
+pub fn load(path: &Path) -> Result<Document, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     if size > MAX_PROJECT_BYTES {
-        return Err("project file exceeds the 512 MiB size limit".into());
+        return Err(SIZE_LIMIT_ERROR.into());
     }
     let mut bytes = Vec::new();
     bytes
@@ -25,13 +40,13 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_PROJECT_BYTES {
-        return Err("project file exceeds the 512 MiB size limit".into());
+        return Err(SIZE_LIMIT_ERROR.into());
     }
     decode(&bytes)
 }
 
-pub fn save(path: &Path, mesh: &Mesh) -> Result<(), String> {
-    let bytes = encode(mesh)?;
+pub fn save(path: &Path, document: &Document) -> Result<(), String> {
+    let bytes = encode(document)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -57,7 +72,18 @@ pub fn save(path: &Path, mesh: &Mesh) -> Result<(), String> {
     write_result
 }
 
-fn encode(mesh: &Mesh) -> Result<Vec<u8>, String> {
+fn encode(document: &Document) -> Result<Vec<u8>, String> {
+    let mut bytes = encode_mesh(&document.mesh)?;
+    bytes[..MAGIC_V2.len()].copy_from_slice(MAGIC_V2);
+    encode_layers(&mut bytes, document)?;
+    if bytes.len() as u64 > MAX_PROJECT_BYTES {
+        return Err(SIZE_LIMIT_ERROR.into());
+    }
+    Ok(bytes)
+}
+
+/// The mesh and its textures in the version 1 layout, magic included.
+fn encode_mesh(mesh: &Mesh) -> Result<Vec<u8>, String> {
     validate_mesh(mesh)?;
     let mut encoded_size = 24_u64
         .checked_add((mesh.vertices.len() as u64) * 32)
@@ -71,13 +97,13 @@ fn encode(mesh: &Mesh) -> Result<Vec<u8>, String> {
             .ok_or_else(|| "project file size overflows".to_string())?;
     }
     if encoded_size > MAX_PROJECT_BYTES {
-        return Err("project file exceeds the 512 MiB size limit".into());
+        return Err(SIZE_LIMIT_ERROR.into());
     }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(encoded_size as usize)
         .map_err(|e| format!("could not allocate project file: {e}"))?;
-    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(MAGIC_V1);
     for count in [
         mesh.vertices.len(),
         mesh.indices.len(),
@@ -114,16 +140,34 @@ fn encode(mesh: &Mesh) -> Result<Vec<u8>, String> {
     }
 
     if bytes.len() as u64 > MAX_PROJECT_BYTES {
-        return Err("project file exceeds the 512 MiB size limit".into());
+        return Err(SIZE_LIMIT_ERROR.into());
     }
     Ok(bytes)
 }
 
-fn decode(bytes: &[u8]) -> Result<Mesh, String> {
+fn decode(bytes: &[u8]) -> Result<Document, String> {
     let mut reader = Reader { bytes, offset: 0 };
-    if reader.take(MAGIC.len())? != MAGIC {
+    let magic = reader.take(MAGIC_V1.len())?;
+    let has_layers = if magic == MAGIC_V2 {
+        true
+    } else if magic == MAGIC_V1 {
+        false
+    } else {
         return Err("not a supported RustPaint project file".into());
+    };
+    let mesh = decode_mesh(&mut reader)?;
+    let document = if has_layers {
+        decode_layers(&mut reader, mesh)?
+    } else {
+        Document::new(mesh)
+    };
+    if reader.offset != bytes.len() {
+        return Err("project file contains unexpected trailing data".into());
     }
+    Ok(document)
+}
+
+fn decode_mesh(reader: &mut Reader) -> Result<Mesh, String> {
     let vertex_count = reader.count(MAX_VERTICES, "vertex")?;
     let index_count = reader.count(MAX_INDICES, "index")?;
     let submesh_count = reader.count(MAX_SUBMESHES, "submesh")?;
@@ -200,10 +244,6 @@ fn decode(bytes: &[u8]) -> Result<Mesh, String> {
             },
         });
     }
-    if reader.offset != bytes.len() {
-        return Err("project file contains unexpected trailing data".into());
-    }
-
     let mesh = Mesh {
         vertices,
         indices,
@@ -212,6 +252,156 @@ fn decode(bytes: &[u8]) -> Result<Mesh, String> {
     };
     validate_mesh(&mesh)?;
     Ok(mesh)
+}
+
+fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String> {
+    let slots = document.mesh.materials.len();
+    write_count(bytes, document.layers.len())?;
+    for layer in &document.layers {
+        if layer.targets.len() != slots {
+            return Err("layer does not match the model's material slots".into());
+        }
+        bytes.push(layer.is_base() as u8);
+        write_count(bytes, layer.name.len())?;
+        bytes.extend_from_slice(layer.name.as_bytes());
+        bytes.push(layer.visible as u8);
+        bytes.extend_from_slice(&layer.opacity.to_le_bytes());
+        bytes.extend(layer.targets.iter().map(|&on| on as u8));
+        if layer.is_base() {
+            continue;
+        }
+        for slot in 0..slots {
+            let Some(image) = layer.textures.get(slot).and_then(Option::as_ref) else {
+                write_count(bytes, 0)?;
+                continue;
+            };
+            let painted: Vec<(usize, ImageRegion)> = (0..tile_count(image.width, image.height))
+                .map(|index| (index, tile_region(index, image.width, image.height)))
+                .filter(|(_, region)| region_has_paint(image, *region))
+                .collect();
+            write_count(bytes, painted.len())?;
+            for (index, region) in painted {
+                write_count(bytes, index)?;
+                for y in region.y..region.y + region.height {
+                    let start = ((y * image.width + region.x) * 4) as usize;
+                    bytes
+                        .extend_from_slice(&image.rgba[start..start + (region.width * 4) as usize]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_layers(reader: &mut Reader, mesh: Mesh) -> Result<Document, String> {
+    let count = reader.count(MAX_LAYERS, "layer")?;
+    if count == 0 {
+        return Err("project has no base layer".into());
+    }
+    let sizes: Vec<(u32, u32)> = mesh
+        .materials
+        .iter()
+        .map(|m| (m.base_color.width, m.base_color.height))
+        .collect();
+    let mut texture_budget = MAX_LAYER_TEXTURE_BYTES;
+    let mut base = None;
+    let mut layers = Vec::new();
+
+    for index in 0..count {
+        let is_base = reader.flag("layer kind")?;
+        if is_base != (index == 0) {
+            return Err("project layers are out of order".into());
+        }
+        let name_len = reader.count(MAX_NAME_BYTES, "layer name byte")?;
+        let name = std::str::from_utf8(reader.take(name_len)?)
+            .map_err(|e| format!("invalid layer name: {e}"))?
+            .to_owned();
+        let visible = reader.flag("layer visibility")?;
+        let opacity = f32::from_le_bytes(reader.array()?);
+        if !opacity.is_finite() {
+            return Err("project contains an invalid layer opacity".into());
+        }
+        let targets = (0..sizes.len())
+            .map(|_| reader.flag("layer slot"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let props = LayerProps {
+            name,
+            visible,
+            opacity: opacity.clamp(0.0, 1.0),
+            targets,
+        };
+        if is_base {
+            base = Some(props);
+            continue;
+        }
+
+        let mut textures = Vec::with_capacity(sizes.len());
+        for &(width, height) in &sizes {
+            let tiles = tile_count(width, height);
+            let painted = reader.count(tiles, "layer tile")?;
+            if painted == 0 {
+                textures.push(None);
+                continue;
+            }
+            let bytes = (width as usize) * (height as usize) * 4;
+            texture_budget = texture_budget
+                .checked_sub(bytes)
+                .ok_or("project layers need more memory than supported")?;
+            let mut image = Image::filled(width, height, CLEAR);
+            for _ in 0..painted {
+                let tile = reader.count(tiles - 1, "layer tile index")?;
+                let region = tile_region(tile, width, height);
+                for y in region.y..region.y + region.height {
+                    let row = reader.take((region.width * 4) as usize)?;
+                    let start = ((y * width + region.x) * 4) as usize;
+                    image.rgba[start..start + row.len()].copy_from_slice(row);
+                }
+            }
+            textures.push(Some(image));
+        }
+        layers.push(Layer {
+            id: index as u64,
+            name: props.name,
+            visible: props.visible,
+            opacity: props.opacity,
+            targets: props.targets,
+            textures,
+        });
+    }
+
+    let mut document = Document::with_layers(mesh, layers);
+    if let Some(mut props) = base {
+        props.name = document.layers[0].name.clone();
+        document.set_base_props(props);
+    }
+    Ok(document)
+}
+
+fn tile_count(width: u32, height: u32) -> usize {
+    (width.div_ceil(TILE_SIZE) * height.div_ceil(TILE_SIZE)) as usize
+}
+
+fn tile_region(index: usize, width: u32, height: u32) -> ImageRegion {
+    let columns = width.div_ceil(TILE_SIZE);
+    let (x, y) = (
+        index as u32 % columns * TILE_SIZE,
+        index as u32 / columns * TILE_SIZE,
+    );
+    ImageRegion {
+        x,
+        y,
+        width: TILE_SIZE.min(width - x),
+        height: TILE_SIZE.min(height - y),
+    }
+}
+
+fn region_has_paint(image: &Image, region: ImageRegion) -> bool {
+    (region.y..region.y + region.height).any(|y| {
+        let start = ((y * image.width + region.x) * 4) as usize;
+        image.rgba[start..start + (region.width * 4) as usize]
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] != 0)
+    })
 }
 
 fn validate_mesh(mesh: &Mesh) -> Result<(), String> {
@@ -323,6 +513,14 @@ impl Reader<'_> {
             .map_err(|_| "project file is truncated".to_string())
     }
 
+    fn flag(&mut self, what: &str) -> Result<bool, String> {
+        match self.take(1)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("project contains an invalid {what}")),
+        }
+    }
+
     fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.array()?))
     }
@@ -338,14 +536,16 @@ impl Reader<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode, load, save};
-    use crate::mesh::primitives;
+    use super::{decode, encode, encode_mesh, load, save};
+    use crate::document::{CLEAR, Document};
+    use crate::mesh::{Image, primitives};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn project_round_trip_preserves_mesh_and_textures() {
-        let mesh = primitives::cube();
-        let decoded = decode(&encode(&mesh).unwrap()).unwrap();
+        let document = Document::new(primitives::cube());
+        let decoded = decode(&encode(&document).unwrap()).unwrap();
+        let (mesh, decoded) = (&document.mesh, &decoded.mesh);
 
         assert_eq!(decoded.vertices.len(), mesh.vertices.len());
         assert_eq!(decoded.indices, mesh.indices);
@@ -361,7 +561,7 @@ mod tests {
 
     #[test]
     fn project_reader_rejects_truncated_data() {
-        let mut bytes = encode(&primitives::cube()).unwrap();
+        let mut bytes = encode(&Document::new(primitives::cube())).unwrap();
         bytes.pop();
 
         assert!(decode(&bytes).is_err());
@@ -377,17 +577,89 @@ mod tests {
             "rustpaint-test-{}-{nonce}.rustpaint",
             std::process::id()
         ));
-        let mut mesh = primitives::cube();
+        let mut document = Document::new(primitives::cube());
 
-        save(&path, &mesh).unwrap();
-        mesh.materials[0].base_color.rgba[0] ^= 0xff;
-        save(&path, &mesh).unwrap();
-        let reopened = load(&path).unwrap();
+        save(&path, &document).unwrap();
+        document.mesh.materials[0].base_color.rgba[0] ^= 0xff;
+        save(&path, &document).unwrap();
+        let reopened = load(&path).unwrap().mesh;
+        let mesh = &document.mesh;
 
         assert_eq!(
             reopened.materials[0].base_color.rgba,
             mesh.materials[0].base_color.rgba
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A cube document with a second, hidden paint layer holding one red pixel.
+    fn layered_document() -> Document {
+        let mut document = Document::new(primitives::cube());
+        let (w, h) = document.slot_sizes()[0];
+        let mut image = Image::filled(w, h, CLEAR);
+        let last = image.rgba.len() - 4;
+        image.rgba[last..].copy_from_slice(&[255, 0, 0, 255]);
+        document.layers[1].textures[0] = Some(image);
+        document.layers[1].name = "Rust".into();
+        document.layers[1].opacity = 0.25;
+        document.insert_new_layer(2);
+        document.layers[2].visible = false;
+        document.layers[0].targets[0] = false;
+        document
+    }
+
+    #[test]
+    fn layers_round_trip() {
+        let document = layered_document();
+        let bytes = encode(&document).unwrap();
+        let decoded = decode(&bytes).unwrap();
+
+        assert_eq!(decoded.layers.len(), 3);
+        for (actual, expected) in decoded.layers.iter().zip(&document.layers) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.visible, expected.visible);
+            assert_eq!(actual.opacity, expected.opacity);
+            assert_eq!(actual.targets, expected.targets);
+            assert_eq!(actual.is_base(), expected.is_base());
+        }
+        let painted = |document: &Document| {
+            document.layers[1].textures[0]
+                .as_ref()
+                .map(|image| image.rgba.clone())
+        };
+        assert_eq!(painted(&decoded), painted(&document));
+        assert!(decoded.layers[2].textures.iter().all(Option::is_none));
+        assert_eq!(
+            decoded.composite(0).unwrap().rgba,
+            document.composite(0).unwrap().rgba
+        );
+        // Only the one painted tile is stored, not the whole layer texture.
+        let base_only = encode_mesh(&document.mesh).unwrap().len();
+        assert!(bytes.len() < base_only + 64 * 64 * 4 + 1024);
+    }
+
+    #[test]
+    fn version_1_files_open_with_the_texture_as_base_layer() {
+        let bytes = encode_mesh(&primitives::cube()).unwrap();
+        let document = decode(&bytes).unwrap();
+        assert_eq!(document.layers.len(), 2);
+        assert!(document.layers[0].is_base());
+        assert_eq!(
+            document.composite(0).unwrap().rgba,
+            primitives::cube().materials[0].base_color.rgba
+        );
+    }
+
+    #[test]
+    fn damaged_layer_data_is_rejected() {
+        let bytes = encode(&layered_document()).unwrap();
+        // Every truncation fails cleanly instead of panicking.
+        for cut in [1, 10, 100, 1000, 10_000] {
+            assert!(decode(&bytes[..bytes.len() - cut]).is_err());
+        }
+        // Append junk.
+        let mut extended = bytes.clone();
+        extended.push(0);
+        assert!(decode(&extended).is_err());
     }
 }

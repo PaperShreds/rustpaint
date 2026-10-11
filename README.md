@@ -26,12 +26,25 @@ Turn off **Paint over edges** to keep a stroke on the face where it started.
 A face ends at the model's hard edges (where its shading normals split), so a
 cube has six faces while a smooth-shaded sphere is one.
 
-Paint only lands on the texture set selected in the right-hand panel. Materials
-without a texture get a blank 2048×2048 canvas in their base color.
+Paint goes into the layer selected in the right-hand panel. Each layer has a
+visibility checkbox, a thumbnail, a name (double-click to rename), and a
+dropdown of the material slots it paints on; one stroke can cross several
+slots. The bottom **Base** layer holds the model's own textures: it can be
+hidden but not painted on, so the original stays intact. Use **Erase** in the
+brush panel to remove paint from a layer. Materials without a texture get a
+blank 2048×2048 canvas in their base color.
 
-Layers, undo, texture export, and autosave are not implemented yet, and the
-project file format may still change. Avoid using it as the only copy of
-important work.
+Undo and redo strokes and layer changes with **Ctrl+Z** and **Ctrl+Shift+Z**
+(or **Ctrl+Y**).
+History isn't saved with the project.
+
+**File > Export textures...** writes each material slot's base color, with its
+visible layers combined, as a PNG named `<model>_<material>_BaseColor.png`. It
+asks before replacing existing files.
+
+Blend modes, masks, other material channels (roughness, metallic, normal), and
+autosave are not implemented yet, and the project file format may still change.
+Avoid using it as the only copy of important work.
 
 ## Run
 
