@@ -35,8 +35,12 @@ const DEPTH_TOLERANCE: f32 = 1e-3;
 const SMOOTH_EDGE_COSINE: f32 = 0.99;
 /// How far the blur brush spreads paint, as a share of the brush radius.
 const BLUR_SHARE: f32 = 0.25;
-/// Most blur passes per dab (each spreads paint by about one texel).
-const MAX_BLUR_PASSES: u32 = 16;
+/// The widest blur, as the Gaussian's sigma in texels.
+const MAX_BLUR_TEXELS: f32 = 8.0;
+/// Blur works on square tiles of this many texels (plus the kernel around them).
+const BLUR_TILE: u32 = 32;
+/// Most steps one smear segment is split into (each moves paint up to a texel).
+const MAX_SMEAR_STEPS: usize = 32;
 /// Number of points in the projected brush outline.
 const OUTLINE_POINTS: usize = 48;
 
@@ -361,6 +365,7 @@ impl StrokePainter {
         } else {
             self.paint_surface_segment(&mut target, from, to, radius, brush);
         }
+        target.filter();
         target.changed()
     }
 
@@ -939,6 +944,8 @@ struct LayerTarget<'a> {
     effect: Effect,
     /// Per slot, the texels the blur may use (see `StrokePainter::uv_mask`).
     masks: Vec<Option<Rc<Vec<bool>>>>,
+    /// Per slot, the texels blur or smear covered in this segment.
+    covered: Vec<Vec<Covered>>,
     /// Changed region per slot and channel.
     regions: Vec<[Option<ImageRegion>; Channel::COUNT]>,
 }
@@ -976,7 +983,21 @@ impl<'a> LayerTarget<'a> {
                 Tool::Paint | Tool::Fill => Effect::Paint,
             },
             masks: Vec::new(),
+            covered: vec![Vec::new(); slot_sizes.len()],
             regions: vec![Default::default(); slot_sizes.len()],
+        }
+    }
+
+    /// Blurs or smears everything the segment covered, slot by slot.
+    fn filter(&mut self) {
+        for material in 0..self.covered.len() {
+            let covered = std::mem::take(&mut self.covered[material]);
+            if covered.is_empty() {
+                continue;
+            }
+            if let Some(mut slot) = self.slot(material) {
+                slot.filter(covered);
+            }
         }
     }
 
@@ -1003,6 +1024,7 @@ impl<'a> LayerTarget<'a> {
         let textures = self.layer.textures.get_mut(material)?;
         let strokes = self.stroke.slots.get_mut(material)?;
         let regions = self.regions.get_mut(material)?;
+        let covered = self.covered.get_mut(material)?;
         let mut channels = Vec::new();
         for (((channel, texture), stroke), region) in Channel::ALL
             .into_iter()
@@ -1033,6 +1055,7 @@ impl<'a> LayerTarget<'a> {
             opacity: self.opacity,
             effect: self.effect,
             mask: self.masks.get(material).cloned().flatten(),
+            covered,
         })
     }
 }
@@ -1046,51 +1069,19 @@ struct ChannelTarget<'a> {
     encoding: Encoding,
 }
 
-/// Binomial weights of the blur kernel (5x5 when used along both axes).
-const BLUR_WEIGHTS: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
-
 impl ChannelTarget<'_> {
-    /// One pass of `SlotTarget::filter`: works out the new value of every
-    /// covered texel from the image as it is, then writes them all.
-    fn filter_pass(
-        &mut self,
-        triangle: &Triangle,
-        size: Vec2,
-        opacity: f32,
-        effect: Effect,
-        mask: Option<&[bool]>,
-        covered: &[(u32, u32, f32, Vec3)],
-    ) {
-        let new: Vec<(u32, u32, [u8; 4])> = covered
-            .iter()
-            .filter_map(|&(x, y, amount, position)| {
-                let source = match effect {
-                    Effect::Blur(_) => self.blurred(x, y, mask),
-                    Effect::Smear(motion) => {
-                        // The point the paint comes from, in texel space.
-                        let from = barycentric_3d(position - motion, triangle.position)?;
-                        let texel = interpolate(triangle.uv, from) * size - Vec2::splat(0.5);
-                        self.sample(texel)?
-                    }
-                    Effect::Paint | Effect::Erase => return None,
-                };
-                let current = self.premultiplied(x as i64, y as i64);
-                let strength = (amount.min(1.0) * opacity).clamp(0.0, 1.0);
-                Some((x, y, self.encode(current.lerp(source, strength))))
-            })
-            .collect();
+    /// Stores a new pixel and records the change for undo and upload.
+    fn write(&mut self, x: u32, y: u32, pixel: [u8; 4]) {
         let width = self.image.width;
-        for (x, y, pixel) in new {
-            let offset = ((y * width + x) * 4) as usize;
-            if self.image.rgba[offset..offset + 4] == pixel {
-                continue;
-            }
-            self.image.rgba[offset..offset + 4].copy_from_slice(&pixel);
-            let tile = (y / history::TILE_SIZE) * tiles_x(width) + x / history::TILE_SIZE;
-            self.stroke.touched_tiles[tile as usize] = true;
-            let pixel = ImageRegion::pixel(x, y);
-            *self.region = Some(self.region.map_or(pixel, |region| region.union(pixel)));
+        let offset = ((y * width + x) * 4) as usize;
+        if self.image.rgba[offset..offset + 4] == pixel {
+            return;
         }
+        self.image.rgba[offset..offset + 4].copy_from_slice(&pixel);
+        let tile = (y / history::TILE_SIZE) * tiles_x(width) + x / history::TILE_SIZE;
+        self.stroke.touched_tiles[tile as usize] = true;
+        let pixel = ImageRegion::pixel(x, y);
+        *self.region = Some(self.region.map_or(pixel, |region| region.union(pixel)));
     }
 
     /// Texel (x, y), wrapping around the edges, as linear premultiplied RGBA.
@@ -1122,28 +1113,75 @@ impl ChannelTarget<'_> {
         ]
     }
 
-    /// Weighted average of the 5x5 texels around (x, y), leaving out those
-    /// `mask` marks as unused.
-    fn blurred(&self, x: u32, y: u32, mask: Option<&[bool]>) -> Vec4 {
+    /// Blurs the `texels` of one tile; returns their (x, y, new pixel).
+    /// Works on a copy of the tile plus `radius` texels around it, as linear
+    /// premultiplied colour: a horizontal pass, then a vertical one. Texels
+    /// `mask` marks as unused don't count (normalised convolution).
+    #[allow(clippy::too_many_arguments)]
+    fn blur_tile(
+        &self,
+        tile_x: u32,
+        tile_y: u32,
+        radius: i64,
+        kernel: &[f32],
+        mask: Option<&[bool]>,
+        texels: &[Covered],
+        opacity: f32,
+    ) -> Vec<(u32, u32, [u8; 4])> {
+        let mut writes = Vec::with_capacity(texels.len());
         let (width, height) = (self.image.width as i64, self.image.height as i64);
-        let mut sum = Vec4::ZERO;
-        let mut total = 0.0;
-        for (dy, wy) in (-2..=2).zip(BLUR_WEIGHTS) {
-            for (dx, wx) in (-2..=2).zip(BLUR_WEIGHTS) {
-                let (sx, sy) = (x as i64 + dx, y as i64 + dy);
-                let index = (sy.rem_euclid(height) * width + sx.rem_euclid(width)) as usize;
-                if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
-                    continue;
-                }
-                sum += self.premultiplied(sx, sy) * (wx * wy);
-                total += wx * wy;
+        let tile = BLUR_TILE as i64;
+        let (x0, y0) = (tile_x as i64 * tile - radius, tile_y as i64 * tile - radius);
+        let span = tile + 2 * radius;
+
+        // The region, with unused texels zeroed and their weight (w) zero.
+        let mut source = Vec::with_capacity((span * span) as usize);
+        for y in y0..y0 + span {
+            for x in x0..x0 + span {
+                let index = (y.rem_euclid(height) * width + x.rem_euclid(width)) as usize;
+                let used = mask.is_none_or(|mask| mask.get(index).copied().unwrap_or(false));
+                source.push(if used {
+                    let value = self.premultiplied(x, y);
+                    (value, 1.0)
+                } else {
+                    (Vec4::ZERO, 0.0)
+                });
             }
         }
-        if total > 0.0 {
-            sum / total
-        } else {
-            self.premultiplied(x as i64, y as i64)
+        // Horizontal pass, for the tile's columns only.
+        let mut across = vec![(Vec4::ZERO, 0.0f32); (span * tile) as usize];
+        for row in 0..span {
+            for column in 0..tile {
+                let mut sum = (Vec4::ZERO, 0.0);
+                for (k, weight) in kernel.iter().enumerate() {
+                    let (value, used) = source[(row * span + column + k as i64) as usize];
+                    sum.0 += value * *weight;
+                    sum.1 += used * weight;
+                }
+                across[(row * tile + column) as usize] = sum;
+            }
         }
+        // Vertical pass, for the covered texels only.
+        for c in texels {
+            let (column, row) = (
+                c.x as i64 - tile_x as i64 * tile,
+                c.y as i64 - tile_y as i64 * tile,
+            );
+            let mut sum = (Vec4::ZERO, 0.0);
+            for (k, weight) in kernel.iter().enumerate() {
+                let (value, used) = across[((row + k as i64) * tile + column) as usize];
+                sum.0 += value * *weight;
+                sum.1 += used * weight;
+            }
+            let current = self.premultiplied(c.x as i64, c.y as i64);
+            if sum.1 <= 1e-6 {
+                continue;
+            }
+            let blurred = sum.0 / sum.1;
+            let strength = (c.amount.min(1.0) * opacity).clamp(0.0, 1.0);
+            writes.push((c.x, c.y, self.encode(current.lerp(blurred, strength))));
+        }
+        writes
     }
 
     /// Bilinear sample at a texel-space position (texel centres at integers).
@@ -1173,6 +1211,20 @@ struct SlotTarget<'a> {
     effect: Effect,
     /// Texels the blur may use; `None` means all.
     mask: Option<Rc<Vec<bool>>>,
+    /// Blur and smear: the texels covered so far in this segment.
+    covered: &'a mut Vec<Covered>,
+}
+
+/// A texel the blur or smear brush covers during one segment.
+#[derive(Clone, Copy)]
+struct Covered {
+    x: u32,
+    y: u32,
+    amount: f32,
+    /// Smear: where the paint comes from, relative to this texel (texels).
+    shift: Vec2,
+    /// Blur: how far the paint spreads here (texels; the Gaussian's sigma).
+    spread: f32,
 }
 
 impl SlotTarget<'_> {
@@ -1211,9 +1263,7 @@ impl SlotTarget<'_> {
 
         let (min_x, max_x) = texel_range(lo.x, hi.x, self.width);
         let (min_y, max_y) = texel_range(lo.y, hi.y, self.height);
-        // Blur and smear read neighbouring texels, so they first work out
-        // every new value and only then write them.
-        let mut covered = Vec::new();
+        let texel_size = texel_reach * std::f32::consts::SQRT_2;
         for raw_y in min_y..=max_y {
             for raw_x in min_x..=max_x {
                 let center = Vec2::new(raw_x as f32 + 0.5, raw_y as f32 + 0.5);
@@ -1228,43 +1278,117 @@ impl SlotTarget<'_> {
                 if amount > 0.0 {
                     let x = raw_x.rem_euclid(self.width as i64) as u32;
                     let y = raw_y.rem_euclid(self.height as i64) as u32;
-                    match self.effect {
-                        Effect::Paint | Effect::Erase => self.apply(x, y, amount),
-                        Effect::Blur(_) | Effect::Smear(_) => {
-                            covered.push((x, y, amount, position))
+                    // Blur and smear read neighbouring texels: they're done for the
+                    // whole segment at once, after every triangle (see `filter`).
+                    let (shift, spread) = match self.effect {
+                        Effect::Paint | Effect::Erase => {
+                            self.apply(x, y, amount);
+                            continue;
                         }
-                    }
+                        Effect::Blur(reach) => (Vec2::ZERO, reach / texel_size),
+                        Effect::Smear(motion) => {
+                            let Some(source) = barycentric_3d(position - motion, triangle.position)
+                            else {
+                                continue;
+                            };
+                            (interpolate(corners, source) - center, 0.0)
+                        }
+                    };
+                    self.covered.push(Covered {
+                        x,
+                        y,
+                        amount,
+                        shift,
+                        spread,
+                    });
                 }
             }
         }
-        if !covered.is_empty() {
-            let texel_size = texel_reach * std::f32::consts::SQRT_2;
-            self.filter(triangle, texel_size, &covered);
+    }
+
+    /// Blurs or smears this segment's covered texels.
+    fn filter(&mut self, mut covered: Vec<Covered>) {
+        // Neighbouring triangles share their seam-margin texels: keep each
+        // texel once, with its strongest coverage.
+        covered.sort_unstable_by_key(|c| (c.y, c.x));
+        covered.dedup_by(|later, kept| {
+            let same = (later.x, later.y) == (kept.x, kept.y);
+            if same && later.amount > kept.amount {
+                *kept = *later;
+            }
+            same
+        });
+        match self.effect {
+            Effect::Blur(_) => self.blur(&covered),
+            Effect::Smear(_) => self.smear(&covered),
+            Effect::Paint | Effect::Erase => {}
         }
     }
 
-    /// Blurs or smears the `covered` texels (x, y, coverage, world position)
-    /// of `triangle`, reading the image as it was before each pass.
-    /// `texel_size` is the world size of one of the triangle's texels.
-    fn filter(&mut self, triangle: &Triangle, texel_size: f32, covered: &[(u32, u32, f32, Vec3)]) {
-        let size = Vec2::new(self.width as f32, self.height as f32);
-        let (opacity, effect) = (self.opacity, self.effect);
-        let mask = self.mask.as_deref().map(Vec::as_slice);
-        // Each blur pass spreads paint by about a texel (its variance is one
-        // texel squared), so a wider blur repeats it.
-        let (passes, opacity) = match effect {
-            Effect::Blur(reach) if texel_size > 0.0 => {
-                let variance = (reach / texel_size).powi(2);
-                let passes = (variance.ceil() as u32).clamp(1, MAX_BLUR_PASSES);
-                // Less than one pass due: do one, proportionally weaker.
-                (passes, opacity * variance.min(1.0))
-            }
-            Effect::Blur(_) => (0, opacity),
-            _ => (1, opacity),
+    /// A Gaussian blur of the covered texels, done horizontally then
+    /// vertically on tiles around them. Texels outside the UV islands
+    /// (`mask`) are left out of the average.
+    fn blur(&mut self, covered: &[Covered]) {
+        let spread = covered.iter().map(|c| c.spread).sum::<f32>() / covered.len() as f32;
+        // Narrower than a texel can't be sampled: blur one texel, more weakly.
+        let (sigma, opacity) = if spread < 1.0 {
+            (1.0, self.opacity * spread * spread)
+        } else {
+            (spread.min(MAX_BLUR_TEXELS), self.opacity)
         };
+        if opacity <= 0.0 {
+            return;
+        }
+        let radius = (sigma * 3.0).ceil() as i64;
+        let kernel: Vec<f32> = (-radius..=radius)
+            .map(|i| (-((i * i) as f32) / (2.0 * sigma * sigma)).exp())
+            .collect();
+
+        // Covered texels by tile (they are sorted by row, so group explicitly).
+        let mut tiles: HashMap<(u32, u32), Vec<Covered>> = HashMap::new();
+        for c in covered {
+            tiles
+                .entry((c.x / BLUR_TILE, c.y / BLUR_TILE))
+                .or_default()
+                .push(*c);
+        }
+        let mask = self.mask.clone();
+        let tiles: Vec<_> = tiles.into_iter().collect();
+        let mask = mask.as_deref().map(Vec::as_slice);
         for target in &mut self.channels {
-            for _ in 0..passes {
-                target.filter_pass(triangle, size, opacity, effect, mask, covered);
+            // A tile is a lot of work: a few are worth spreading out.
+            let blurred = parallel_filter_map(&tiles, 4, |((tile_x, tile_y), texels)| {
+                Some(target.blur_tile(*tile_x, *tile_y, radius, &kernel, mask, texels, opacity))
+            });
+            for (x, y, pixel) in blurred.into_iter().flatten() {
+                target.write(x, y, pixel);
+            }
+        }
+    }
+
+    /// Pushes paint along the stroke: each covered texel takes the paint
+    /// from `shift` back. Long moves go in steps of at most a texel, so the
+    /// paint flows instead of jumping (and never reads far outside its island).
+    fn smear(&mut self, covered: &[Covered]) {
+        let longest = covered.iter().map(|c| c.shift.length()).fold(0.0, f32::max);
+        if longest <= 0.0 {
+            return;
+        }
+        let steps = (longest.ceil() as usize).clamp(1, MAX_SMEAR_STEPS);
+        // Split the strength too, so the result doesn't depend on the steps.
+        let opacity = 1.0 - (1.0 - self.opacity.clamp(0.0, 1.0)).powf(1.0 / steps as f32);
+        for target in &mut self.channels {
+            for _ in 0..steps {
+                let new = parallel_filter_map(covered, 4096, |c| {
+                    let from = Vec2::new(c.x as f32, c.y as f32) + c.shift / steps as f32;
+                    let source = target.sample(from)?;
+                    let current = target.premultiplied(c.x as i64, c.y as i64);
+                    let strength = c.amount.min(1.0) * opacity;
+                    Some((c.x, c.y, target.encode(current.lerp(source, strength))))
+                });
+                for (x, y, pixel) in new {
+                    target.write(x, y, pixel);
+                }
             }
         }
     }
@@ -1311,6 +1435,30 @@ impl SlotTarget<'_> {
             *target.region = Some(target.region.map_or(pixel, |region| region.union(pixel)));
         }
     }
+}
+
+/// `items.iter().filter_map(f).collect()`, spread over the CPU cores when
+/// there are at least `min_items` (fewer aren't worth starting threads for).
+/// Keeps the order.
+fn parallel_filter_map<T: Sync, R: Send>(
+    items: &[T],
+    min_items: usize,
+    f: impl Fn(&T) -> Option<R> + Sync,
+) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads < 2 || items.len() < min_items {
+        return items.iter().filter_map(f).collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = items
+            .chunks(chunk)
+            .map(|part| scope.spawn(|| part.iter().filter_map(&f).collect::<Vec<R>>()))
+            .collect();
+        jobs.into_iter()
+            .flat_map(|job| job.join().expect("brush worker thread panicked"))
+            .collect()
+    })
 }
 
 fn tiles_x(width: u32) -> u32 {
