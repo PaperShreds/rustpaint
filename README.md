@@ -30,9 +30,8 @@ Paint goes into the layer selected in the right-hand panel. Each layer has a
 visibility checkbox, a thumbnail, a name (double-click to rename), and a
 dropdown of the material slots it paints on; one stroke can cross several
 slots. The bottom **Base** layer holds the model's own textures: it can be
-hidden but not painted on, so the original stays intact. Use **Erase** in the
-brush panel to remove paint from a layer. Materials without a texture get a
-blank 2048×2048 canvas in their base color.
+hidden but not painted on, so the original stays intact. Materials without a
+texture get a blank 2048×2048 canvas in their base color.
 
 Each layer has an opacity and a blend mode (Normal, Multiply, Screen, Overlay,
 Darken, Lighten, Add). Layers are combined on the GPU, in linear light.
@@ -42,9 +41,19 @@ model, and parts further away get a bigger share of it. Tick **Keep size on
 model** to give the brush one size on the model instead: it scales with zooming
 and is the same on near and far parts.
 
-The **Fill** tool fills the selected layer with the ticked channels in one
-click: the whole layer, the material under the cursor, or the UV island under
-the cursor (the connected piece of the UV layout). Undo removes the fill.
+The brush panel has four tools:
+
+- **Paint** puts the ticked channels' values onto the selected layer.
+- **Smear** pushes the layer's paint along the stroke, like a finger in wet
+  paint.
+- **Blur** softens the layer's paint under the brush; the further you move,
+  the more it blurs. It stays within the model's UV islands.
+- **Fill** fills in one click: the whole layer, the material under the cursor,
+  or the UV island under the cursor (the connected piece of the UV layout).
+
+Turn on **Erase** to make Paint and Fill remove paint instead. Smear and Blur
+work on the selected layer's own paint and on the ticked channels; for them
+the brush's opacity is its strength.
 
 When a stroke changes metallic with a soft brush, its edge mixes the two
 materials' values: painting dielectric over a white metal gives a pale ring,
@@ -67,8 +76,8 @@ Closing the window, or opening another file, with unsaved changes asks whether
 to save them first. **File > Open recent** lists the last files you opened or
 saved.
 
-The program remembers your recent files, environment, view, brush settings,
-and window size between runs (in `~/.local/share/rustpaint/` on Linux, the
+The program remembers your recent files, environment, view, brush and
+autosave settings, and window size between runs (in `~/.local/share/rustpaint/` on Linux, the
 user's app data folder on Windows and macOS).
 
 Undo and redo strokes and layer changes with **Ctrl+Z** and **Ctrl+Shift+Z**
@@ -82,10 +91,10 @@ in one file, for Blender, Godot, Unity, Unreal or a web viewer. Each material
 gets a base color texture and a metallic-roughness texture (roughness in green,
 metallic in blue, as glTF expects).
 
-While there are unsaved changes, a recovery copy is autosaved every two minutes
-(in a `recovery` folder next to the settings). If RustPaint crashes, it offers
-to restore that work on the next start. Saving or closing normally removes the
-copy.
+While there are unsaved changes, a recovery copy is autosaved every 30 seconds
+(in a `recovery` folder next to the settings; **Settings** in the menu bar turns
+it off or changes how often). If RustPaint crashes, it offers to restore that
+work on the next start. Saving or closing normally removes the copy.
 
 **File > Export textures...** writes, for each material slot, one PNG per
 channel with its visible layers combined: `<model>_<material>_BaseColor.png`,

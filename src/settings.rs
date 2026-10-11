@@ -15,6 +15,34 @@ pub const STORAGE_KEY: &str = "rustpaint_settings";
 /// How many files File > Open recent lists.
 pub const MAX_RECENT_FILES: usize = 10;
 
+/// How often unsaved work is autosaved for crash recovery.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Autosave {
+    pub enabled: bool,
+    pub interval_seconds: f32,
+}
+
+impl Autosave {
+    pub const MIN_SECONDS: f32 = 10.0;
+    pub const MAX_SECONDS: f32 = 600.0;
+
+    pub fn interval(&self) -> std::time::Duration {
+        let seconds = self
+            .interval_seconds
+            .clamp(Self::MIN_SECONDS, Self::MAX_SECONDS);
+        std::time::Duration::from_secs_f32(seconds.round())
+    }
+}
+
+impl Default for Autosave {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 30.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     /// Most recent first.
@@ -23,6 +51,7 @@ pub struct Settings {
     pub environment: EnvironmentSettings,
     pub view_mode: ViewMode,
     pub brush: Brush,
+    pub autosave: Autosave,
 }
 
 impl Settings {
@@ -67,6 +96,11 @@ impl Settings {
             .iter()
             .position(|mode| *mode == self.view_mode);
         put("view_mode", view.unwrap_or(0).to_string());
+        put("autosave", self.autosave.enabled.to_string());
+        put(
+            "autosave_interval",
+            self.autosave.interval_seconds.round().to_string(),
+        );
         let brush = &self.brush;
         put("brush_size", brush.size.to_string());
         put("brush_hardness", brush.hardness.to_string());
@@ -144,6 +178,12 @@ impl Settings {
                 }
             }
             "brush_size" => number(value, &mut brush.size, brush::MIN_SIZE..=brush::MAX_SIZE),
+            "autosave" => flag(value, &mut self.autosave.enabled),
+            "autosave_interval" => number(
+                value,
+                &mut self.autosave.interval_seconds,
+                Autosave::MIN_SECONDS..=Autosave::MAX_SECONDS,
+            ),
             "brush_hardness" => number(value, &mut brush.hardness, 0.0..=1.0),
             "brush_opacity" => number(value, &mut brush.opacity, 0.0..=1.0),
             "brush_paint_color" => flag(value, &mut brush.paint_color),
@@ -208,6 +248,10 @@ mod tests {
         settings.brush.screen_space = true;
         settings.brush.keep_size_on_model = true;
         settings.brush.fill_mode = FillMode::UvIsland;
+        settings.autosave = Autosave {
+            enabled: false,
+            interval_seconds: 45.0,
+        };
 
         assert_eq!(Settings::from_text(&settings.to_text()), settings);
 

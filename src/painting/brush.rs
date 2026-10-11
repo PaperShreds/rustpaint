@@ -9,10 +9,30 @@ pub const MAX_SIZE: f32 = 2048.0;
 pub enum Tool {
     #[default]
     Paint,
-    /// Remove paint from the layer.
-    Erase,
+    /// Push the layer's paint along the stroke, like a finger in wet paint.
+    Smear,
+    /// Soften the layer's paint under the brush.
+    Blur,
     /// Fill an area of the layer with the brush's values in one click.
     Fill,
+}
+
+impl Tool {
+    pub const ALL: [Tool; 4] = [Tool::Paint, Tool::Smear, Tool::Blur, Tool::Fill];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Paint => "Paint",
+            Tool::Smear => "Smear",
+            Tool::Blur => "Blur",
+            Tool::Fill => "Fill",
+        }
+    }
+
+    /// Whether the erase toggle applies (it removes paint instead of adding it).
+    pub fn can_erase(self) -> bool {
+        matches!(self, Tool::Paint | Tool::Fill)
+    }
 }
 
 /// How much of the layer the fill tool covers.
@@ -75,6 +95,8 @@ pub struct Brush {
     /// size on screen, so it covers more of the model further away.
     pub keep_size_on_model: bool,
     pub tool: Tool,
+    /// Paint and Fill remove paint from the layer instead of adding it.
+    pub erase: bool,
     pub fill_mode: FillMode,
 }
 
@@ -94,7 +116,15 @@ impl Default for Brush {
             paint_over_edges: true,
             keep_size_on_model: false,
             tool: Tool::Paint,
+            erase: false,
             fill_mode: FillMode::Layer,
         }
+    }
+}
+
+impl Brush {
+    /// Whether strokes remove paint: the erase toggle, for tools it applies to.
+    pub fn erases(&self) -> bool {
+        self.erase && self.tool.can_erase()
     }
 }

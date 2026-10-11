@@ -1,5 +1,6 @@
 use crate::renderer::environment::{BuiltIn, EnvironmentSource};
 use crate::renderer::viewport::{EnvironmentSettings, ViewMode};
+use crate::settings::Autosave;
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -47,6 +48,7 @@ pub fn show(
     ui: &mut egui::Ui,
     state: &MenuState<'_>,
     environment: &mut EnvironmentSettings,
+    autosave: &mut Autosave,
 ) -> Option<MenuAction> {
     // Check the more specific shortcuts first: Ctrl+Shift+S also matches Ctrl+S.
     let mut action = ui.input_mut(|i| {
@@ -168,6 +170,24 @@ pub fn show(
                     environment.show_background,
                     egui::Slider::new(&mut environment.background_blur, 0.0..=1.0)
                         .text("Background blur"),
+                );
+            });
+            ui.menu_button("Settings", |ui| {
+                ui.checkbox(&mut autosave.enabled, "Autosave")
+                    .on_hover_text(
+                        "While there are unsaved changes, keep a recovery copy that is \
+                         offered for restoring if RustPaint crashes",
+                    );
+                ui.add_enabled(
+                    autosave.enabled,
+                    egui::Slider::new(
+                        &mut autosave.interval_seconds,
+                        Autosave::MIN_SECONDS..=Autosave::MAX_SECONDS,
+                    )
+                    .logarithmic(true)
+                    .integer()
+                    .suffix(" s")
+                    .text("Every"),
                 );
             });
         });

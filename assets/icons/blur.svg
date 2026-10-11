@@ -1,0 +1,19 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 20010904//EN" "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd">
+<!-- Created using Krita: https://krita.org -->
+<svg xmlns="http://www.w3.org/2000/svg"
+    xmlns:xlink="http://www.w3.org/1999/xlink"
+    xmlns:krita="http://krita.org/namespaces/svg/krita"
+    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+    width="737.28pt"
+    height="737.28pt"
+    viewBox="0 0 737.28 737.28">
+<defs>
+  <radialGradient id="gradient0" gradientUnits="objectBoundingBox" cx="0.498450413223136" cy="0.50501022494887" fx="0.498450413223136" fy="0.50501022494887" r="0.524750752455749" spreadMethod="pad">
+   <stop stop-color="#ffffff" offset="0" stop-opacity="1"/>
+   <stop stop-color="#ffffff" offset="0.858744394618834" stop-opacity="0.0588235"/>
+   <stop stop-color="#6b6a7b" offset="0.979820627802691" stop-opacity="0"/>
+  </radialGradient>
+ </defs>
+<ellipse id="shape0" transform="translate(21.5999999999997, 21.6000000000001)" rx="348.48" ry="352.08" cx="348.48" cy="352.08" fill="url(#gradient0)" fill-rule="evenodd" stroke="none" stroke-width="70.1424" stroke-linecap="square" stroke-linejoin="bevel"/>
+</svg>

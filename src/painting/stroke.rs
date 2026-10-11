@@ -17,7 +17,9 @@ use crate::painting::history;
 use crate::renderer::camera::OrbitCamera;
 use egui::{Pos2, Rect};
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 const TILE_SIZE: f32 = 32.0;
 /// Texels whose centre lies this many texels outside a triangle's UV footprint
@@ -31,6 +33,10 @@ const DEPTH_TOLERANCE: f32 = 1e-3;
 /// Two triangles sharing an edge are one smooth surface when their vertex
 /// normals along it agree this closely (cosine); otherwise it's a hard edge.
 const SMOOTH_EDGE_COSINE: f32 = 0.99;
+/// How far the blur brush spreads paint, as a share of the brush radius.
+const BLUR_SHARE: f32 = 0.25;
+/// Most blur passes per dab (each spreads paint by about one texel).
+const MAX_BLUR_PASSES: u32 = 16;
 /// Number of points in the projected brush outline.
 const OUTLINE_POINTS: usize = 48;
 
@@ -57,6 +63,8 @@ impl Triangle {
 
 /// A shared edge, identified by the exact bits of its two end positions.
 type EdgeKey = ([u32; 3], [u32; 3]);
+/// Which texels of a texture the model's UVs use, row by row.
+type UvMask = Rc<Vec<bool>>;
 /// A UV edge within one material slot, by the exact bits of its two end UVs.
 type UvEdgeKey = (usize, [u32; 2], [u32; 2]);
 
@@ -215,6 +223,9 @@ pub struct StrokePainter {
     tiles: Vec<Vec<u32>>,
     /// Every triangle edge, sorted by key, to find neighbours. Built on first use.
     edges: OnceCell<Vec<(EdgeKey, u32)>>,
+    /// Per (material, width, height): which texels the model's UVs use.
+    /// Built when the blur brush first needs it.
+    uv_masks: RefCell<HashMap<(usize, u32, u32), UvMask>>,
 }
 
 impl StrokePainter {
@@ -236,6 +247,7 @@ impl StrokePainter {
             tiles_y,
             tiles: vec![Vec::new(); tiles_x * tiles_y],
             edges: OnceCell::new(),
+            uv_masks: RefCell::default(),
         };
 
         for submesh in &mesh.submeshes {
@@ -313,6 +325,37 @@ impl StrokePainter {
         }
         let radius = (brush.size * 0.5).max(0.5);
         let mut target = LayerTarget::new(layer, stroke, slot_sizes, brush);
+        match brush.tool {
+            Tool::Smear => {
+                target.effect = Effect::Smear(self.smear_motion(from, to, radius, brush))
+            }
+            Tool::Blur => {
+                let reach = self.surface_hit(to).map_or(0.0, |hit| {
+                    BLUR_SHARE * self.brush_world_radius(hit.position, radius, brush)
+                });
+                // The blur builds up with the distance the brush travels (a
+                // full dab per brush radius), not with how often the mouse
+                // reports a move. A click is one full dab. Blur passes add up
+                // as variance, hence the square root.
+                let travel = if from == to {
+                    1.0
+                } else {
+                    (from.distance(to) / radius).min(1.0)
+                };
+                target.effect = Effect::Blur(reach * travel.sqrt());
+                // Blur only within the UV islands, so paint doesn't drain
+                // into the unused texture space around them.
+                target.masks = slot_sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(material, &(width, height))| {
+                        (target.layer.targets.get(material) == Some(&true))
+                            .then(|| self.uv_mask(material, width, height))
+                    })
+                    .collect();
+            }
+            Tool::Paint | Tool::Fill => {}
+        }
         if brush.screen_space {
             self.paint_screen_segment(&mut target, from, to, radius, brush.hardness);
         } else {
@@ -369,6 +412,44 @@ impl StrokePainter {
         target.changed()
     }
 
+    /// Which texels of a `width` x `height` texture the triangles of
+    /// `material` cover (with the seam margin), as row-major flags.
+    fn uv_mask(&self, material: usize, width: u32, height: u32) -> Rc<Vec<bool>> {
+        let key = (material, width, height);
+        if let Some(mask) = self.uv_masks.borrow().get(&key) {
+            return Rc::clone(mask);
+        }
+        let size = Vec2::new(width as f32, height as f32);
+        let mut mask = vec![false; width as usize * height as usize];
+        for triangle in self.triangles.iter().filter(|t| t.material == material) {
+            let corners = triangle.uv.map(|uv| uv * size);
+            let Some(margins) = edge_margins(corners, SEAM_MARGIN_TEXELS) else {
+                continue;
+            };
+            let (lo, hi) = uv_bounds(&corners);
+            let (min_x, max_x) =
+                texel_range(lo.x - SEAM_MARGIN_TEXELS, hi.x + SEAM_MARGIN_TEXELS, width);
+            let (min_y, max_y) =
+                texel_range(lo.y - SEAM_MARGIN_TEXELS, hi.y + SEAM_MARGIN_TEXELS, height);
+            for raw_y in min_y..=max_y {
+                for raw_x in min_x..=max_x {
+                    let center = Vec2::new(raw_x as f32 + 0.5, raw_y as f32 + 0.5);
+                    let Some(weights) = barycentric_2d(center, corners) else {
+                        continue;
+                    };
+                    if weights.iter().zip(margins).all(|(w, margin)| *w >= -margin) {
+                        let x = raw_x.rem_euclid(width as i64) as usize;
+                        let y = raw_y.rem_euclid(height as i64) as usize;
+                        mask[y * width as usize + x] = true;
+                    }
+                }
+            }
+        }
+        let mask = Rc::new(mask);
+        self.uv_masks.borrow_mut().insert(key, Rc::clone(&mask));
+        mask
+    }
+
     /// The triangles in the same UV island as `start`: same material slot,
     /// joined through edges that share both UV coordinates.
     fn uv_island(&self, start: u32) -> Vec<u32> {
@@ -402,6 +483,22 @@ impl StrokePainter {
         (0..self.triangles.len() as u32)
             .filter(|&index| root(&mut parent, index) == island)
             .collect()
+    }
+
+    /// How far the paint moves on the model during a smear segment: from
+    /// the surface under `from` to the surface under `to`. Zero when either
+    /// misses, or when they lie on different surfaces (far apart in 3D).
+    fn smear_motion(&self, from: Vec2, to: Vec2, radius: f32, brush: &Brush) -> Vec3 {
+        let (Some(start), Some(end)) = (self.surface_hit(from), self.surface_hit(to)) else {
+            return Vec3::ZERO;
+        };
+        let motion = end.position - start.position;
+        let reach = self.brush_world_radius(end.position, radius + from.distance(to), brush);
+        if motion.length() > 2.0 * reach {
+            Vec3::ZERO
+        } else {
+            motion
+        }
     }
 
     /// Outline of the surface brush under the cursor: a disc lying on the
@@ -839,9 +936,24 @@ struct LayerTarget<'a> {
     slot_sizes: &'a [(u32, u32)],
     values: Vec<(Channel, [f32; 3])>,
     opacity: f32,
-    erase: bool,
+    effect: Effect,
+    /// Per slot, the texels the blur may use (see `StrokePainter::uv_mask`).
+    masks: Vec<Option<Rc<Vec<bool>>>>,
     /// Changed region per slot and channel.
     regions: Vec<[Option<ImageRegion>; Channel::COUNT]>,
+}
+
+/// What a stroke does to the texels it covers.
+#[derive(Clone, Copy)]
+enum Effect {
+    /// Blend the brush's values in.
+    Paint,
+    /// Remove paint.
+    Erase,
+    /// Average with the texels around, this far (world units).
+    Blur(f32),
+    /// Pull in the paint from this far back along the stroke (world units).
+    Smear(Vec3),
 }
 
 impl<'a> LayerTarget<'a> {
@@ -857,7 +969,13 @@ impl<'a> LayerTarget<'a> {
             slot_sizes,
             values: brush_values(brush),
             opacity: brush.opacity.clamp(0.0, 1.0),
-            erase: brush.tool == Tool::Erase,
+            effect: match brush.tool {
+                Tool::Blur => Effect::Blur(0.0),
+                Tool::Smear => Effect::Smear(Vec3::ZERO),
+                Tool::Paint | Tool::Fill if brush.erases() => Effect::Erase,
+                Tool::Paint | Tool::Fill => Effect::Paint,
+            },
+            masks: Vec::new(),
             regions: vec![Default::default(); slot_sizes.len()],
         }
     }
@@ -913,7 +1031,8 @@ impl<'a> LayerTarget<'a> {
             width,
             height,
             opacity: self.opacity,
-            erase: self.erase,
+            effect: self.effect,
+            mask: self.masks.get(material).cloned().flatten(),
         })
     }
 }
@@ -927,13 +1046,133 @@ struct ChannelTarget<'a> {
     encoding: Encoding,
 }
 
+/// Binomial weights of the blur kernel (5x5 when used along both axes).
+const BLUR_WEIGHTS: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
+
+impl ChannelTarget<'_> {
+    /// One pass of `SlotTarget::filter`: works out the new value of every
+    /// covered texel from the image as it is, then writes them all.
+    fn filter_pass(
+        &mut self,
+        triangle: &Triangle,
+        size: Vec2,
+        opacity: f32,
+        effect: Effect,
+        mask: Option<&[bool]>,
+        covered: &[(u32, u32, f32, Vec3)],
+    ) {
+        let new: Vec<(u32, u32, [u8; 4])> = covered
+            .iter()
+            .filter_map(|&(x, y, amount, position)| {
+                let source = match effect {
+                    Effect::Blur(_) => self.blurred(x, y, mask),
+                    Effect::Smear(motion) => {
+                        // The point the paint comes from, in texel space.
+                        let from = barycentric_3d(position - motion, triangle.position)?;
+                        let texel = interpolate(triangle.uv, from) * size - Vec2::splat(0.5);
+                        self.sample(texel)?
+                    }
+                    Effect::Paint | Effect::Erase => return None,
+                };
+                let current = self.premultiplied(x as i64, y as i64);
+                let strength = (amount.min(1.0) * opacity).clamp(0.0, 1.0);
+                Some((x, y, self.encode(current.lerp(source, strength))))
+            })
+            .collect();
+        let width = self.image.width;
+        for (x, y, pixel) in new {
+            let offset = ((y * width + x) * 4) as usize;
+            if self.image.rgba[offset..offset + 4] == pixel {
+                continue;
+            }
+            self.image.rgba[offset..offset + 4].copy_from_slice(&pixel);
+            let tile = (y / history::TILE_SIZE) * tiles_x(width) + x / history::TILE_SIZE;
+            self.stroke.touched_tiles[tile as usize] = true;
+            let pixel = ImageRegion::pixel(x, y);
+            *self.region = Some(self.region.map_or(pixel, |region| region.union(pixel)));
+        }
+    }
+
+    /// Texel (x, y), wrapping around the edges, as linear premultiplied RGBA.
+    fn premultiplied(&self, x: i64, y: i64) -> Vec4 {
+        let x = x.rem_euclid(self.image.width as i64) as u32;
+        let y = y.rem_euclid(self.image.height as i64) as u32;
+        let offset = ((y * self.image.width + x) * 4) as usize;
+        let pixel = &self.image.rgba[offset..offset + 4];
+        let alpha = pixel[3] as f32 / 255.0;
+        Vec4::new(
+            self.encoding.decode(pixel[0]) * alpha,
+            self.encoding.decode(pixel[1]) * alpha,
+            self.encoding.decode(pixel[2]) * alpha,
+            alpha,
+        )
+    }
+
+    /// Back from linear premultiplied RGBA to the stored pixel.
+    fn encode(&self, value: Vec4) -> [u8; 4] {
+        let alpha = value.w.clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            return [0; 4];
+        }
+        [
+            self.encoding.encode(value.x / alpha),
+            self.encoding.encode(value.y / alpha),
+            self.encoding.encode(value.z / alpha),
+            (alpha * 255.0).round() as u8,
+        ]
+    }
+
+    /// Weighted average of the 5x5 texels around (x, y), leaving out those
+    /// `mask` marks as unused.
+    fn blurred(&self, x: u32, y: u32, mask: Option<&[bool]>) -> Vec4 {
+        let (width, height) = (self.image.width as i64, self.image.height as i64);
+        let mut sum = Vec4::ZERO;
+        let mut total = 0.0;
+        for (dy, wy) in (-2..=2).zip(BLUR_WEIGHTS) {
+            for (dx, wx) in (-2..=2).zip(BLUR_WEIGHTS) {
+                let (sx, sy) = (x as i64 + dx, y as i64 + dy);
+                let index = (sy.rem_euclid(height) * width + sx.rem_euclid(width)) as usize;
+                if mask.is_some_and(|mask| !mask.get(index).copied().unwrap_or(false)) {
+                    continue;
+                }
+                sum += self.premultiplied(sx, sy) * (wx * wy);
+                total += wx * wy;
+            }
+        }
+        if total > 0.0 {
+            sum / total
+        } else {
+            self.premultiplied(x as i64, y as i64)
+        }
+    }
+
+    /// Bilinear sample at a texel-space position (texel centres at integers).
+    fn sample(&self, texel: Vec2) -> Option<Vec4> {
+        if !texel.is_finite() {
+            return None;
+        }
+        let base = texel.floor();
+        let f = texel - base;
+        let (x, y) = (base.x as i64, base.y as i64);
+        let top = self
+            .premultiplied(x, y)
+            .lerp(self.premultiplied(x + 1, y), f.x);
+        let bottom = self
+            .premultiplied(x, y + 1)
+            .lerp(self.premultiplied(x + 1, y + 1), f.x);
+        Some(top.lerp(bottom, f.y))
+    }
+}
+
 /// One slot's textures being painted, all the same size.
 struct SlotTarget<'a> {
     channels: Vec<ChannelTarget<'a>>,
     width: u32,
     height: u32,
     opacity: f32,
-    erase: bool,
+    effect: Effect,
+    /// Texels the blur may use; `None` means all.
+    mask: Option<Rc<Vec<bool>>>,
 }
 
 impl SlotTarget<'_> {
@@ -972,6 +1211,9 @@ impl SlotTarget<'_> {
 
         let (min_x, max_x) = texel_range(lo.x, hi.x, self.width);
         let (min_y, max_y) = texel_range(lo.y, hi.y, self.height);
+        // Blur and smear read neighbouring texels, so they first work out
+        // every new value and only then write them.
+        let mut covered = Vec::new();
         for raw_y in min_y..=max_y {
             for raw_x in min_x..=max_x {
                 let center = Vec2::new(raw_x as f32 + 0.5, raw_y as f32 + 0.5);
@@ -981,12 +1223,48 @@ impl SlotTarget<'_> {
                 if weights.iter().zip(margins).any(|(w, margin)| *w < -margin) {
                     continue;
                 }
-                let amount = coverage(interpolate(triangle.position, weights), texel_reach);
+                let position = interpolate(triangle.position, weights);
+                let amount = coverage(position, texel_reach);
                 if amount > 0.0 {
                     let x = raw_x.rem_euclid(self.width as i64) as u32;
                     let y = raw_y.rem_euclid(self.height as i64) as u32;
-                    self.apply(x, y, amount);
+                    match self.effect {
+                        Effect::Paint | Effect::Erase => self.apply(x, y, amount),
+                        Effect::Blur(_) | Effect::Smear(_) => {
+                            covered.push((x, y, amount, position))
+                        }
+                    }
                 }
+            }
+        }
+        if !covered.is_empty() {
+            let texel_size = texel_reach * std::f32::consts::SQRT_2;
+            self.filter(triangle, texel_size, &covered);
+        }
+    }
+
+    /// Blurs or smears the `covered` texels (x, y, coverage, world position)
+    /// of `triangle`, reading the image as it was before each pass.
+    /// `texel_size` is the world size of one of the triangle's texels.
+    fn filter(&mut self, triangle: &Triangle, texel_size: f32, covered: &[(u32, u32, f32, Vec3)]) {
+        let size = Vec2::new(self.width as f32, self.height as f32);
+        let (opacity, effect) = (self.opacity, self.effect);
+        let mask = self.mask.as_deref().map(Vec::as_slice);
+        // Each blur pass spreads paint by about a texel (its variance is one
+        // texel squared), so a wider blur repeats it.
+        let (passes, opacity) = match effect {
+            Effect::Blur(reach) if texel_size > 0.0 => {
+                let variance = (reach / texel_size).powi(2);
+                let passes = (variance.ceil() as u32).clamp(1, MAX_BLUR_PASSES);
+                // Less than one pass due: do one, proportionally weaker.
+                (passes, opacity * variance.min(1.0))
+            }
+            Effect::Blur(_) => (0, opacity),
+            _ => (1, opacity),
+        };
+        for target in &mut self.channels {
+            for _ in 0..passes {
+                target.filter_pass(triangle, size, opacity, effect, mask, covered);
             }
         }
     }
@@ -1016,7 +1294,7 @@ impl SlotTarget<'_> {
             let original = &target.stroke.original[offset..offset + 4];
             let original_alpha = original[3] as f32 / 255.0;
             let out = &mut target.image.rgba[offset..offset + 4];
-            if self.erase {
+            if matches!(self.effect, Effect::Erase) {
                 out.copy_from_slice(original);
                 out[3] = (original_alpha * (1.0 - alpha) * 255.0).round() as u8;
             } else {
@@ -1305,6 +1583,15 @@ mod tests {
         points: &[Pos2],
         brush: &Brush,
     ) -> Option<ImageRegion> {
+        paint_strokes(mesh, camera, &[(points, brush)])
+    }
+
+    /// Like `paint`, with several strokes one after another on the same layer.
+    fn paint_strokes(
+        mesh: &mut Mesh,
+        camera: &OrbitCamera,
+        strokes: &[(&[Pos2], &Brush)],
+    ) -> Option<ImageRegion> {
         let painter = StrokePainter::new(mesh, camera, viewport());
         let empty = Mesh {
             vertices: Vec::new(),
@@ -1317,19 +1604,21 @@ mod tests {
             *target = slot == 0;
         }
         let sizes = document.slot_sizes();
-        let mut stroke = Stroke::begin(&document, 1).unwrap();
         let mut region: Option<ImageRegion> = None;
-        let segments: Vec<_> = if points.len() == 1 {
-            vec![(points[0], points[0])]
-        } else {
-            points.windows(2).map(|pair| (pair[0], pair[1])).collect()
-        };
-        for (from, to) in segments {
-            let layer = &mut document.layers[1];
-            for (_, _, changed) in
-                painter.paint_segment(&mut stroke, layer, &sizes, from, to, brush)
-            {
-                region = Some(region.map_or(changed, |r| r.union(changed)));
+        for &(points, brush) in strokes {
+            let mut stroke = Stroke::begin(&document, 1).unwrap();
+            let segments: Vec<_> = if points.len() == 1 {
+                vec![(points[0], points[0])]
+            } else {
+                points.windows(2).map(|pair| (pair[0], pair[1])).collect()
+            };
+            for (from, to) in segments {
+                let layer = &mut document.layers[1];
+                for (_, _, changed) in
+                    painter.paint_segment(&mut stroke, layer, &sizes, from, to, brush)
+                {
+                    region = Some(region.map_or(changed, |r| r.union(changed)));
+                }
             }
         }
 
@@ -1674,7 +1963,7 @@ mod tests {
         let point = Pos2::new(91.0, 128.0);
         let mut paint_brush = brush(20.0, false);
         for erase in [false, true] {
-            paint_brush.tool = if erase { Tool::Erase } else { Tool::Paint };
+            paint_brush.erase = erase;
             let mut stroke = Stroke::begin(&document, 1).unwrap();
             painter.paint_segment(
                 &mut stroke,
@@ -1925,5 +2214,113 @@ mod tests {
         );
         let ratio = dab(far, false) / dab(near, false);
         assert!(ratio > 3.0, "screen size: far/near = {ratio}");
+    }
+
+    /// A hard red dab on the left triangle of `test_mesh`, at (76, 145).
+    fn red_dab() -> (Vec<Pos2>, Brush) {
+        (vec![Pos2::new(76.0, 145.0)], brush(30.0, false))
+    }
+
+    #[test]
+    fn blur_softens_the_edge_of_paint() {
+        let (dab, paint_brush) = red_dab();
+        let mut hard = test_mesh();
+        paint(&mut hard, &test_camera(), &dab, &paint_brush);
+
+        let blur = Brush {
+            tool: Tool::Blur,
+            ..brush(60.0, false)
+        };
+        // A few short segments, like holding the mouse over the spot.
+        let wiggle: Vec<_> = (0..12)
+            .map(|i| Pos2::new(76.0 + (i % 2) as f32, 145.0))
+            .collect();
+        let mut soft = test_mesh();
+        paint_strokes(
+            &mut soft,
+            &test_camera(),
+            &[(&dab, &paint_brush), (&wiggle, &blur)],
+        );
+
+        // Partly covered texels: the hard dab has (nearly) none, the blurred one many.
+        let partial = |mesh: &Mesh| {
+            painted(mesh)
+                .iter()
+                .filter(|(_, _, red)| (20..230).contains(red))
+                .count()
+        };
+        assert!(
+            partial(&soft) > partial(&hard) + 50,
+            "{} vs {}",
+            partial(&soft),
+            partial(&hard)
+        );
+        // Blurring spreads paint out; it doesn't add or remove much of it.
+        // (Summed as linear light; the stored values are sRGB-encoded.)
+        let total = |mesh: &Mesh| {
+            painted(mesh)
+                .iter()
+                .map(|t| crate::mesh::Encoding::Srgb.decode(t.2))
+                .sum::<f32>()
+        };
+        let ratio = total(&soft) / total(&hard);
+        assert!((0.8..1.25).contains(&ratio), "total paint ratio {ratio}");
+    }
+
+    #[test]
+    fn smear_pushes_paint_along_the_stroke() {
+        let (dab, paint_brush) = red_dab();
+        let smear = Brush {
+            tool: Tool::Smear,
+            ..brush(30.0, false)
+        };
+        // Drag from the middle of the dab to the right, in small steps.
+        let drag: Vec<_> = (0..=20)
+            .map(|i| Pos2::new(76.0 + i as f32, 145.0))
+            .collect();
+        let mut dabbed = test_mesh();
+        paint(&mut dabbed, &test_camera(), &dab, &paint_brush);
+        let mut smeared = test_mesh();
+        paint_strokes(
+            &mut smeared,
+            &test_camera(),
+            &[(&dab, &paint_brush), (&drag, &smear)],
+        );
+
+        let right_edge = |mesh: &Mesh| painted(mesh).iter().map(|t| t.0).max().unwrap();
+        assert!(
+            right_edge(&smeared) > right_edge(&dabbed) + 3,
+            "{} vs {}",
+            right_edge(&smeared),
+            right_edge(&dabbed)
+        );
+        // Nothing appears on the left, where the stroke came from.
+        let left_edge = |mesh: &Mesh| painted(mesh).iter().map(|t| t.0).min().unwrap();
+        assert!(left_edge(&smeared) >= left_edge(&dabbed));
+    }
+
+    #[test]
+    fn erase_fill_clears_only_the_clicked_island() {
+        let painter = StrokePainter::new(&test_mesh(), &test_camera(), viewport());
+        let mut document = Document::new(test_mesh());
+        let sizes = document.slot_sizes();
+        let mut fill = Brush {
+            tool: Tool::Fill,
+            fill_mode: FillMode::Layer,
+            ..brush(1.0, false)
+        };
+        for (erase, mode) in [(false, FillMode::Layer), (true, FillMode::UvIsland)] {
+            fill.erase = erase;
+            fill.fill_mode = mode;
+            let mut stroke = Stroke::begin(&document, 1).unwrap();
+            let at = Pos2::new(76.0, 145.0);
+            painter.fill(&mut stroke, &mut document.layers[1], &sizes, at, &fill);
+        }
+        let layer = document.layers[1].textures[0][0].as_ref().unwrap();
+        let alpha = |x: u32, y: u32| layer.rgba[((y * TEXTURE_SIZE + x) * 4 + 3) as usize];
+        // Left island (u < 0.45) erased; the right island and empty space stay filled.
+        assert_eq!(alpha(20, 64), 0);
+        assert_eq!(alpha(100, 64), 255);
+        assert_eq!(alpha(64, 120), 255);
     }
 }

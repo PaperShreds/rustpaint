@@ -1,7 +1,7 @@
 //! Autosave and crash recovery.
 //!
 //! While there are unsaved changes, the app writes a recovery copy of the
-//! project every `AUTOSAVE_INTERVAL` into a folder in the user's data
+//! project every so often (see `settings::Autosave`) into a folder in the user's data
 //! directory. A clean exit, or saving, removes it again; so a copy that is
 //! still there on the next start means RustPaint didn't close properly.
 //!
@@ -15,9 +15,7 @@ use crate::project;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
-
-pub const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
+use std::time::SystemTime;
 
 const PROJECT_EXTENSION: &str = "rustpaint";
 const INFO_EXTENSION: &str = "txt";

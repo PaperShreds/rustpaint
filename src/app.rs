@@ -10,7 +10,7 @@ use crate::renderer;
 use crate::renderer::camera::OrbitCamera;
 use crate::renderer::environment::{EnvironmentSource, HdrImage};
 use crate::renderer::viewport::{EnvironmentSettings, ViewMode};
-use crate::settings::{self, Settings};
+use crate::settings::{self, Autosave, Settings};
 use crate::ui;
 use crate::ui::layers_panel::{LayerAction, LayersPanelState};
 use crate::ui::menu_bar::{MenuAction, MenuState};
@@ -74,12 +74,15 @@ pub struct RustPaintApp {
     /// Autosaves left behind by a crash, offered for restoring one at a time.
     recovery_offers: Vec<Recovered>,
     last_autosave: Instant,
+    autosave_options: Autosave,
     /// `history.state()` of the current recovery copy, if there is one.
     autosaved_state: Option<u64>,
 }
 
 impl RustPaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Lets egui draw the SVG tool icons.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let settings = Settings::load(cc.storage);
         let mut status = "Use File > Open model... to load a .glb / .gltf file.".to_string();
         let mut environment_source = settings.environment_source;
@@ -138,6 +141,7 @@ impl RustPaintApp {
             session,
             recovery_offers,
             last_autosave: Instant::now(),
+            autosave_options: settings.autosave,
             autosaved_state: None,
         }
     }
@@ -425,14 +429,20 @@ impl RustPaintApp {
     /// The history panel's name for a stroke on layer `id` with the current tool.
     fn stroke_label(&self, id: u64) -> String {
         let name = self.layer_name(id);
+        let erase = self.brush.erases();
         match self.brush.tool {
+            Tool::Paint if erase => format!("Erase on {name}"),
             Tool::Paint => format!("Paint on {name}"),
-            Tool::Erase => format!("Erase on {name}"),
-            Tool::Fill => match self.brush.fill_mode {
-                FillMode::Layer => format!("Fill {name}"),
-                FillMode::Material => format!("Fill material on {name}"),
-                FillMode::UvIsland => format!("Fill UV island on {name}"),
-            },
+            Tool::Smear => format!("Smear on {name}"),
+            Tool::Blur => format!("Blur on {name}"),
+            Tool::Fill => {
+                let verb = if erase { "Erase" } else { "Fill" };
+                match self.brush.fill_mode {
+                    FillMode::Layer => format!("{verb} all of {name}"),
+                    FillMode::Material => format!("{verb} material on {name}"),
+                    FillMode::UvIsland => format!("{verb} UV island on {name}"),
+                }
+            }
         }
     }
 
@@ -778,13 +788,15 @@ impl RustPaintApp {
             // Always start with the paint brush.
             brush: Brush {
                 tool: Tool::Paint,
+                erase: false,
                 ..self.brush.clone()
             },
+            autosave: self.autosave_options,
         }
     }
 
-    /// Writes a recovery copy every `AUTOSAVE_INTERVAL` while there are
-    /// unsaved changes (between strokes), and removes it once there are none.
+    /// Writes a recovery copy every so often (`autosave_options`) while there
+    /// are unsaved changes (between strokes), and removes it once there are none.
     fn autosave(&mut self, ctx: &egui::Context) {
         let unsaved = self.has_unsaved_changes();
         let Some(session) = self.session.as_mut() else {
@@ -797,10 +809,14 @@ impl RustPaintApp {
             return;
         }
         let state = self.history.state();
-        if self.autosaved_state == Some(state) || self.stroke.is_some() {
+        if !self.autosave_options.enabled
+            || self.autosaved_state == Some(state)
+            || self.stroke.is_some()
+        {
             return;
         }
-        let remaining = recovery::AUTOSAVE_INTERVAL.saturating_sub(self.last_autosave.elapsed());
+        let interval = self.autosave_options.interval();
+        let remaining = interval.saturating_sub(self.last_autosave.elapsed());
         if !remaining.is_zero() {
             ctx.request_repaint_after(remaining);
             return;
@@ -950,7 +966,12 @@ impl eframe::App for RustPaintApp {
             self.pending = Some(Pending::Quit);
         }
 
-        match ui::menu_bar::show(ui, &menu_state, &mut self.environment) {
+        match ui::menu_bar::show(
+            ui,
+            &menu_state,
+            &mut self.environment,
+            &mut self.autosave_options,
+        ) {
             Some(MenuAction::OpenModel) => {
                 let picked = rfd::FileDialog::new()
                     .add_filter("glTF", &["glb", "gltf"])
