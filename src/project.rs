@@ -1,12 +1,14 @@
 //! The `.rustpaint` project file.
 //!
-//! Layout: magic, the mesh with its own textures (the base layer), then the
-//! paint layers. Layer textures are mostly transparent, so only their 64x64
-//! tiles that contain paint are stored. Version 1 files have no layer section.
+//! Layout: magic, the mesh with its base colour textures, then (version 3)
+//! each material's roughness and metallic, then the paint layers. Layer
+//! textures are mostly transparent, so only their 64x64 tiles that contain
+//! paint are stored. Older versions still open: version 1 has no layers,
+//! version 2 has base colour layers only and no blend modes.
 //! All counts are validated before allocating, so a damaged or hostile file
 //! produces an error instead of a crash.
 
-use crate::document::{CLEAR, Document, Layer, LayerProps};
+use crate::document::{BlendMode, CLEAR, Channel, Document, Layer, LayerProps};
 use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
 use crate::painting::history::TILE_SIZE;
 use std::io::{Read, Write};
@@ -14,6 +16,9 @@ use std::path::Path;
 
 const MAGIC_V1: &[u8; 8] = b"RPAINT01";
 const MAGIC_V2: &[u8; 8] = b"RPAINT02";
+const MAGIC_V3: &[u8; 8] = b"RPAINT03";
+/// Channels after base colour, stored one byte per pixel per material.
+const DATA_CHANNELS: [Channel; 2] = [Channel::Roughness, Channel::Metallic];
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SIZE_LIMIT_ERROR: &str = "project file exceeds the 4 GiB size limit";
 const MAX_LAYERS: usize = 4096;
@@ -74,7 +79,18 @@ pub fn save(path: &Path, document: &Document) -> Result<(), String> {
 
 fn encode(document: &Document) -> Result<Vec<u8>, String> {
     let mut bytes = encode_mesh(&document.mesh)?;
-    bytes[..MAGIC_V2.len()].copy_from_slice(MAGIC_V2);
+    bytes[..MAGIC_V3.len()].copy_from_slice(MAGIC_V3);
+    for material in &document.mesh.materials {
+        for channel in DATA_CHANNELS {
+            let image = material.channel(channel);
+            if (image.width, image.height)
+                != (material.base_color.width, material.base_color.height)
+            {
+                return Err("material channels differ in size".into());
+            }
+            bytes.extend(image.rgba.chunks_exact(4).map(|pixel| pixel[0]));
+        }
+    }
     encode_layers(&mut bytes, document)?;
     if bytes.len() as u64 > MAX_PROJECT_BYTES {
         return Err(SIZE_LIMIT_ERROR.into());
@@ -148,18 +164,27 @@ fn encode_mesh(mesh: &Mesh) -> Result<Vec<u8>, String> {
 fn decode(bytes: &[u8]) -> Result<Document, String> {
     let mut reader = Reader { bytes, offset: 0 };
     let magic = reader.take(MAGIC_V1.len())?;
-    let has_layers = if magic == MAGIC_V2 {
-        true
-    } else if magic == MAGIC_V1 {
-        false
-    } else {
-        return Err("not a supported RustPaint project file".into());
-    };
-    let mesh = decode_mesh(&mut reader)?;
-    let document = if has_layers {
-        decode_layers(&mut reader, mesh)?
-    } else {
-        Document::new(mesh)
+    let version = [MAGIC_V1, MAGIC_V2, MAGIC_V3]
+        .iter()
+        .position(|known| magic == *known)
+        .ok_or("not a supported RustPaint project file")?
+        + 1;
+    let mut mesh = decode_mesh(&mut reader)?;
+    if version >= 3 {
+        for material in &mut mesh.materials {
+            let (width, height) = (material.base_color.width, material.base_color.height);
+            for channel in DATA_CHANNELS {
+                let values = reader.take(width as usize * height as usize)?;
+                let image = material.channel_mut(channel);
+                for (pixel, &value) in image.rgba.chunks_exact_mut(4).zip(values) {
+                    pixel[..3].fill(value);
+                }
+            }
+        }
+    }
+    let document = match version {
+        1 => Document::new(mesh),
+        _ => decode_layers(&mut reader, mesh, version)?,
     };
     if reader.offset != bytes.len() {
         return Err("project file contains unexpected trailing data".into());
@@ -235,14 +260,15 @@ fn decode_mesh(reader: &mut Reader) -> Result<Mesh, String> {
         let height = reader.u32()?;
         let pixel_bytes = texture_byte_len(width, height)?;
         let rgba = reader.take(pixel_bytes)?.to_vec();
-        materials.push(Material {
+        // Data channels follow later in the file (version 3) or default.
+        materials.push(Material::new(
             name,
-            base_color: Image {
+            Image {
                 width,
                 height,
                 rgba,
             },
-        });
+        ));
     }
     let mesh = Mesh {
         vertices,
@@ -266,12 +292,19 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
         bytes.extend_from_slice(layer.name.as_bytes());
         bytes.push(layer.visible as u8);
         bytes.extend_from_slice(&layer.opacity.to_le_bytes());
+        bytes.push(layer.blend.index());
         bytes.extend(layer.targets.iter().map(|&on| on as u8));
         if layer.is_base() {
             continue;
         }
-        for slot in 0..slots {
-            let Some(image) = layer.textures.get(slot).and_then(Option::as_ref) else {
+        for (slot, channel) in
+            (0..slots).flat_map(|slot| Channel::ALL.map(|channel| (slot, channel)))
+        {
+            let image = layer
+                .textures
+                .get(slot)
+                .and_then(|textures| textures[channel.index()].as_ref());
+            let Some(image) = image else {
                 write_count(bytes, 0)?;
                 continue;
             };
@@ -293,7 +326,13 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
     Ok(())
 }
 
-fn decode_layers(reader: &mut Reader, mesh: Mesh) -> Result<Document, String> {
+fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Document, String> {
+    // Version 2 had no blend modes and only base colour paint.
+    let channels: &[Channel] = if version >= 3 {
+        &Channel::ALL
+    } else {
+        &[Channel::BaseColor]
+    };
     let count = reader.count(MAX_LAYERS, "layer")?;
     if count == 0 {
         return Err("project has no base layer".into());
@@ -321,6 +360,12 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh) -> Result<Document, String> {
         if !opacity.is_finite() {
             return Err("project contains an invalid layer opacity".into());
         }
+        let blend = if version >= 3 {
+            BlendMode::from_index(reader.take(1)?[0])
+                .ok_or("project contains an unknown blend mode")?
+        } else {
+            BlendMode::Normal
+        };
         let targets = (0..sizes.len())
             .map(|_| reader.flag("layer slot"))
             .collect::<Result<Vec<_>, _>>()?;
@@ -328,6 +373,7 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh) -> Result<Document, String> {
             name,
             visible,
             opacity: opacity.clamp(0.0, 1.0),
+            blend,
             targets,
         };
         if is_base {
@@ -335,35 +381,21 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh) -> Result<Document, String> {
             continue;
         }
 
-        let mut textures = Vec::with_capacity(sizes.len());
+        let mut textures: Vec<[Option<Image>; Channel::COUNT]> = Vec::with_capacity(sizes.len());
         for &(width, height) in &sizes {
-            let tiles = tile_count(width, height);
-            let painted = reader.count(tiles, "layer tile")?;
-            if painted == 0 {
-                textures.push(None);
-                continue;
+            let mut slot: [Option<Image>; Channel::COUNT] = Default::default();
+            for channel in channels {
+                slot[channel.index()] =
+                    decode_layer_texture(reader, width, height, &mut texture_budget)?;
             }
-            let bytes = (width as usize) * (height as usize) * 4;
-            texture_budget = texture_budget
-                .checked_sub(bytes)
-                .ok_or("project layers need more memory than supported")?;
-            let mut image = Image::filled(width, height, CLEAR);
-            for _ in 0..painted {
-                let tile = reader.count(tiles - 1, "layer tile index")?;
-                let region = tile_region(tile, width, height);
-                for y in region.y..region.y + region.height {
-                    let row = reader.take((region.width * 4) as usize)?;
-                    let start = ((y * width + region.x) * 4) as usize;
-                    image.rgba[start..start + row.len()].copy_from_slice(row);
-                }
-            }
-            textures.push(Some(image));
+            textures.push(slot);
         }
         layers.push(Layer {
             id: index as u64,
             name: props.name,
             visible: props.visible,
             opacity: props.opacity,
+            blend: props.blend,
             targets: props.targets,
             textures,
         });
@@ -375,6 +407,35 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh) -> Result<Document, String> {
         document.set_base_props(props);
     }
     Ok(document)
+}
+
+/// One layer texture: its painted tiles, or `None` when it has none.
+fn decode_layer_texture(
+    reader: &mut Reader,
+    width: u32,
+    height: u32,
+    budget: &mut usize,
+) -> Result<Option<Image>, String> {
+    let tiles = tile_count(width, height);
+    let painted = reader.count(tiles, "layer tile")?;
+    if painted == 0 {
+        return Ok(None);
+    }
+    let bytes = (width as usize) * (height as usize) * 4;
+    *budget = budget
+        .checked_sub(bytes)
+        .ok_or("project layers need more memory than supported")?;
+    let mut image = Image::filled(width, height, CLEAR);
+    for _ in 0..painted {
+        let tile = reader.count(tiles - 1, "layer tile index")?;
+        let region = tile_region(tile, width, height);
+        for y in region.y..region.y + region.height {
+            let row = reader.take((region.width * 4) as usize)?;
+            let start = ((y * width + region.x) * 4) as usize;
+            image.rgba[start..start + row.len()].copy_from_slice(row);
+        }
+    }
+    Ok(Some(image))
 }
 
 fn tile_count(width: u32, height: u32) -> usize {
@@ -538,6 +599,7 @@ impl Reader<'_> {
 mod tests {
     use super::{decode, encode, encode_mesh, load, save};
     use crate::document::{CLEAR, Document};
+    use crate::mesh::Channel;
     use crate::mesh::{Image, primitives};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -599,9 +661,15 @@ mod tests {
         let mut image = Image::filled(w, h, CLEAR);
         let last = image.rgba.len() - 4;
         image.rgba[last..].copy_from_slice(&[255, 0, 0, 255]);
-        document.layers[1].textures[0] = Some(image);
+        document.layers[1].textures[0][0] = Some(image.clone());
+        // The same pixel painted into roughness too.
+        image.rgba[last..].copy_from_slice(&[40, 40, 40, 255]);
+        document.layers[1].textures[0][Channel::Roughness.index()] = Some(image);
         document.layers[1].name = "Rust".into();
         document.layers[1].opacity = 0.25;
+        document.layers[1].blend = crate::document::BlendMode::Multiply;
+        // A metallic value on the model itself.
+        document.mesh.materials[0].metallic.rgba[0..3].fill(200);
         document.insert_new_layer(2);
         document.layers[2].visible = false;
         document.layers[0].targets[0] = false;
@@ -617,25 +685,43 @@ mod tests {
         assert_eq!(decoded.layers.len(), 3);
         for (actual, expected) in decoded.layers.iter().zip(&document.layers) {
             assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.blend, expected.blend);
             assert_eq!(actual.visible, expected.visible);
             assert_eq!(actual.opacity, expected.opacity);
             assert_eq!(actual.targets, expected.targets);
             assert_eq!(actual.is_base(), expected.is_base());
         }
         let painted = |document: &Document| {
-            document.layers[1].textures[0]
+            document.layers[1].textures[0][0]
                 .as_ref()
                 .map(|image| image.rgba.clone())
         };
         assert_eq!(painted(&decoded), painted(&document));
-        assert!(decoded.layers[2].textures.iter().all(Option::is_none));
+        assert!(
+            decoded.layers[2]
+                .textures
+                .iter()
+                .flatten()
+                .all(Option::is_none)
+        );
         assert_eq!(
-            decoded.composite(0).unwrap().rgba,
-            document.composite(0).unwrap().rgba
+            decoded.composite(0, Channel::BaseColor).unwrap().rgba,
+            document.composite(0, Channel::BaseColor).unwrap().rgba
         );
         // Only the one painted tile is stored, not the whole layer texture.
-        let base_only = encode_mesh(&document.mesh).unwrap().len();
-        assert!(bytes.len() < base_only + 64 * 64 * 4 + 1024);
+        for channel in Channel::ALL {
+            assert_eq!(
+                decoded.composite(0, channel).unwrap().rgba,
+                document.composite(0, channel).unwrap().rgba,
+                "{}",
+                channel.name()
+            );
+        }
+        // Only the painted tiles (one per painted channel) are stored, plus
+        // one byte per pixel for each data channel of the model.
+        let (w, h) = document.slot_sizes()[0];
+        let base = encode_mesh(&document.mesh).unwrap().len() + 2 * (w * h) as usize;
+        assert!(bytes.len() < base + 2 * 64 * 64 * 4 + 1024);
     }
 
     #[test]
@@ -645,7 +731,7 @@ mod tests {
         assert_eq!(document.layers.len(), 2);
         assert!(document.layers[0].is_base());
         assert_eq!(
-            document.composite(0).unwrap().rgba,
+            document.composite(0, Channel::BaseColor).unwrap().rgba,
             primitives::cube().materials[0].base_color.rgba
         );
     }

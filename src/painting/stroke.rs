@@ -11,7 +11,7 @@
 //! segments of one stroke therefore never darken each other.
 
 use crate::document::{CLEAR, Change, Document, Layer, Tile};
-use crate::mesh::{Image, ImageRegion, Mesh, linear_to_srgb, srgb_to_linear};
+use crate::mesh::{Channel, Encoding, Image, ImageRegion, Mesh};
 use crate::painting::brush::Brush;
 use crate::painting::history;
 use crate::renderer::camera::OrbitCamera;
@@ -125,11 +125,12 @@ impl SlotStroke {
     }
 }
 
-/// One continuous brush stroke into one layer, on every slot the layer targets.
+/// One continuous brush stroke into one layer, on every slot the layer
+/// targets and every channel the brush paints.
 pub struct Stroke {
     layer: u64,
-    /// Per material slot, created when the stroke first reaches that slot.
-    slots: Vec<Option<SlotStroke>>,
+    /// Per material slot and channel, created when the stroke first reaches it.
+    slots: Vec<[Option<SlotStroke>; Channel::COUNT]>,
     /// When the brush may not paint over edges: which triangles belong to the
     /// face the stroke started on. Found on the first segment that hits the model.
     face: Option<Vec<bool>>,
@@ -144,7 +145,9 @@ impl Stroke {
         }
         Some(Self {
             layer: layer.id,
-            slots: (0..document.mesh.materials.len()).map(|_| None).collect(),
+            slots: (0..document.mesh.materials.len())
+                .map(|_| Default::default())
+                .collect(),
             face: None,
         })
     }
@@ -154,24 +157,28 @@ impl Stroke {
         self.slots
             .iter()
             .flatten()
+            .flatten()
             .any(|slot| slot.touched_tiles.contains(&true))
     }
 
     /// Ends the stroke. Returns the changes that undo it (empty if nothing changed).
     pub fn finish(self) -> Vec<Change> {
         let layer = self.layer;
-        self.slots
-            .into_iter()
-            .enumerate()
-            .filter_map(|(material, slot)| {
-                let tiles = slot?.into_tiles();
-                (!tiles.is_empty()).then_some(Change::Pixels {
-                    layer,
-                    material,
-                    tiles,
-                })
-            })
-            .collect()
+        let mut changes = Vec::new();
+        for (material, channels) in self.slots.into_iter().enumerate() {
+            for (channel, slot) in Channel::ALL.into_iter().zip(channels) {
+                let tiles = slot.map(SlotStroke::into_tiles).unwrap_or_default();
+                if !tiles.is_empty() {
+                    changes.push(Change::Pixels {
+                        layer,
+                        material,
+                        channel,
+                        tiles,
+                    });
+                }
+            }
+        }
+        changes
     }
 
     fn allows(&self, triangle: u32) -> bool {
@@ -270,7 +277,7 @@ impl StrokePainter {
 
     /// Paints one segment of `stroke` into `layer` between two screen
     /// positions (in points). `slot_sizes` gives each slot's texture size.
-    /// Returns the texel region that changed in each slot.
+    /// Returns the texel region that changed in each slot and channel.
     pub fn paint_segment(
         &self,
         stroke: &mut Stroke,
@@ -279,7 +286,7 @@ impl StrokePainter {
         from: Pos2,
         to: Pos2,
         brush: &Brush,
-    ) -> Vec<(usize, ImageRegion)> {
+    ) -> Vec<(usize, Channel, ImageRegion)> {
         if layer.id != stroke.layer || self.viewport.height() <= 0.0 {
             return Vec::new();
         }
@@ -298,10 +305,10 @@ impl StrokePainter {
             layer,
             stroke,
             slot_sizes,
-            color: brush.color.map(srgb_float_to_linear),
+            values: brush_values(brush),
             opacity: brush.opacity.clamp(0.0, 1.0),
             erase: brush.erase,
-            regions: vec![None; slot_sizes.len()],
+            regions: vec![Default::default(); slot_sizes.len()],
         };
 
         if brush.screen_space {
@@ -309,12 +316,15 @@ impl StrokePainter {
         } else {
             self.paint_surface_segment(&mut target, from, to, radius, brush.hardness);
         }
-        target
-            .regions
-            .into_iter()
-            .enumerate()
-            .filter_map(|(material, region)| Some((material, region?)))
-            .collect()
+        let mut changed = Vec::new();
+        for (material, regions) in target.regions.into_iter().enumerate() {
+            for (channel, region) in Channel::ALL.into_iter().zip(regions) {
+                if let Some(region) = region {
+                    changed.push((material, channel, region));
+                }
+            }
+        }
+        changed
     }
 
     /// Outline of the surface brush under the cursor: a disc lying on the
@@ -716,56 +726,92 @@ impl StrokePainter {
     }
 }
 
+/// What the brush puts into each channel it paints: linear colour for base
+/// colour, the value itself for data channels.
+fn brush_values(brush: &Brush) -> Vec<(Channel, [f32; 3])> {
+    let mut values = Vec::new();
+    if brush.paint_color {
+        values.push((Channel::BaseColor, brush.color.map(srgb_float_to_linear)));
+    }
+    if brush.paint_roughness {
+        values.push((Channel::Roughness, [brush.roughness.clamp(0.0, 1.0); 3]));
+    }
+    if brush.paint_metallic {
+        values.push((Channel::Metallic, [brush.metallic.clamp(0.0, 1.0); 3]));
+    }
+    values
+}
+
 /// The layer being painted plus the stroke's bookkeeping.
 struct LayerTarget<'a> {
     layer: &'a mut Layer,
     stroke: &'a mut Stroke,
     slot_sizes: &'a [(u32, u32)],
-    color: [f32; 3],
+    values: Vec<(Channel, [f32; 3])>,
     opacity: f32,
     erase: bool,
-    /// Changed region per slot.
-    regions: Vec<Option<ImageRegion>>,
+    /// Changed region per slot and channel.
+    regions: Vec<[Option<ImageRegion>; Channel::COUNT]>,
 }
 
 impl LayerTarget<'_> {
-    /// The texture of `material` to paint into, created on first use.
-    /// `None` if the layer doesn't paint on that slot.
+    /// The textures of `material` to paint into (one per painted channel),
+    /// created on first use. `None` if the layer doesn't paint on that slot.
     fn slot(&mut self, material: usize) -> Option<SlotTarget<'_>> {
         if self.layer.targets.get(material) != Some(&true) {
             return None;
         }
         let (width, height) = *self.slot_sizes.get(material)?;
-        let image = self
-            .layer
-            .textures
-            .get_mut(material)?
-            .get_or_insert_with(|| Image::filled(width, height, CLEAR));
-        if (image.width, image.height) != (width, height) {
-            return None;
+        let textures = self.layer.textures.get_mut(material)?;
+        let strokes = self.stroke.slots.get_mut(material)?;
+        let regions = self.regions.get_mut(material)?;
+        let mut channels = Vec::new();
+        for (((channel, texture), stroke), region) in Channel::ALL
+            .into_iter()
+            .zip(textures.iter_mut())
+            .zip(strokes.iter_mut())
+            .zip(regions.iter_mut())
+        {
+            let Some(&(_, value)) = self.values.iter().find(|(c, _)| *c == channel) else {
+                continue;
+            };
+            let image = texture.get_or_insert_with(|| Image::filled(width, height, CLEAR));
+            if (image.width, image.height) != (width, height) {
+                continue;
+            }
+            let stroke = stroke.get_or_insert_with(|| SlotStroke::new(image));
+            channels.push(ChannelTarget {
+                image,
+                stroke,
+                region,
+                value,
+                encoding: channel.encoding(),
+            });
         }
-        let stroke = self
-            .stroke
-            .slots
-            .get_mut(material)?
-            .get_or_insert_with(|| SlotStroke::new(image));
-        Some(SlotTarget {
-            image,
-            stroke,
-            region: self.regions.get_mut(material)?,
-            color: self.color,
+        (!channels.is_empty()).then_some(SlotTarget {
+            channels,
+            width,
+            height,
             opacity: self.opacity,
             erase: self.erase,
         })
     }
 }
 
-/// One slot's texture being painted.
-struct SlotTarget<'a> {
+/// One channel texture of a slot being painted.
+struct ChannelTarget<'a> {
     image: &'a mut Image,
     stroke: &'a mut SlotStroke,
     region: &'a mut Option<ImageRegion>,
-    color: [f32; 3],
+    value: [f32; 3],
+    encoding: Encoding,
+}
+
+/// One slot's textures being painted, all the same size.
+struct SlotTarget<'a> {
+    channels: Vec<ChannelTarget<'a>>,
+    width: u32,
+    height: u32,
     opacity: f32,
     erase: bool,
 }
@@ -781,7 +827,7 @@ impl SlotTarget<'_> {
         bounds: Option<(Vec2, Vec2)>,
         coverage: impl Fn(Vec3, f32) -> f32,
     ) {
-        let size = Vec2::new(self.image.width as f32, self.image.height as f32);
+        let size = Vec2::new(self.width as f32, self.height as f32);
         // Work in texel units so the seam margin is the same on both axes.
         let corners = triangle.uv.map(|uv| uv * size);
         let Some(margins) = edge_margins(corners, SEAM_MARGIN_TEXELS) else {
@@ -804,8 +850,8 @@ impl SlotTarget<'_> {
             return;
         }
 
-        let (min_x, max_x) = texel_range(lo.x, hi.x, self.image.width);
-        let (min_y, max_y) = texel_range(lo.y, hi.y, self.image.height);
+        let (min_x, max_x) = texel_range(lo.x, hi.x, self.width);
+        let (min_y, max_y) = texel_range(lo.y, hi.y, self.height);
         for raw_y in min_y..=max_y {
             for raw_x in min_x..=max_x {
                 let center = Vec2::new(raw_x as f32 + 0.5, raw_y as f32 + 0.5);
@@ -817,8 +863,8 @@ impl SlotTarget<'_> {
                 }
                 let amount = coverage(interpolate(triangle.position, weights), texel_reach);
                 if amount > 0.0 {
-                    let x = raw_x.rem_euclid(self.image.width as i64) as u32;
-                    let y = raw_y.rem_euclid(self.image.height as i64) as u32;
+                    let x = raw_x.rem_euclid(self.width as i64) as u32;
+                    let y = raw_y.rem_euclid(self.height as i64) as u32;
                     self.apply(x, y, amount);
                 }
             }
@@ -826,34 +872,37 @@ impl SlotTarget<'_> {
     }
 
     fn apply(&mut self, x: u32, y: u32, amount: f32) {
-        let texel = (y * self.image.width + x) as usize;
+        let texel = (y * self.width + x) as usize;
         let amount = amount.min(1.0);
-        if amount <= self.stroke.coverage[texel] {
-            return;
-        }
-        self.stroke.coverage[texel] = amount;
-
-        // Blend from the pixel as it was before the stroke, with straight alpha.
         let alpha = amount * self.opacity;
-        let offset = texel * 4;
-        let original = &self.stroke.original[offset..offset + 4];
-        let original_alpha = original[3] as f32 / 255.0;
-        let out = &mut self.image.rgba[offset..offset + 4];
-        if self.erase {
-            out.copy_from_slice(original);
-            out[3] = (original_alpha * (1.0 - alpha) * 255.0).round() as u8;
-        } else {
-            let out_alpha = alpha + original_alpha * (1.0 - alpha);
-            for (channel, color) in self.color.iter().enumerate() {
-                let below = srgb_to_linear(original[channel]) * original_alpha * (1.0 - alpha);
-                out[channel] = linear_to_srgb((color * alpha + below) / out_alpha);
+        let tile = (y / history::TILE_SIZE) * tiles_x(self.width) + x / history::TILE_SIZE;
+        for target in &mut self.channels {
+            if amount <= target.stroke.coverage[texel] {
+                continue;
             }
-            out[3] = (out_alpha * 255.0).round() as u8;
+            target.stroke.coverage[texel] = amount;
+
+            // Blend from the pixel as it was before the stroke, with straight alpha.
+            let offset = texel * 4;
+            let original = &target.stroke.original[offset..offset + 4];
+            let original_alpha = original[3] as f32 / 255.0;
+            let out = &mut target.image.rgba[offset..offset + 4];
+            if self.erase {
+                out.copy_from_slice(original);
+                out[3] = (original_alpha * (1.0 - alpha) * 255.0).round() as u8;
+            } else {
+                let out_alpha = alpha + original_alpha * (1.0 - alpha);
+                for (channel, value) in target.value.iter().enumerate() {
+                    let below =
+                        target.encoding.decode(original[channel]) * original_alpha * (1.0 - alpha);
+                    out[channel] = target.encoding.encode((value * alpha + below) / out_alpha);
+                }
+                out[3] = (out_alpha * 255.0).round() as u8;
+            }
+            target.stroke.touched_tiles[tile as usize] = true;
+            let pixel = ImageRegion::pixel(x, y);
+            *target.region = Some(target.region.map_or(pixel, |region| region.union(pixel)));
         }
-        let tile = (y / history::TILE_SIZE) * tiles_x(self.image.width) + x / history::TILE_SIZE;
-        self.stroke.touched_tiles[tile as usize] = true;
-        let pixel = ImageRegion::pixel(x, y);
-        *self.region = Some(self.region.map_or(pixel, |region| region.union(pixel)));
     }
 }
 
@@ -1017,6 +1066,7 @@ fn srgb_float_to_linear(value: f32) -> f32 {
 mod tests {
     use super::{Stroke, StrokePainter};
     use crate::document::Document;
+    use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
     use crate::painting::brush::Brush;
     use crate::renderer::camera::OrbitCamera;
@@ -1041,10 +1091,10 @@ mod tests {
     }
 
     fn blank_material(name: &str) -> Material {
-        Material {
-            name: name.into(),
-            base_color: Image::filled(TEXTURE_SIZE, TEXTURE_SIZE, [0, 0, 0, 255]),
-        }
+        Material::new(
+            name,
+            Image::filled(TEXTURE_SIZE, TEXTURE_SIZE, [0, 0, 0, 255]),
+        )
     }
 
     /// Corner positions and UVs of one triangle.
@@ -1115,6 +1165,7 @@ mod tests {
             screen_space,
             paint_over_edges: true,
             erase: false,
+            ..Brush::default()
         }
     }
 
@@ -1147,13 +1198,15 @@ mod tests {
         };
         for (from, to) in segments {
             let layer = &mut document.layers[1];
-            for (_, changed) in painter.paint_segment(&mut stroke, layer, &sizes, from, to, brush) {
+            for (_, _, changed) in
+                painter.paint_segment(&mut stroke, layer, &sizes, from, to, brush)
+            {
                 region = Some(region.map_or(changed, |r| r.union(changed)));
             }
         }
 
         let composites: Vec<_> = (0..document.mesh.materials.len())
-            .map(|material| document.composite(material).unwrap())
+            .map(|material| document.composite(material, Channel::BaseColor).unwrap())
             .collect();
         *mesh = document.mesh;
         for (material, composite) in mesh.materials.iter_mut().zip(composites) {
@@ -1439,7 +1492,11 @@ mod tests {
     #[test]
     fn finished_stroke_undoes_to_the_original_texture() {
         let mut document = Document::new(crate::mesh::primitives::cube());
-        let before = document.composite(0).unwrap().rgba.clone();
+        let before = document
+            .composite(0, Channel::BaseColor)
+            .unwrap()
+            .rgba
+            .clone();
         let camera = OrbitCamera {
             yaw: 0.6,
             ..test_camera()
@@ -1460,15 +1517,25 @@ mod tests {
                 &brush(40.0, false),
             );
         }
-        let after = document.composite(0).unwrap().rgba.clone();
+        let after = document
+            .composite(0, Channel::BaseColor)
+            .unwrap()
+            .rgba
+            .clone();
         assert_ne!(before, after);
 
         let mut history = crate::painting::history::History::default();
         history.push(stroke.finish());
         history.undo(&mut document);
-        assert_eq!(document.composite(0).unwrap().rgba, before);
+        assert_eq!(
+            document.composite(0, Channel::BaseColor).unwrap().rgba,
+            before
+        );
         history.redo(&mut document);
-        assert_eq!(document.composite(0).unwrap().rgba, after);
+        assert_eq!(
+            document.composite(0, Channel::BaseColor).unwrap().rgba,
+            after
+        );
     }
 
     #[test]
@@ -1490,7 +1557,7 @@ mod tests {
                 &paint_brush,
             );
         }
-        let layer = document.layers[1].textures[0].as_ref().unwrap();
+        let layer = document.layers[1].textures[0][0].as_ref().unwrap();
         assert!(layer.rgba.chunks_exact(4).any(|pixel| pixel[0] == 255));
         assert!(layer.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0));
     }
@@ -1550,5 +1617,56 @@ mod tests {
                 "hidden panel painted (screen_space={screen_space})"
             );
         }
+    }
+
+    #[test]
+    fn brush_paints_only_the_channels_it_is_set_to() {
+        let mut document = Document::new(test_mesh());
+        let painter = StrokePainter::new(&document.mesh, &test_camera(), viewport());
+        let sizes = document.slot_sizes();
+        let mut roughness_only = brush(20.0, false);
+        roughness_only.paint_color = false;
+        roughness_only.paint_roughness = true;
+        roughness_only.roughness = 0.9;
+        let point = Pos2::new(91.0, 128.0);
+        let mut stroke = Stroke::begin(&document, 1).unwrap();
+        let changed = painter.paint_segment(
+            &mut stroke,
+            &mut document.layers[1],
+            &sizes,
+            point,
+            point,
+            &roughness_only,
+        );
+        assert!(
+            changed
+                .iter()
+                .all(|(_, channel, _)| *channel == Channel::Roughness)
+        );
+        assert!(!changed.is_empty());
+
+        let textures = &document.layers[1].textures[0];
+        assert!(textures[Channel::BaseColor.index()].is_none());
+        assert!(textures[Channel::Metallic.index()].is_none());
+        let roughness = document.composite(0, Channel::Roughness).unwrap();
+        let painted = crate::mesh::Encoding::Linear.encode(0.9);
+        assert!(
+            roughness
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] == painted)
+        );
+        // Base colour is untouched.
+        let base = document.composite(0, Channel::BaseColor).unwrap();
+        assert_eq!(base.rgba, document.mesh.materials[0].base_color.rgba);
+        // One undo step, for the roughness texture.
+        let changes = stroke.finish();
+        assert!(matches!(
+            changes.as_slice(),
+            [crate::document::Change::Pixels {
+                channel: Channel::Roughness,
+                ..
+            }]
+        ));
     }
 }

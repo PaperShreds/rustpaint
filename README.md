@@ -7,8 +7,8 @@ on 3D models.
 ## Current status
 
 The app provides a 3D viewport, loads `.glb` and `.gltf` models, and lets you
-paint the base color of the selected texture set. Projects can be saved to and
-reopened from `.rustpaint` files.
+paint their base color, roughness, and metallic in layers. Projects can be saved
+to and reopened from `.rustpaint` files.
 
 Viewport controls:
 
@@ -34,16 +34,39 @@ hidden but not painted on, so the original stays intact. Use **Erase** in the
 brush panel to remove paint from a layer. Materials without a texture get a
 blank 2048×2048 canvas in their base color.
 
+Each layer has an opacity and a blend mode (Normal, Multiply, Screen, Overlay,
+Darken, Lighten, Add). Layers are combined on the GPU, in linear light.
+
+The brush paints the channels ticked under **Channels**: base color, roughness,
+and metallic, each with its own value. Imported models bring their glTF
+roughness and metallic along. **View** switches the viewport between the lit
+material and a single channel.
+
+The viewport is lit by an HDR environment. Two come built in, both from
+[Poly Haven](https://polyhaven.com) (CC0, see `assets/environments/`): an
+outdoor scene (the default) and a studio. **View** switches between them, loads
+your own `.hdr` or `.exr` file, rotates the environment, changes its intensity,
+and shows or hides it as a blurred background.
+
+Closing the window, or opening another file, with unsaved changes asks whether
+to save them first. **File > Open recent** lists the last files you opened or
+saved.
+
+The program remembers your recent files, environment, view, brush settings,
+and window size between runs (in `~/.local/share/rustpaint/` on Linux, the
+user's app data folder on Windows and macOS).
+
 Undo and redo strokes and layer changes with **Ctrl+Z** and **Ctrl+Shift+Z**
 (or **Ctrl+Y**).
 History isn't saved with the project.
 
-**File > Export textures...** writes each material slot's base color, with its
-visible layers combined, as a PNG named `<model>_<material>_BaseColor.png`. It
-asks before replacing existing files.
+**File > Export textures...** writes, for each material slot, one PNG per
+channel with its visible layers combined: `<model>_<material>_BaseColor.png`,
+`_Roughness.png`, and `_Metallic.png` (greyscale). It asks before replacing
+existing files.
 
-Blend modes, masks, other material channels (roughness, metallic, normal), and
-autosave are not implemented yet, and the project file format may still change.
+Masks, normal and height maps, and autosave are not implemented yet, and the
+project file format may still change.
 Avoid using it as the only copy of important work.
 
 ## Run

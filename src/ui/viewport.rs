@@ -1,5 +1,5 @@
 use crate::renderer::camera::OrbitCamera;
-use crate::renderer::viewport::ViewportCallback;
+use crate::renderer::viewport::{EnvironmentSettings, ViewMode, ViewportCallback};
 use eframe::egui;
 use eframe::egui_wgpu;
 use egui::PointerButton;
@@ -27,7 +27,12 @@ pub enum BrushCursor {
 
 /// Left drag paints. Right drag (or Alt + left drag) orbits.
 /// Middle drag (or Shift + right drag) pans. Scroll zooms.
-pub fn show(ui: &mut egui::Ui, camera: &mut OrbitCamera) -> ViewportInput {
+pub fn show(
+    ui: &mut egui::Ui,
+    camera: &mut OrbitCamera,
+    view_mode: ViewMode,
+    environment: EnvironmentSettings,
+) -> ViewportInput {
     egui::CentralPanel::default()
         .show(ui, |ui| {
             let (rect, response) =
@@ -72,13 +77,17 @@ pub fn show(ui: &mut egui::Ui, camera: &mut OrbitCamera) -> ViewportInput {
                 || response.clicked_by(PointerButton::Primary);
 
             let view = camera.view_proj(aspect);
-            let view_proj = view.to_cols_array_2d();
 
             ui.painter()
                 .rect_filled(rect, 0.0, egui::Color32::from_gray(30));
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
-                ViewportCallback { view_proj },
+                ViewportCallback {
+                    view_proj: view,
+                    eye: camera.eye().to_array(),
+                    view_mode,
+                    environment,
+                },
             ));
 
             let orbiting_or_panning = ui.input(|i| {

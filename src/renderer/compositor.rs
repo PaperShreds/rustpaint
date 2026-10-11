@@ -1,40 +1,73 @@
 //! Layer compositing on the GPU.
 //!
 //! Each material slot keeps its layer textures on the GPU and a composite
-//! texture the mesh shader samples. Recompositing draws the visible layers
-//! into the composite (one full-screen triangle each) and then renders its
-//! mip chain, so changing opacity or visibility costs a few draw calls instead
-//! of a pass over every pixel on the CPU.
+//! texture the mesh shader samples. Recompositing blends the visible layers
+//! one at a time into a float scratch texture (ping-ponging between two, since
+//! blend modes need to read what's below), copies the result into the
+//! composite, and renders its mip chain. Changing opacity, visibility or blend
+//! mode costs a few draw calls instead of a pass over every pixel on the CPU.
 
+use crate::document::{BlendMode, Encoding};
 use crate::mesh::{Image, ImageRegion};
 use crate::renderer::texture;
 use eframe::egui_wgpu::wgpu::{self, util::DeviceExt as _};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
+use std::sync::Mutex;
 
-/// sRGB, so blending and filtering happen in linear light.
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// Precise, linear format layers are blended in.
+const SCRATCH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Most layers one slot can blend in a single composite.
 const MAX_DRAWS: usize = 1024;
-/// Spacing of per-draw entries in the opacity buffer (the dynamic-offset alignment).
-const OPACITY_STRIDE: u64 = 256;
+/// Spacing of per-draw entries in the parameter buffer (the dynamic-offset alignment).
+const PARAMS_STRIDE: u64 = 256;
 
-pub struct Compositor {
-    layer_layout: wgpu::BindGroupLayout,
-    mip_layout: wgpu::BindGroupLayout,
-    layer_pipeline: wgpu::RenderPipeline,
-    mip_pipeline: wgpu::RenderPipeline,
-    opacity_buffer: wgpu::Buffer,
-    opacity_bind_group: wgpu::BindGroup,
-    mip_sampler: wgpu::Sampler,
-    max_texture_size: u32,
+/// Texture format for a channel: colour is sRGB (decoded to linear when
+/// read), data such as roughness is stored as is.
+fn format_for(encoding: Encoding) -> wgpu::TextureFormat {
+    match encoding {
+        Encoding::Srgb => wgpu::TextureFormat::Rgba8UnormSrgb,
+        Encoding::Linear => wgpu::TextureFormat::Rgba8Unorm,
+    }
 }
 
-/// The GPU side of one material slot.
+/// One layer to blend, bottom to top.
+pub struct Draw {
+    pub layer: u64,
+    pub opacity: f32,
+    pub blend: BlendMode,
+}
+
+pub struct Compositor {
+    /// One texture, no sampler: layer textures and the "below" scratch.
+    texture_layout: wgpu::BindGroupLayout,
+    /// Texture plus sampler: sources of the resolve and mip passes.
+    source_layout: wgpu::BindGroupLayout,
+    layer_pipeline: wgpu::RenderPipeline,
+    /// Resolve/mip pipeline per composite format.
+    copy_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    params_buffer: wgpu::Buffer,
+    params_bind_group: wgpu::BindGroup,
+    sampler: wgpu::Sampler,
+    max_texture_size: u32,
+    /// Scratch texture pairs, shared by all slots of the same size.
+    scratch: Mutex<HashMap<(u32, u32), Scratch>>,
+}
+
+struct Scratch {
+    views: [wgpu::TextureView; 2],
+    /// Reads scratch `i` as the "below" input of a layer pass.
+    below: [wgpu::BindGroup; 2],
+    /// Reads scratch `i` as the source of the resolve pass.
+    source: [wgpu::BindGroup; 2],
+}
+
+/// The GPU side of one channel of one material slot.
 pub struct GpuSlot {
     width: u32,
     height: u32,
-    /// False when the slot is too big for this GPU; it then shows a 1x1 grey.
+    format: wgpu::TextureFormat,
+    /// False when the slot is too big for this GPU; it then shows a 1x1 blank.
     usable: bool,
     /// Kept alive by its views; read directly only by the read-back test.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -68,12 +101,12 @@ impl Compositor {
             },
             count: None,
         };
-        let layer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("composite_layer_layout"),
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("composite_texture_layout"),
             entries: &[texture_entry(0)],
         });
-        let opacity_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("composite_opacity_layout"),
+        let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("composite_params_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -85,8 +118,8 @@ impl Compositor {
                 count: None,
             }],
         });
-        let mip_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("composite_mip_layout"),
+        let source_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("composite_source_layout"),
             entries: &[
                 texture_entry(0),
                 wgpu::BindGroupLayoutEntry {
@@ -98,12 +131,7 @@ impl Compositor {
             ],
         });
 
-        let premultiplied_over = wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        };
-        let pipeline = |label, layouts: &[Option<&wgpu::BindGroupLayout>], entry, blend| {
+        let pipeline = |label, layouts: &[Option<&wgpu::BindGroupLayout>], entry, format| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
                 bind_group_layouts: layouts,
@@ -122,8 +150,8 @@ impl Compositor {
                     module: &shader,
                     entry_point: Some(entry),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: FORMAT,
-                        blend,
+                        format,
+                        blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -137,64 +165,116 @@ impl Compositor {
         };
         let layer_pipeline = pipeline(
             "composite_layer_pipeline",
-            &[Some(&layer_layout), Some(&opacity_layout)],
+            &[
+                Some(&texture_layout),
+                Some(&params_layout),
+                Some(&texture_layout),
+            ],
             "fs_layer",
-            Some(wgpu::BlendState {
-                color: premultiplied_over,
-                alpha: premultiplied_over,
-            }),
+            SCRATCH_FORMAT,
         );
-        let mip_pipeline = pipeline(
-            "composite_mip_pipeline",
-            &[Some(&mip_layout)],
-            "fs_mip",
-            None,
-        );
+        let copy_pipelines = [Encoding::Srgb, Encoding::Linear]
+            .into_iter()
+            .map(|encoding| {
+                let format = format_for(encoding);
+                let pipeline = pipeline(
+                    "composite_copy_pipeline",
+                    &[Some(&source_layout)],
+                    "fs_copy",
+                    format,
+                );
+                (format, pipeline)
+            })
+            .collect();
 
-        let opacity_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("composite_opacity"),
-            size: MAX_DRAWS as u64 * OPACITY_STRIDE,
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("composite_params"),
+            size: MAX_DRAWS as u64 * PARAMS_STRIDE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let opacity_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("composite_opacity_bind_group"),
-            layout: &opacity_layout,
+        let params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite_params_bind_group"),
+            layout: &params_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &opacity_buffer,
+                    buffer: &params_buffer,
                     offset: 0,
                     size: NonZeroU64::new(16),
                 }),
             }],
         });
-        let mip_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("composite_mip_sampler"),
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("composite_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
         Self {
-            layer_layout,
-            mip_layout,
+            texture_layout,
+            source_layout,
             layer_pipeline,
-            mip_pipeline,
-            opacity_buffer,
-            opacity_bind_group,
-            mip_sampler,
+            copy_pipelines,
+            params_buffer,
+            params_bind_group,
+            sampler,
             max_texture_size: device.limits().max_texture_dimension_2d,
+            scratch: Mutex::new(HashMap::new()),
         }
     }
 
-    /// A slot whose layers are `width` x `height`.
-    pub fn create_slot(&self, device: &wgpu::Device, width: u32, height: u32) -> GpuSlot {
+    fn texture_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite_texture"),
+            layout: &self.texture_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            }],
+        })
+    }
+
+    fn source_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite_source"),
+            layout: &self.source_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
+    }
+
+    /// A slot whose layers are `width` x `height`, stored with `encoding`.
+    pub fn create_slot(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        encoding: Encoding,
+    ) -> GpuSlot {
         let usable = width > 0
             && height > 0
             && width <= self.max_texture_size
             && height <= self.max_texture_size;
         let (texture_width, texture_height) = if usable { (width, height) } else { (1, 1) };
+        let format = format_for(encoding);
         let levels = 32 - texture_width.max(texture_height).leading_zeros();
         let composite = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("slot_composite"),
@@ -206,7 +286,7 @@ impl Compositor {
             mip_level_count: levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC,
@@ -223,26 +303,12 @@ impl Compositor {
             .collect();
         let mip_sources = level_views[..level_views.len() - 1]
             .iter()
-            .map(|view| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("composite_mip_source"),
-                    layout: &self.mip_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.mip_sampler),
-                        },
-                    ],
-                })
-            })
+            .map(|view| self.source_bind_group(device, view))
             .collect();
         GpuSlot {
             width,
             height,
+            format,
             usable,
             view: composite.create_view(&wgpu::TextureViewDescriptor::default()),
             composite,
@@ -288,7 +354,7 @@ impl Compositor {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: FORMAT,
+                format: slot.format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },
@@ -296,14 +362,7 @@ impl Compositor {
             &image.rgba,
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("layer_bind_group"),
-            layout: &self.layer_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
-        });
+        let bind_group = self.texture_bind_group(device, &view);
         slot.layers.insert(
             id,
             GpuLayer {
@@ -322,50 +381,101 @@ impl Compositor {
         slot.layers.contains_key(&id)
     }
 
-    /// Blends `draws` (layer id, opacity; bottom to top) into the slot's
-    /// composite and rebuilds its mips. Layers missing on the GPU are skipped.
+    /// Blends `draws` (bottom to top) into the slot's composite and rebuilds
+    /// its mips. Layers missing on the GPU are skipped.
     pub fn composite(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         slot: &GpuSlot,
-        draws: &[(u64, f32)],
+        draws: &[Draw],
     ) {
-        let draws: Vec<(&GpuLayer, f32)> = draws
+        let draws: Vec<(&GpuLayer, &Draw)> = draws
             .iter()
             .filter(|_| slot.usable)
-            .filter_map(|(id, opacity)| Some((slot.layers.get(id)?, *opacity)))
+            .filter_map(|draw| Some((slot.layers.get(&draw.layer)?, draw)))
             .take(MAX_DRAWS)
             .collect();
-        let mut opacities = vec![0u8; draws.len() * OPACITY_STRIDE as usize];
-        for (index, (_, opacity)) in draws.iter().enumerate() {
-            let start = index * OPACITY_STRIDE as usize;
-            opacities[start..start + 4].copy_from_slice(&opacity.to_le_bytes());
+        let mut params = vec![0u8; draws.len() * PARAMS_STRIDE as usize];
+        for (index, (_, draw)) in draws.iter().enumerate() {
+            let start = index * PARAMS_STRIDE as usize;
+            params[start..start + 4].copy_from_slice(&draw.opacity.to_le_bytes());
+            params[start + 4..start + 8]
+                .copy_from_slice(&(draw.blend.index() as f32).to_le_bytes());
         }
-        if !opacities.is_empty() {
-            queue.write_buffer(&self.opacity_buffer, 0, &opacities);
+        if !params.is_empty() {
+            queue.write_buffer(&self.params_buffer, 0, &params);
         }
+
+        let mut pool = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let size = (
+            slot.level_views[0].texture().width(),
+            slot.level_views[0].texture().height(),
+        );
+        let scratch = pool
+            .entry(size)
+            .or_insert_with(|| self.create_scratch(device, size.0, size.1));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("composite"),
         });
-        {
-            let mut pass = begin_pass(&mut encoder, &slot.level_views[0], "composite_layers");
+        // Start from transparent, then each layer reads one scratch and writes the other.
+        drop(begin_pass(
+            &mut encoder,
+            &scratch.views[0],
+            "composite_clear",
+        ));
+        for (index, (layer, _)) in draws.iter().enumerate() {
+            let (read, write) = (index % 2, (index + 1) % 2);
+            let mut pass = begin_pass(&mut encoder, &scratch.views[write], "composite_layer");
             pass.set_pipeline(&self.layer_pipeline);
-            for (index, (layer, _)) in draws.iter().enumerate() {
-                pass.set_bind_group(0, &layer.bind_group, &[]);
-                let offset = (index as u64 * OPACITY_STRIDE) as u32;
-                pass.set_bind_group(1, &self.opacity_bind_group, &[offset]);
-                pass.draw(0..3, 0..1);
-            }
+            pass.set_bind_group(0, &layer.bind_group, &[]);
+            let offset = (index as u64 * PARAMS_STRIDE) as u32;
+            pass.set_bind_group(1, &self.params_bind_group, &[offset]);
+            pass.set_bind_group(2, &scratch.below[read], &[]);
+            pass.draw(0..3, 0..1);
         }
-        for (source, target) in slot.mip_sources.iter().zip(&slot.level_views[1..]) {
-            let mut pass = begin_pass(&mut encoder, target, "composite_mip");
-            pass.set_pipeline(&self.mip_pipeline);
+        let result = draws.len() % 2;
+
+        let copy = &self.copy_pipelines[&slot.format];
+        let sources = std::iter::once(&scratch.source[result]).chain(&slot.mip_sources);
+        for (source, target) in sources.zip(&slot.level_views) {
+            let mut pass = begin_pass(&mut encoder, target, "composite_copy");
+            pass.set_pipeline(copy);
             pass.set_bind_group(0, source, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit([encoder.finish()]);
+    }
+
+    fn create_scratch(&self, device: &wgpu::Device, width: u32, height: u32) -> Scratch {
+        let views = [0, 1].map(|_| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("composite_scratch"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: SCRATCH_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
+        Scratch {
+            below: [0, 1].map(|i| self.texture_bind_group(device, &views[i])),
+            source: [0, 1].map(|i| self.source_bind_group(device, &views[i])),
+            views,
+        }
     }
 }
 
@@ -394,8 +504,9 @@ fn begin_pass<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::Compositor;
-    use crate::document::{CLEAR, Document};
+    use super::{Compositor, Draw};
+    use crate::document::{BlendMode, CLEAR, Document, Encoding};
+    use crate::mesh::Channel;
     use crate::mesh::{Image, Material, primitives};
     use eframe::egui_wgpu::wgpu;
 
@@ -409,7 +520,12 @@ mod tests {
     }
 
     /// Reads mip level 0 of the slot's composite back as straight-alpha RGBA.
-    fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, slot: &super::GpuSlot) -> Vec<u8> {
+    fn read_back(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: &super::GpuSlot,
+        encoding: Encoding,
+    ) -> Vec<u8> {
         let row = (slot.width * 4).div_ceil(256) * 256;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -448,8 +564,7 @@ mod tests {
             let alpha = pixel[3] as f32 / 255.0;
             if alpha > 0.0 {
                 for channel in &mut pixel[..3] {
-                    let linear = crate::mesh::srgb_to_linear(*channel) / alpha;
-                    *channel = crate::mesh::linear_to_srgb(linear);
+                    *channel = encoding.encode(encoding.decode(*channel) / alpha);
                 }
             }
         }
@@ -457,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_composite_matches_the_cpu_blend() {
+    fn gpu_composite_matches_the_cpu_blend_in_every_mode() {
         let Some((device, queue)) = gpu() else {
             eprintln!("no GPU adapter available; skipping");
             return;
@@ -465,45 +580,64 @@ mod tests {
         // An odd size, to exercise the mip chain's edges.
         let (width, height) = (37, 21);
         let mut mesh = primitives::cube();
-        mesh.materials = vec![Material {
-            name: "Test".into(),
-            base_color: Image::filled(width, height, [200, 40, 40, 255]),
-        }];
+        mesh.materials = vec![Material::new(
+            "Test",
+            Image::filled(width, height, [200, 40, 40, 255]),
+        )];
         let mut document = Document::new(mesh);
+        // Colour and roughness paint on two layers, partly transparent.
         let mut paint = Image::filled(width, height, CLEAR);
         for (index, pixel) in paint.rgba.chunks_exact_mut(4).enumerate() {
             if index % 3 == 0 {
                 pixel.copy_from_slice(&[20, 220, 90, 160]);
             }
         }
-        document.layers[1].textures[0] = Some(paint);
+        document.layers[1].textures[0] = [Some(paint.clone()), Some(paint), None];
         document.layers[1].opacity = 0.6;
         let top = document.layers.len();
         document.insert_new_layer(top);
-        document.layers[2].textures[0] = Some(Image::filled(width, height, [10, 10, 250, 60]));
+        let wash = Image::filled(width, height, [10, 10, 250, 60]);
+        document.layers[2].textures[0] = [Some(wash.clone()), Some(wash), None];
 
         let compositor = Compositor::new(&device);
-        let mut slot = compositor.create_slot(&device, width, height);
-        let draws: Vec<(u64, f32)> = document
-            .visible_layers(0)
-            .into_iter()
-            .map(|(id, image, opacity)| {
-                compositor.upload_layer(&device, &queue, &mut slot, id, image, None);
-                (id, opacity)
-            })
-            .collect();
-        assert_eq!(draws.len(), 3);
-        compositor.composite(&device, &queue, &slot, &draws);
+        for channel in [Channel::BaseColor, Channel::Roughness] {
+            let encoding = channel.encoding();
+            let mut slot = compositor.create_slot(&device, width, height, encoding);
+            for layer in document.visible_layers(0, channel) {
+                compositor.upload_layer(&device, &queue, &mut slot, layer.id, layer.image, None);
+            }
 
-        let gpu = read_back(&device, &queue, &slot);
-        let cpu = document.composite(0).unwrap().rgba;
-        let worst = gpu
-            .iter()
-            .zip(&cpu)
-            .map(|(a, b)| a.abs_diff(*b))
-            .max()
-            .unwrap();
-        // 8-bit storage and premultiplication round slightly differently.
-        assert!(worst <= 3, "GPU and CPU composites differ by up to {worst}");
+            for mode in BlendMode::ALL {
+                document.layers[1].blend = mode;
+                document.layers[2].blend = mode;
+                let draws: Vec<Draw> = document
+                    .visible_layers(0, channel)
+                    .into_iter()
+                    .map(|layer| Draw {
+                        layer: layer.id,
+                        opacity: layer.opacity,
+                        blend: layer.blend,
+                    })
+                    .collect();
+                assert_eq!(draws.len(), 3);
+                compositor.composite(&device, &queue, &slot, &draws);
+
+                let gpu = read_back(&device, &queue, &slot, encoding);
+                let cpu = document.composite(0, channel).unwrap().rgba;
+                let worst = gpu
+                    .iter()
+                    .zip(&cpu)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                // The 8-bit composite stores premultiplied values, so rounding differs slightly.
+                assert!(
+                    worst <= 3,
+                    "{} / {}: GPU and CPU differ by up to {worst}",
+                    channel.name(),
+                    mode.name()
+                );
+            }
+        }
     }
 }

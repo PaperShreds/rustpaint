@@ -51,10 +51,10 @@ pub fn cube() -> Mesh {
             indices: 0..index_count,
             material: 0,
         }],
-        materials: vec![Material {
-            name: "Checker".to_string(),
-            base_color: checker_image(FACE_SIZE * 3, FACE_SIZE * 2, FACE_SIZE / 8),
-        }],
+        materials: vec![Material::new(
+            "Checker".to_string(),
+            checker_image(FACE_SIZE * 3, FACE_SIZE * 2, FACE_SIZE / 8),
+        )],
     }
 }
 

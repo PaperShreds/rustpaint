@@ -79,10 +79,161 @@ impl ImageRegion {
     }
 }
 
-/// One material slot of the model. This will become a "texture set" you paint on.
+/// How a texture's bytes map to values that blend linearly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    /// Colour: sRGB-encoded, blended in linear light.
+    Srgb,
+    /// Data such as roughness: the bytes are the values.
+    Linear,
+}
+
+impl Encoding {
+    pub fn decode(self, byte: u8) -> f32 {
+        match self {
+            Encoding::Srgb => srgb_to_linear(byte),
+            Encoding::Linear => byte as f32 / 255.0,
+        }
+    }
+
+    pub fn encode(self, value: f32) -> u8 {
+        match self {
+            Encoding::Srgb => linear_to_srgb(value),
+            Encoding::Linear => (value.clamp(0.0, 1.0) * 255.0).round() as u8,
+        }
+    }
+}
+
+/// A material property that can be painted, each with its own texture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Channel {
+    BaseColor,
+    Roughness,
+    Metallic,
+}
+
+impl Channel {
+    pub const COUNT: usize = 3;
+    pub const ALL: [Channel; Channel::COUNT] =
+        [Channel::BaseColor, Channel::Roughness, Channel::Metallic];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Channel::BaseColor => "Base color",
+            Channel::Roughness => "Roughness",
+            Channel::Metallic => "Metallic",
+        }
+    }
+
+    /// Suffix of exported files, as game engines expect.
+    pub fn file_suffix(self) -> &'static str {
+        match self {
+            Channel::BaseColor => "BaseColor",
+            Channel::Roughness => "Roughness",
+            Channel::Metallic => "Metallic",
+        }
+    }
+
+    pub fn encoding(self) -> Encoding {
+        match self {
+            Channel::BaseColor => Encoding::Srgb,
+            Channel::Roughness | Channel::Metallic => Encoding::Linear,
+        }
+    }
+}
+
+/// A grey image holding one data value (such as roughness) in every pixel.
+pub fn data_image(width: u32, height: u32, value: f32) -> Image {
+    let byte = Encoding::Linear.encode(value);
+    Image::filled(width, height, [byte, byte, byte, 255])
+}
+
+/// One material slot of the model: a texture per channel, all the same size.
 pub struct Material {
     pub name: String,
     pub base_color: Image,
+    /// Data channels hold their value in the red (and green, blue) bytes.
+    pub roughness: Image,
+    pub metallic: Image,
+}
+
+impl Material {
+    /// A material with uniform, mid roughness and no metal.
+    pub fn new(name: impl Into<String>, base_color: Image) -> Self {
+        Self::with_values(name, base_color, 0.5, 0.0)
+    }
+
+    pub fn with_values(
+        name: impl Into<String>,
+        base_color: Image,
+        roughness: f32,
+        metallic: f32,
+    ) -> Self {
+        let (width, height) = (base_color.width, base_color.height);
+        Self {
+            name: name.into(),
+            base_color,
+            roughness: data_image(width, height, roughness),
+            metallic: data_image(width, height, metallic),
+        }
+    }
+
+    pub fn channel(&self, channel: Channel) -> &Image {
+        match channel {
+            Channel::BaseColor => &self.base_color,
+            Channel::Roughness => &self.roughness,
+            Channel::Metallic => &self.metallic,
+        }
+    }
+
+    pub fn channel_mut(&mut self, channel: Channel) -> &mut Image {
+        match channel {
+            Channel::BaseColor => &mut self.base_color,
+            Channel::Roughness => &mut self.roughness,
+            Channel::Metallic => &mut self.metallic,
+        }
+    }
+
+    /// Resizes the data channels to the base colour's size, which every
+    /// layer of this slot uses.
+    pub fn conform_channels(&mut self) {
+        let (width, height) = (self.base_color.width, self.base_color.height);
+        for channel in [Channel::Roughness, Channel::Metallic] {
+            let image = self.channel_mut(channel);
+            if (image.width, image.height) != (width, height) {
+                *image = resize(image, width, height);
+            }
+        }
+    }
+}
+
+/// Smoothly resamples an image to a new size.
+pub fn resize(image: &Image, width: u32, height: u32) -> Image {
+    if (image.width, image.height) == (1, 1) {
+        let pixel = [image.rgba[0], image.rgba[1], image.rgba[2], image.rgba[3]];
+        return Image::filled(width, height, pixel);
+    }
+    let source = ::image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone());
+    match source {
+        Some(source) => {
+            let resized = ::image::imageops::resize(
+                &source,
+                width,
+                height,
+                ::image::imageops::FilterType::Triangle,
+            );
+            Image {
+                width,
+                height,
+                rgba: resized.into_raw(),
+            }
+        }
+        None => Image::filled(width, height, [0, 0, 0, 255]),
+    }
 }
 
 /// A range of indices drawn with one material.

@@ -118,6 +118,7 @@ impl History {
 mod tests {
     use super::History;
     use crate::document::{CLEAR, Change, Document, Tile};
+    use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, primitives};
 
     fn document() -> Document {
@@ -128,7 +129,7 @@ mod tests {
     fn paint(document: &mut Document, region: ImageRegion, value: u8) -> Change {
         let (w, h) = document.slot_sizes()[0];
         let layer = &mut document.layers[1];
-        let image = layer.textures[0].get_or_insert_with(|| Image::filled(w, h, CLEAR));
+        let image = layer.textures[0][0].get_or_insert_with(|| Image::filled(w, h, CLEAR));
         let mut before = Vec::new();
         for y in region.y..region.y + region.height {
             for x in region.x..region.x + region.width {
@@ -141,6 +142,7 @@ mod tests {
         Change::Pixels {
             layer: id,
             material: 0,
+            channel: Channel::BaseColor,
             tiles: vec![Tile {
                 region,
                 pixels: before,
@@ -149,7 +151,11 @@ mod tests {
     }
 
     fn composite(document: &Document) -> Vec<u8> {
-        document.composite(0).unwrap().rgba.clone()
+        document
+            .composite(0, Channel::BaseColor)
+            .unwrap()
+            .rgba
+            .clone()
     }
 
     #[test]
@@ -233,7 +239,10 @@ mod tests {
         assert!(!history.undo(&mut document).is_empty());
         assert!(history.undo(&mut document).is_empty());
         // Back to the state after the first (forgotten) step.
-        assert_eq!(document.layers[1].textures[0].as_ref().unwrap().rgba[0], 1);
+        assert_eq!(
+            document.layers[1].textures[0][0].as_ref().unwrap().rgba[0],
+            1
+        );
     }
 
     #[test]

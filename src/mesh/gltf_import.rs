@@ -1,4 +1,6 @@
-use super::{linear_to_srgb, srgb_to_linear, Image, Material, Mesh, SubMesh, Vertex};
+use super::{
+    Channel, Image, Material, Mesh, SubMesh, Vertex, data_image, linear_to_srgb, srgb_to_linear,
+};
 use glam::{Mat3, Mat4, Vec3};
 use std::path::Path;
 
@@ -64,7 +66,29 @@ fn convert_material(material: &gltf::Material, images: &[gltf::image::Data]) -> 
         None => Image::solid(factor),
     };
 
-    Material { name, base_color }
+    // glTF packs roughness into green and metallic into blue, scaled by factors.
+    let packed = pbr
+        .metallic_roughness_texture()
+        .and_then(|info| images.get(info.texture().source().index()))
+        .and_then(|data| Some((data.width, data.height, to_rgba8(data)?)));
+    let channel = |byte: usize, factor: f32| match &packed {
+        Some((width, height, rgba)) => {
+            let encoding = Channel::Roughness.encoding();
+            let mut image = data_image(*width, *height, 0.0);
+            for (pixel, source) in image.rgba.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+                pixel[..3].fill(encoding.encode(encoding.decode(source[byte]) * factor));
+            }
+            image
+        }
+        None => data_image(1, 1, factor),
+    };
+    // Sizes may differ from the base colour; `Document` makes them match.
+    Material {
+        name,
+        roughness: channel(1, pbr.roughness_factor()),
+        metallic: channel(2, pbr.metallic_factor()),
+        base_color,
+    }
 }
 
 /// Converts decoded glTF image data to 8-bit RGBA. Returns None for exotic formats.
@@ -118,13 +142,17 @@ fn tint(image: &mut Image, factor: [f32; 4]) {
 
 /// Index of the fallback material for primitives that don't specify one.
 fn no_material_index(mesh: &mut Mesh) -> usize {
-    if let Some(i) = mesh.materials.iter().position(|m| m.name == NO_MATERIAL_NAME) {
+    if let Some(i) = mesh
+        .materials
+        .iter()
+        .position(|m| m.name == NO_MATERIAL_NAME)
+    {
         return i;
     }
-    mesh.materials.push(Material {
-        name: NO_MATERIAL_NAME.to_string(),
-        base_color: Image::solid([0.8, 0.8, 0.8, 1.0]),
-    });
+    mesh.materials.push(Material::new(
+        NO_MATERIAL_NAME.to_string(),
+        Image::solid([0.8, 0.8, 0.8, 1.0]),
+    ));
     mesh.materials.len() - 1
 }
 
@@ -243,4 +271,79 @@ fn compute_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     sums.into_iter()
         .map(|n| n.normalize_or_zero().to_array())
         .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::load;
+    use crate::mesh::{Channel, Encoding};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn imports_roughness_and_metallic_from_the_packed_texture() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("rustpaint-gltf-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+
+        // One triangle with UVs.
+        let floats: [f32; 15] = [
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, // positions
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, // uvs
+        ];
+        let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(directory.join("data.bin"), &bytes).unwrap();
+        // A 4x4 base colour, and a 2x2 packed texture: roughness in green, metallic in blue.
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
+            .save(directory.join("base.png"))
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 200, 100, 255]))
+            .save(directory.join("packed.png"))
+            .unwrap();
+        let gltf = r#"{
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "TEXCOORD_0": 1}, "material": 0}]}],
+            "materials": [{"name": "Paint", "pbrMetallicRoughness": {
+                "baseColorTexture": {"index": 0},
+                "metallicRoughnessTexture": {"index": 1},
+                "roughnessFactor": 0.5,
+                "metallicFactor": 1.0
+            }}],
+            "textures": [{"source": 0}, {"source": 1}],
+            "images": [{"uri": "base.png"}, {"uri": "packed.png"}],
+            "buffers": [{"uri": "data.bin", "byteLength": 60}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 24}
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                 "min": [0, 0, 0], "max": [1, 1, 0]},
+                {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2"}
+            ]
+        }"#;
+        let path = directory.join("model.gltf");
+        std::fs::write(&path, gltf).unwrap();
+
+        let mut mesh = load(&path).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let material = &mut mesh.materials[0];
+        assert_eq!(material.roughness.width, 2, "imported at its own size");
+        material.conform_channels();
+        for channel in Channel::ALL {
+            let image = material.channel(channel);
+            assert_eq!((image.width, image.height), (4, 4), "{}", channel.name());
+        }
+        let value = |channel: Channel| material.channel(channel).rgba[0];
+        assert_eq!(
+            value(Channel::Roughness),
+            Encoding::Linear.encode(200.0 / 255.0 * 0.5)
+        );
+        assert_eq!(value(Channel::Metallic), 100);
+    }
 }

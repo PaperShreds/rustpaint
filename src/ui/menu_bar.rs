@@ -1,13 +1,21 @@
+use crate::renderer::environment::{BuiltIn, EnvironmentSource};
+use crate::renderer::viewport::{EnvironmentSettings, ViewMode};
 use eframe::egui;
+use std::path::PathBuf;
 
 pub enum MenuAction {
     OpenModel,
     OpenProject,
+    OpenRecent(PathBuf),
+    ClearRecent,
     SaveProject,
     SaveProjectAs,
     ExportTextures,
     Undo,
     Redo,
+    SetView(ViewMode),
+    LoadEnvironment,
+    SetEnvironment(BuiltIn),
 }
 
 const SAVE: egui::KeyboardShortcut =
@@ -26,12 +34,19 @@ const REDO_ALT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y);
 
 /// Which menu entries are currently usable.
-pub struct MenuState {
+pub struct MenuState<'a> {
     pub can_undo: bool,
     pub can_redo: bool,
+    pub view_mode: ViewMode,
+    pub recent_files: &'a [PathBuf],
+    pub environment_source: &'a EnvironmentSource,
 }
 
-pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &MenuState<'_>,
+    environment: &mut EnvironmentSettings,
+) -> Option<MenuAction> {
     // Check the more specific shortcuts first: Ctrl+Shift+S also matches Ctrl+S.
     let mut action = ui.input_mut(|i| {
         if i.consume_shortcut(&SAVE_AS) {
@@ -56,6 +71,24 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 if ui.button("Open project...").clicked() {
                     action = Some(MenuAction::OpenProject);
                 }
+                ui.add_enabled_ui(!state.recent_files.is_empty(), |ui| {
+                    ui.menu_button("Open recent", |ui| {
+                        for path in state.recent_files {
+                            let name = path.file_name().map_or_else(
+                                || path.display().to_string(),
+                                |name| name.to_string_lossy().into_owned(),
+                            );
+                            let button = ui.button(name).on_hover_text(path.display().to_string());
+                            if button.clicked() {
+                                action = Some(MenuAction::OpenRecent(path.clone()));
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Clear list").clicked() {
+                            action = Some(MenuAction::ClearRecent);
+                        }
+                    });
+                });
                 ui.separator();
                 let shortcut = ui.ctx().format_shortcut(&SAVE);
                 if ui
@@ -91,6 +124,43 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 if ui.add_enabled(state.can_redo, redo).clicked() {
                     action = Some(MenuAction::Redo);
                 }
+            });
+            ui.menu_button("View", |ui| {
+                ui.label("Show in viewport");
+                for mode in ViewMode::ALL {
+                    if ui.radio(state.view_mode == mode, mode.name()).clicked() {
+                        action = Some(MenuAction::SetView(mode));
+                    }
+                }
+                ui.separator();
+                ui.label("Environment");
+                for built_in in BuiltIn::ALL {
+                    let selected =
+                        *state.environment_source == EnvironmentSource::BuiltIn(built_in);
+                    if ui.radio(selected, built_in.name()).clicked() {
+                        action = Some(MenuAction::SetEnvironment(built_in));
+                    }
+                }
+                if let EnvironmentSource::File(path) = state.environment_source {
+                    let _ = ui
+                        .radio(true, state.environment_source.name())
+                        .on_hover_text(path.display().to_string());
+                }
+                if ui.button("Load HDRI...").clicked() {
+                    action = Some(MenuAction::LoadEnvironment);
+                }
+                ui.add(
+                    egui::Slider::new(&mut environment.rotation_degrees, 0.0..=360.0)
+                        .text("Rotation")
+                        .suffix("°"),
+                );
+                ui.add(egui::Slider::new(&mut environment.intensity, 0.0..=4.0).text("Intensity"));
+                ui.checkbox(&mut environment.show_background, "Show as background");
+                ui.add_enabled(
+                    environment.show_background,
+                    egui::Slider::new(&mut environment.background_blur, 0.0..=1.0)
+                        .text("Background blur"),
+                );
             });
         });
     });

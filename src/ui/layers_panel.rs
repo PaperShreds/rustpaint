@@ -1,5 +1,5 @@
-use crate::document::{Document, Layer};
-use crate::mesh::Image;
+use crate::document::{BlendMode, Document, Layer};
+use crate::mesh::{Channel, Image};
 use eframe::egui;
 use egui::containers::menu::{MenuButton, MenuConfig};
 use std::collections::HashMap;
@@ -25,6 +25,7 @@ pub enum LayerAction {
         on: bool,
     },
     Rename(usize, String),
+    SetBlend(usize, BlendMode),
     /// `done` is false while the slider is still being dragged.
     Opacity {
         layer: usize,
@@ -87,6 +88,18 @@ pub fn show(
                     });
                 }
             });
+
+            let mut blend = current.blend;
+            egui::ComboBox::from_label("Blend")
+                .selected_text(blend.name())
+                .show_ui(ui, |ui| {
+                    for mode in BlendMode::ALL {
+                        ui.selectable_value(&mut blend, mode, mode.name());
+                    }
+                });
+            if blend != current.blend {
+                actions.push(LayerAction::SetBlend(selected, blend));
+            }
 
             let mut opacity = current.opacity;
             let slider = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"));
@@ -219,18 +232,17 @@ fn slot_summary(document: &Document, layer: &Layer) -> String {
     }
 }
 
-/// A small preview of the layer on its first ticked slot, over a checkerboard
-/// so transparent areas are visible.
+/// A small preview of the layer on its first ticked slot (base colour, or
+/// another channel if that's all it has), over a checkerboard so transparent
+/// areas are visible.
 pub fn thumbnail(document: &Document, index: usize) -> egui::ColorImage {
     let layer = &document.layers[index];
     let image: Option<&Image> = (0..layer.targets.len())
         .filter(|&slot| layer.targets[slot])
         .find_map(|slot| {
-            if layer.is_base() {
-                document.mesh.materials.get(slot).map(|m| &m.base_color)
-            } else {
-                layer.textures.get(slot)?.as_ref()
-            }
+            Channel::ALL
+                .into_iter()
+                .find_map(|channel| document.layer_image(layer, slot, channel))
         });
 
     const SAMPLES: usize = 4;

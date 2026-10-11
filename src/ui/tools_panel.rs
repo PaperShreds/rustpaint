@@ -19,10 +19,23 @@ pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
             ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
             ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
 
-            ui.horizontal(|ui| {
-                ui.label("Color");
-                ui.color_edit_button_rgb(&mut brush.color);
-            });
+            ui.add_space(8.0);
+            ui.label("Channels")
+                .on_hover_text("Tick the channels a stroke paints, and the value it puts there");
+            egui::Grid::new("brush_channels")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.checkbox(&mut brush.paint_color, "Base color");
+                    ui.color_edit_button_rgb(&mut brush.color);
+                    ui.end_row();
+                    ui.checkbox(&mut brush.paint_roughness, "Roughness");
+                    ui.add(egui::Slider::new(&mut brush.roughness, 0.0..=1.0));
+                    ui.end_row();
+                    ui.checkbox(&mut brush.paint_metallic, "Metallic");
+                    ui.add(egui::Slider::new(&mut brush.metallic, 0.0..=1.0));
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
             ui.checkbox(&mut brush.screen_space, "Screen-space brush")
                 .on_hover_text(
                     "Project the brush flat from the screen instead of following the surface",

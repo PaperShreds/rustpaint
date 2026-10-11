@@ -1,19 +1,21 @@
 //! Exporting painted textures as image files.
 
 use crate::document::Document;
-use crate::mesh::Image;
+use crate::mesh::{Channel, Encoding, Image};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// One texture file to write.
 pub struct ExportFile {
     pub path: PathBuf,
-    /// The material slot whose combined layers go into this file.
+    /// The material slot and channel whose combined layers go into this file.
     pub material: usize,
+    pub channel: Channel,
 }
 
-/// The PNG files exporting `document` into `directory` would write, one per
-/// material slot with its visible layers combined: `<model>_<material>_BaseColor.png`.
+/// The PNG files exporting `document` into `directory` would write: one per
+/// material slot and channel, with its visible layers combined, named
+/// `<model>_<material>_<Channel>.png` (e.g. `_BaseColor`, `_Roughness`).
 pub fn plan(directory: &Path, model_name: &str, document: &Document) -> Vec<ExportFile> {
     let model = sanitize(model_name);
     let mut used = HashSet::new();
@@ -22,19 +24,20 @@ pub fn plan(directory: &Path, model_name: &str, document: &Document) -> Vec<Expo
         .materials
         .iter()
         .enumerate()
-        .map(|(index, material)| {
-            let base = format!("{model}_{}_BaseColor", sanitize(&material.name));
+        .flat_map(|(index, material)| {
+            let base = format!("{model}_{}", sanitize(&material.name));
             // Two materials can sanitize to the same name; keep files distinct.
-            let mut name = base.clone();
+            let mut stem = base.clone();
             let mut suffix = 2;
-            while !used.insert(name.to_lowercase()) {
-                name = format!("{base}_{suffix}");
+            while !used.insert(stem.to_lowercase()) {
+                stem = format!("{base}_{suffix}");
                 suffix += 1;
             }
-            ExportFile {
-                path: directory.join(format!("{name}.png")),
+            Channel::ALL.map(|channel| ExportFile {
+                path: directory.join(format!("{stem}_{}.png", channel.file_suffix())),
                 material: index,
-            }
+                channel,
+            })
         })
         .collect()
 }
@@ -49,9 +52,9 @@ pub fn write(files: &[ExportFile], document: &Document) -> Result<(), String> {
             .map(|file| {
                 scope.spawn(move || {
                     let image = document
-                        .composite(file.material)
+                        .composite(file.material, file.channel)
                         .ok_or("material slot not found")?;
-                    write_png(&file.path, &image)
+                    write_png(&file.path, &image, file.channel.encoding())
                 })
             })
             .collect();
@@ -64,9 +67,18 @@ pub fn write(files: &[ExportFile], document: &Document) -> Result<(), String> {
     })
 }
 
-fn write_png(path: &Path, image: &Image) -> Result<(), String> {
-    let buffer = image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
-        .ok_or("texture data does not match its size")?;
+/// Colour is written as RGBA; data channels as greyscale, as engines expect.
+fn write_png(path: &Path, image: &Image, encoding: Encoding) -> Result<(), String> {
+    let buffer: image::DynamicImage = match encoding {
+        Encoding::Srgb => image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+            .map(image::DynamicImage::ImageRgba8),
+        Encoding::Linear => {
+            let values = image.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect();
+            image::GrayImage::from_raw(image.width, image.height, values)
+                .map(image::DynamicImage::ImageLuma8)
+        }
+    }
+    .ok_or("texture data does not match its size")?;
     let temporary = path.with_file_name(format!(
         ".{}.{}.tmp",
         display_name(path),
@@ -121,6 +133,7 @@ fn sanitize(name: &str) -> String {
 mod tests {
     use super::{plan, sanitize, write};
     use crate::document::Document;
+    use crate::mesh::Channel;
     use crate::mesh::{Image, Material, primitives};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,10 +146,7 @@ mod tests {
         let mut mesh = primitives::cube();
         mesh.materials = ["Metal", "metal", "Metal?"]
             .into_iter()
-            .map(|name| Material {
-                name: name.into(),
-                base_color: Image::filled(1, 1, [0, 0, 0, 255]),
-            })
+            .map(|name| Material::new(name, Image::filled(1, 1, [0, 0, 0, 255])))
             .collect();
         let document = Document::new(mesh);
         let names: Vec<_> = plan("out".as_ref(), "My Model", &document)
@@ -153,8 +163,14 @@ mod tests {
             names,
             [
                 "My_Model_Metal_BaseColor.png",
-                "My_Model_metal_BaseColor_2.png",
-                "My_Model_Metal_BaseColor_3.png",
+                "My_Model_Metal_Roughness.png",
+                "My_Model_Metal_Metallic.png",
+                "My_Model_metal_2_BaseColor.png",
+                "My_Model_metal_2_Roughness.png",
+                "My_Model_metal_2_Metallic.png",
+                "My_Model_Metal_3_BaseColor.png",
+                "My_Model_Metal_3_Roughness.png",
+                "My_Model_Metal_3_Metallic.png",
             ]
         );
     }
@@ -176,11 +192,24 @@ mod tests {
         write(&files, &document).unwrap();
 
         let saved = image::open(&files[0].path).unwrap().to_rgba8();
-        let texture = &document.composite(0).unwrap();
+        let texture = &document.composite(0, Channel::BaseColor).unwrap();
         assert_eq!(saved.dimensions(), (texture.width, texture.height));
         assert_eq!(saved.as_raw(), &texture.rgba);
-        // Only the PNG is left: no temporary files.
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        // Data channels are greyscale, holding the raw values.
+        assert_eq!(files[1].channel, Channel::Roughness);
+        let roughness = image::open(&files[1].path).unwrap();
+        assert!(matches!(roughness, image::DynamicImage::ImageLuma8(_)));
+        let expected = crate::mesh::Encoding::Linear.encode(0.5);
+        assert!(
+            roughness
+                .to_luma8()
+                .pixels()
+                .all(|pixel| pixel.0[0] == expected)
+        );
+
+        // Only the PNGs are left: no temporary files.
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 3);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

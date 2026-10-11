@@ -5,6 +5,7 @@ mod mesh;
 mod painting;
 mod project;
 mod renderer;
+mod settings;
 mod ui;
 
 use app::RustPaintApp;

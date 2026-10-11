@@ -7,10 +7,78 @@
 //! The viewport blends the visible layers on the GPU. `composite` does the same
 //! on the CPU, for export.
 
-use crate::mesh::{Image, ImageRegion, Mesh, linear_to_srgb, srgb_to_linear};
+pub use crate::mesh::{Channel, Encoding};
+use crate::mesh::{Image, ImageRegion, Mesh};
 
 /// A transparent pixel, the starting content of a paint layer.
 pub const CLEAR: [u8; 4] = [0, 0, 0, 0];
+
+/// How a layer combines with the layers below it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    Add,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 7] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Add,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::Add => "Add",
+        }
+    }
+
+    /// Stable number for files and shaders.
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0) as u8
+    }
+
+    pub fn from_index(index: u8) -> Option<Self> {
+        Self::ALL.get(index as usize).copied()
+    }
+
+    /// Blends one channel of `top` onto `below` (straight values in 0..1).
+    /// Must match `blend_channel` in `composite.wgsl`.
+    pub fn apply(self, below: f32, top: f32) -> f32 {
+        let value = match self {
+            BlendMode::Normal => top,
+            BlendMode::Multiply => below * top,
+            BlendMode::Screen => below + top - below * top,
+            BlendMode::Overlay => {
+                if below <= 0.5 {
+                    2.0 * below * top
+                } else {
+                    1.0 - 2.0 * (1.0 - below) * (1.0 - top)
+                }
+            }
+            BlendMode::Darken => below.min(top),
+            BlendMode::Lighten => below.max(top),
+            BlendMode::Add => below + top,
+        };
+        value.clamp(0.0, 1.0)
+    }
+}
 
 pub struct Layer {
     /// Stable identity, so undo steps and UI state survive reordering.
@@ -18,11 +86,12 @@ pub struct Layer {
     pub name: String,
     pub visible: bool,
     pub opacity: f32,
+    pub blend: BlendMode,
     /// Which material slots the layer paints on (and shows on), by slot index.
     pub targets: Vec<bool>,
-    /// Paint per material slot; `None` until the slot is first painted.
+    /// Paint per material slot and channel; `None` until first painted.
     /// Always empty for the base layer, whose pixels are the mesh's textures.
-    pub textures: Vec<Option<Image>>,
+    pub textures: Vec<[Option<Image>; Channel::COUNT]>,
 }
 
 impl Layer {
@@ -35,6 +104,7 @@ impl Layer {
             name: self.name.clone(),
             visible: self.visible,
             opacity: self.opacity,
+            blend: self.blend,
             targets: self.targets.clone(),
         }
     }
@@ -43,12 +113,14 @@ impl Layer {
         self.name = props.name;
         self.visible = props.visible;
         self.opacity = props.opacity;
+        self.blend = props.blend;
         self.targets = props.targets;
     }
 
     fn bytes(&self) -> usize {
         self.textures
             .iter()
+            .flatten()
             .flatten()
             .map(|image| image.rgba.len())
             .sum()
@@ -57,12 +129,21 @@ impl Layer {
 
 pub const BASE_LAYER_ID: u64 = 0;
 
+/// A layer as it contributes to one slot's composite.
+pub struct VisibleLayer<'a> {
+    pub id: u64,
+    pub image: &'a Image,
+    pub opacity: f32,
+    pub blend: BlendMode,
+}
+
 /// Settings of a layer that can be changed (and undone) as one.
 #[derive(Clone, PartialEq)]
 pub struct LayerProps {
     pub name: String,
     pub visible: bool,
     pub opacity: f32,
+    pub blend: BlendMode,
     pub targets: Vec<bool>,
 }
 
@@ -79,6 +160,7 @@ pub enum Change {
     Pixels {
         layer: u64,
         material: usize,
+        channel: Channel,
         tiles: Vec<Tile>,
     },
     /// With `stored` set: insert it at `index`. Without: remove the layer at
@@ -109,6 +191,7 @@ pub enum Dirty {
     Pixels {
         layer: u64,
         material: usize,
+        channel: Channel,
         region: ImageRegion,
     },
     /// Layers were added, removed, reordered, or their settings changed.
@@ -132,13 +215,18 @@ impl Document {
     }
 
     /// `layers` excludes the base layer, which is created here.
-    pub fn with_layers(mesh: Mesh, layers: Vec<Layer>) -> Self {
+    pub fn with_layers(mut mesh: Mesh, layers: Vec<Layer>) -> Self {
+        // Every texture of a slot must be the same size, whatever its source.
+        for material in &mut mesh.materials {
+            material.conform_channels();
+        }
         let slots = mesh.materials.len();
         let base = Layer {
             id: BASE_LAYER_ID,
             name: "Base (from model)".to_string(),
             visible: true,
             opacity: 1.0,
+            blend: BlendMode::Normal,
             targets: vec![true; slots],
             textures: Vec::new(),
         };
@@ -169,28 +257,37 @@ impl Document {
 
     /// The pixels of a layer on a slot: the mesh's texture for the base
     /// layer, otherwise the layer's paint (if any).
-    pub fn layer_image<'a>(&'a self, layer: &'a Layer, material: usize) -> Option<&'a Image> {
+    pub fn layer_image<'a>(
+        &'a self,
+        layer: &'a Layer,
+        material: usize,
+        channel: Channel,
+    ) -> Option<&'a Image> {
         if layer.is_base() {
-            self.mesh.materials.get(material).map(|m| &m.base_color)
+            self.mesh
+                .materials
+                .get(material)
+                .map(|m| m.channel(channel))
         } else {
-            layer.textures.get(material)?.as_ref()
+            layer.textures.get(material)?[channel.index()].as_ref()
         }
     }
 
     /// What shows on `material`, bottom to top: each visible layer that targets
-    /// the slot and has pixels there, with its id and opacity.
-    pub fn visible_layers(&self, material: usize) -> Vec<(u64, &Image, f32)> {
+    /// the slot and has pixels there.
+    pub fn visible_layers(&self, material: usize, channel: Channel) -> Vec<VisibleLayer<'_>> {
         let size = self.slot_sizes().get(material).copied();
         self.layers
             .iter()
             .filter(|layer| layer.visible && layer.targets.get(material) == Some(&true))
             .filter_map(|layer| {
-                let image = self.layer_image(layer, material)?;
-                (Some((image.width, image.height)) == size).then_some((
-                    layer.id,
+                let image = self.layer_image(layer, material, channel)?;
+                (Some((image.width, image.height)) == size).then_some(VisibleLayer {
+                    id: layer.id,
                     image,
-                    layer.opacity.clamp(0.0, 1.0),
-                ))
+                    opacity: layer.opacity.clamp(0.0, 1.0),
+                    blend: layer.blend,
+                })
             })
             .collect()
     }
@@ -205,8 +302,9 @@ impl Document {
             name: format!("Layer {id}"),
             visible: true,
             opacity: 1.0,
+            blend: BlendMode::Normal,
             targets: vec![true; slots],
-            textures: (0..slots).map(|_| None).collect(),
+            textures: (0..slots).map(|_| Default::default()).collect(),
         }
     }
 
@@ -228,10 +326,12 @@ impl Document {
             Change::Pixels {
                 layer,
                 material,
+                channel,
                 tiles,
             } => {
                 let index = self.layer_index(*layer)?;
-                let image = self.layers[index].textures.get_mut(*material)?.as_mut()?;
+                let image =
+                    self.layers[index].textures.get_mut(*material)?[channel.index()].as_mut()?;
                 let fits = tiles.iter().all(|tile| {
                     tile.region.x + tile.region.width <= image.width
                         && tile.region.y + tile.region.height <= image.height
@@ -251,6 +351,7 @@ impl Document {
                 Some(Dirty::Pixels {
                     layer: *layer,
                     material: *material,
+                    channel: *channel,
                     region,
                 })
             }
@@ -294,59 +395,60 @@ impl Document {
         }
     }
 
-    /// The visible layers of `material` blended into one image (on the CPU).
-    pub fn composite(&self, material: usize) -> Option<Image> {
+    /// The visible layers of one channel of `material`, blended into one image (on the CPU).
+    pub fn composite(&self, material: usize, channel: Channel) -> Option<Image> {
         let (width, height) = *self.slot_sizes().get(material)?;
-        let sources: Vec<(&[u8], f32)> = self
-            .visible_layers(material)
-            .into_iter()
-            .map(|(_, image, opacity)| (&image.rgba[..], opacity))
-            .collect();
+        let sources = self.visible_layers(material, channel);
         let mut composite = Image::filled(width, height, CLEAR);
         for (offset, pixel) in composite.rgba.chunks_exact_mut(4).enumerate() {
-            pixel.copy_from_slice(&composite_pixel(&sources, offset * 4));
+            pixel.copy_from_slice(&composite_pixel(&sources, offset * 4, channel.encoding()));
         }
         Some(composite)
     }
 }
 
-/// "Over" blend of one pixel through the layer stack, in linear light.
-fn composite_pixel(sources: &[(&[u8], f32)], offset: usize) -> [u8; 4] {
-    // Only the layers from the topmost fully opaque one upward matter.
-    let mut start = 0;
-    let mut contributors = 0;
-    for (index, (rgba, opacity)) in sources.iter().enumerate().rev() {
-        let alpha = rgba[offset + 3];
-        if alpha == 0 || *opacity == 0.0 {
-            continue;
-        }
-        contributors += 1;
-        if alpha == 255 && *opacity == 1.0 {
-            start = index;
-            break;
-        }
-    }
-    if contributors == 0 {
+/// Blends one pixel through the layer stack. Same maths as `fs_layer` in
+/// `composite.wgsl`: premultiplied, with the W3C formula for blend modes.
+fn composite_pixel(sources: &[VisibleLayer], offset: usize, encoding: Encoding) -> [u8; 4] {
+    let contributes =
+        |layer: &&VisibleLayer| layer.image.rgba[offset + 3] != 0 && layer.opacity > 0.0;
+    // A fully opaque Normal layer hides everything below it.
+    let start = sources
+        .iter()
+        .rposition(|layer| {
+            layer.blend == BlendMode::Normal
+                && layer.opacity == 1.0
+                && layer.image.rgba[offset + 3] == 255
+        })
+        .unwrap_or(0);
+    let mut contributors = sources[start..].iter().filter(contributes);
+    let Some(first) = contributors.next() else {
         return CLEAR;
-    }
-    let (top, opacity) = sources[start];
-    if contributors == 1 && opacity == 1.0 {
-        // A single opaque layer shows through unchanged.
+    };
+    if contributors.next().is_none() && first.opacity == 1.0 && first.blend == BlendMode::Normal {
+        // A single Normal layer shows through unchanged.
         let mut pixel = [0; 4];
-        pixel.copy_from_slice(&top[offset..offset + 4]);
+        pixel.copy_from_slice(&first.image.rgba[offset..offset + 4]);
         return pixel;
     }
 
-    // Premultiplied accumulation.
-    let mut color = [0.0f32; 3];
+    let mut color = [0.0f32; 3]; // premultiplied
     let mut coverage = 0.0f32;
-    for (rgba, opacity) in &sources[start..] {
-        let alpha = rgba[offset + 3] as f32 / 255.0 * opacity;
+    for layer in &sources[start..] {
+        let alpha = layer.image.rgba[offset + 3] as f32 / 255.0 * layer.opacity;
         if alpha == 0.0 {
             continue;
         }
         for (channel, value) in color.iter_mut().enumerate() {
-            *value = srgb_to_linear(rgba[offset + channel]) * alpha + *value * (1.0 - alpha);
+            let top = encoding.decode(layer.image.rgba[offset + channel]);
+            let below = if coverage > 0.0 {
+                *value / coverage
+            } else {
+                0.0
+            };
+            let mixed = layer.blend.apply(below, top);
+            *value =
+                top * alpha * (1.0 - coverage) + *value * (1.0 - alpha) + alpha * coverage * mixed;
         }
         coverage = alpha + coverage * (1.0 - alpha);
     }
@@ -354,9 +456,9 @@ fn composite_pixel(sources: &[(&[u8], f32)], offset: usize) -> [u8; 4] {
         return CLEAR;
     }
     [
-        linear_to_srgb(color[0] / coverage),
-        linear_to_srgb(color[1] / coverage),
-        linear_to_srgb(color[2] / coverage),
+        encoding.encode(color[0] / coverage),
+        encoding.encode(color[1] / coverage),
+        encoding.encode(color[2] / coverage),
         (coverage * 255.0).round() as u8,
     ]
 }
@@ -374,7 +476,8 @@ fn swap_tile(image: &mut Image, tile: &mut Tile) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLEAR, Change, Document};
+    use super::{BlendMode, CLEAR, Change, Document};
+    use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, Material, primitives};
 
     /// A cube with two 4x4 slots: red and blue.
@@ -382,17 +485,14 @@ mod tests {
         let mut mesh = primitives::cube();
         mesh.materials = [("Red", [255, 0, 0, 255]), ("Blue", [0, 0, 255, 255])]
             .into_iter()
-            .map(|(name, pixel)| Material {
-                name: name.into(),
-                base_color: Image::filled(4, 4, pixel),
-            })
+            .map(|(name, pixel)| Material::new(name, Image::filled(4, 4, pixel)))
             .collect();
         Document::new(mesh)
     }
 
     fn paint(document: &mut Document, layer: usize, material: usize, pixel: [u8; 4]) {
         let (w, h) = document.slot_sizes()[material];
-        let image = document.layers[layer].textures[material]
+        let image = document.layers[layer].textures[material][0]
             .get_or_insert_with(|| Image::filled(w, h, CLEAR));
         image.rgba[0..4].copy_from_slice(&pixel);
     }
@@ -403,11 +503,11 @@ mod tests {
         assert_eq!(document.layers.len(), 2);
         assert!(document.layers[0].is_base());
         assert_eq!(
-            &document.composite(0).unwrap().rgba[0..4],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
             &[255, 0, 0, 255]
         );
         assert_eq!(
-            &document.composite(1).unwrap().rgba[0..4],
+            &document.composite(1, Channel::BaseColor).unwrap().rgba[0..4],
             &[0, 0, 255, 255]
         );
     }
@@ -417,17 +517,17 @@ mod tests {
         let mut document = document();
         paint(&mut document, 1, 0, [0, 255, 0, 255]);
         assert_eq!(
-            &document.composite(0).unwrap().rgba[0..4],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
             &[0, 255, 0, 255]
         );
         // Pixels the layer didn't paint still show the base.
         assert_eq!(
-            &document.composite(0).unwrap().rgba[4..8],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[4..8],
             &[255, 0, 0, 255]
         );
 
         document.layers[1].opacity = 0.5;
-        let composite = document.composite(0).unwrap();
+        let composite = document.composite(0, Channel::BaseColor).unwrap();
         let pixel = &composite.rgba[0..4];
         // Half green over red, mixed in linear light: both channels well above 50%.
         assert!(pixel[0] > 180 && pixel[1] > 180 && pixel[2] == 0 && pixel[3] == 255);
@@ -440,20 +540,20 @@ mod tests {
 
         document.layers[1].visible = false;
         assert_eq!(
-            &document.composite(0).unwrap().rgba[0..4],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
             &[255, 0, 0, 255]
         );
 
         document.layers[1].visible = true;
         document.layers[1].targets[0] = false;
         assert_eq!(
-            &document.composite(0).unwrap().rgba[0..4],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
             &[255, 0, 0, 255]
         );
         // The paint is kept and comes back when the slot is ticked again.
         document.layers[1].targets[0] = true;
         assert_eq!(
-            &document.composite(0).unwrap().rgba[0..4],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
             &[0, 255, 0, 255]
         );
     }
@@ -471,13 +571,13 @@ mod tests {
         document.apply(&mut remove).unwrap();
         assert_eq!(document.layers.len(), 1);
         assert_eq!(
-            &document.composite(0).unwrap().rgba[0..4],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
             &[255, 0, 0, 255]
         );
         document.apply(&mut remove).unwrap();
         assert_eq!(document.layers.len(), 2);
         assert_eq!(
-            &document.composite(0).unwrap().rgba[0..4],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
             &[0, 255, 0, 255]
         );
 
@@ -514,6 +614,7 @@ mod tests {
         let mut change = Change::Pixels {
             layer: id,
             material: 0,
+            channel: Channel::BaseColor,
             tiles: vec![super::Tile {
                 region,
                 pixels: vec![0, 255, 0, 255],
@@ -521,12 +622,12 @@ mod tests {
         };
         document.apply(&mut change).unwrap();
         assert_eq!(
-            &document.composite(0).unwrap().rgba[20..24],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[20..24],
             &[0, 255, 0, 255]
         );
         document.apply(&mut change).unwrap();
         assert_eq!(
-            &document.composite(0).unwrap().rgba[20..24],
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[20..24],
             &[255, 0, 0, 255]
         );
     }
@@ -537,5 +638,41 @@ mod tests {
             let linear = crate::mesh::srgb_to_linear(value);
             assert_eq!(crate::mesh::linear_to_srgb(linear), value);
         }
+    }
+
+    #[test]
+    fn blend_modes_combine_with_the_layers_below() {
+        let mut document = document();
+        // The base is pure red; paint mid grey on the layer above.
+        paint(&mut document, 1, 0, [128, 128, 128, 255]);
+        let grey = crate::mesh::srgb_to_linear(128);
+        let pixel = |document: &Document| {
+            let composite = document.composite(0, Channel::BaseColor).unwrap();
+            [0, 1, 2].map(|c| crate::mesh::srgb_to_linear(composite.rgba[c]))
+        };
+        for mode in BlendMode::ALL {
+            document.layers[1].blend = mode;
+            let expected = [
+                mode.apply(1.0, grey),
+                mode.apply(0.0, grey),
+                mode.apply(0.0, grey),
+            ];
+            let actual = pixel(&document);
+            for (a, e) in actual.iter().zip(expected) {
+                assert!(
+                    (a - e).abs() < 0.01,
+                    "{}: {actual:?} vs {expected:?}",
+                    mode.name()
+                );
+            }
+        }
+        // Spot checks against the definitions.
+        document.layers[1].blend = BlendMode::Multiply;
+        assert!(
+            pixel(&document)[1] < 0.01,
+            "multiply onto black stays black"
+        );
+        document.layers[1].blend = BlendMode::Screen;
+        assert!(pixel(&document)[0] > 0.99, "screen onto white stays white");
     }
 }

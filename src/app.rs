@@ -7,6 +7,9 @@ use crate::painting::stroke::{Stroke, StrokePainter};
 use crate::project;
 use crate::renderer;
 use crate::renderer::camera::OrbitCamera;
+use crate::renderer::environment::{EnvironmentSource, HdrImage};
+use crate::renderer::viewport::{EnvironmentSettings, ViewMode};
+use crate::settings::{self, Settings};
 use crate::ui;
 use crate::ui::layers_panel::{LayerAction, LayersPanelState};
 use crate::ui::menu_bar::{MenuAction, MenuState};
@@ -19,10 +22,25 @@ const PROJECT_EXTENSION: &str = "rustpaint";
 /// Untextured materials get a blank canvas of this size so they can be painted.
 const DEFAULT_CANVAS_SIZE: u32 = 2048;
 
+/// An action waiting for the user to decide what happens to unsaved changes.
+enum Pending {
+    Quit,
+    Open(PathBuf),
+}
+
 pub struct RustPaintApp {
     pub brush: Brush,
     pub camera: OrbitCamera,
+    pub view_mode: ViewMode,
+    pub environment: EnvironmentSettings,
+    environment_source: EnvironmentSource,
+    /// File > Open recent, most recent first.
+    recent_files: Vec<PathBuf>,
     pub status: String,
+    /// Shown as the "Save changes?" dialog while set.
+    pending: Option<Pending>,
+    /// Set once the user agreed to close, so the next close request goes through.
+    allow_close: bool,
     /// The model and its layers; painting edits this, then uploads the composites.
     document: Document,
     /// Id of the layer strokes go into.
@@ -51,12 +69,35 @@ pub struct RustPaintApp {
 
 impl RustPaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = Settings::load(cc.storage);
+        let mut status = "Use File > Open model... to load a .glb / .gltf file.".to_string();
+        let mut environment_source = settings.environment_source;
+        // A custom HDRI may have been moved or deleted since: fall back to the default.
+        let environment = environment_source.load().or_else(|error| {
+            status = format!("Could not load {}: {error}", environment_source.name());
+            environment_source = EnvironmentSource::default();
+            environment_source.load()
+        });
+        let environment = environment.unwrap_or_else(|error| {
+            eprintln!("Could not load the built-in environment: {error}");
+            HdrImage {
+                width: 1,
+                height: 1,
+                rgba: vec![0.5, 0.5, 0.5, 1.0],
+            }
+        });
         let document = Document::new(mesh::primitives::cube());
-        renderer::viewport::init(cc, &document);
+        renderer::viewport::init(cc, &document, &environment);
         Self {
-            brush: Brush::default(),
+            brush: settings.brush,
             camera: OrbitCamera::default(),
-            status: "Use File > Open model... to load a .glb / .gltf file.".to_string(),
+            view_mode: settings.view_mode,
+            environment: settings.environment,
+            environment_source,
+            recent_files: settings.recent_files,
+            pending: None,
+            allow_close: false,
+            status,
             selected_layer: document.layers[document.layers.len() - 1].id,
             document,
             layers_panel: LayersPanelState::default(),
@@ -94,6 +135,11 @@ impl RustPaintApp {
     }
 
     fn open(&mut self, path: &Path, frame: &eframe::Frame) {
+        if !path.exists() {
+            self.status = format!("{} no longer exists", path.display());
+            self.recent_files.retain(|recent| recent != path);
+            return;
+        }
         let is_project = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case(PROJECT_EXTENSION));
@@ -117,6 +163,7 @@ impl RustPaintApp {
                 );
                 self.set_document(Document::new(mesh), frame);
                 self.remember_source(path);
+                settings::add_recent_file(&mut self.recent_files, path);
                 // A model isn't a project yet; the first save asks where to put it.
                 self.project_path = None;
             }
@@ -132,6 +179,7 @@ impl RustPaintApp {
             Ok(document) => {
                 self.set_document(document, frame);
                 self.remember_source(path);
+                settings::add_recent_file(&mut self.recent_files, path);
                 self.project_path = Some(path.to_path_buf());
                 self.status = format!("Opened project {name}");
             }
@@ -226,6 +274,7 @@ impl RustPaintApp {
         let name = file_name(&path);
         match project::save(&path, &self.document) {
             Ok(()) => {
+                settings::add_recent_file(&mut self.recent_files, &path);
                 self.project_path = Some(path);
                 self.saved_state = self.history.state();
                 self.status = format!("Saved {name}");
@@ -289,9 +338,10 @@ impl RustPaintApp {
         let changed = painter.paint_segment(stroke, layer, &sizes, from, to, &self.brush);
         let dirty: Vec<Dirty> = changed
             .into_iter()
-            .map(|(material, region)| Dirty::Pixels {
+            .map(|(material, channel, region)| Dirty::Pixels {
                 layer: id,
                 material,
+                channel,
                 region,
             })
             .collect();
@@ -394,6 +444,11 @@ impl RustPaintApp {
                     self.commit(change, frame);
                 }
             }
+            LayerAction::SetBlend(index, blend) => {
+                if let Some(change) = props_change(index, &self.document, &|p| p.blend = blend) {
+                    self.commit(change, frame);
+                }
+            }
             LayerAction::Rename(index, name) => {
                 if let Some(change) =
                     props_change(index, &self.document, &|p| p.name = name.clone())
@@ -474,6 +529,122 @@ impl RustPaintApp {
             .map_or(circle, BrushCursor::Outline)
     }
 
+    /// Opens a file, first asking about unsaved changes if there are any.
+    fn request_open(&mut self, path: PathBuf, frame: &eframe::Frame) {
+        if self.has_unsaved_changes() {
+            self.pending = Some(Pending::Open(path));
+        } else {
+            self.open(&path, frame);
+        }
+    }
+
+    fn proceed(&mut self, pending: Pending, ctx: &egui::Context, frame: &eframe::Frame) {
+        match pending {
+            Pending::Quit => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Pending::Open(path) => self.open(&path, frame),
+        }
+    }
+
+    /// "Save changes before ...?" with Save / Don't save / Cancel.
+    fn unsaved_changes_dialog(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let verb = match pending {
+            Pending::Quit => "closing",
+            Pending::Open(_) => "opening another file",
+        };
+        let document = self
+            .project_path
+            .as_deref()
+            .map_or_else(|| "Untitled".to_string(), file_name);
+
+        #[derive(Clone, Copy)]
+        enum Choice {
+            Save,
+            Discard,
+            Cancel,
+        }
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
+            ui.heading("Unsaved changes");
+            ui.label(format!("Save changes to {document} before {verb}?"));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(Choice::Save);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(Choice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(Choice::Cancel);
+                }
+            });
+        });
+        // Escape or a click outside counts as Cancel.
+        if modal.should_close() && choice.is_none() {
+            choice = Some(Choice::Cancel);
+        }
+        // Only take `pending` once a choice is made, or the dialog closes itself.
+        let Some(choice) = choice else {
+            return;
+        };
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        match choice {
+            Choice::Save => {
+                self.save_project(false);
+                // Only go ahead if the save actually happened (not cancelled or failed).
+                if !self.has_unsaved_changes() {
+                    self.proceed(pending, ctx, frame);
+                }
+            }
+            Choice::Discard => self.proceed(pending, ctx, frame),
+            Choice::Cancel => {}
+        }
+    }
+
+    fn load_environment(&mut self, frame: &eframe::Frame) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("HDR image", &["hdr", "exr"])
+            .pick_file();
+        if let Some(path) = picked {
+            self.set_environment(EnvironmentSource::File(path), frame);
+        }
+    }
+
+    fn set_environment(&mut self, source: EnvironmentSource, frame: &eframe::Frame) {
+        let name = source.name();
+        match source.load() {
+            Ok(image) => {
+                if let Some(render_state) = frame.wgpu_render_state() {
+                    renderer::viewport::set_environment(render_state, &image);
+                }
+                self.status = format!("Lighting with {name} ({}x{})", image.width, image.height);
+                self.environment_source = source;
+            }
+            Err(error) => self.status = format!("Failed to load {name}: {error}"),
+        }
+    }
+
+    fn settings(&self) -> Settings {
+        Settings {
+            recent_files: self.recent_files.clone(),
+            environment_source: self.environment_source.clone(),
+            environment: self.environment,
+            view_mode: self.view_mode,
+            brush: Brush {
+                erase: false,
+                ..self.brush.clone()
+            },
+        }
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
         let document = self
             .project_path
@@ -489,18 +660,34 @@ impl RustPaintApp {
 }
 
 impl eframe::App for RustPaintApp {
+    /// Called by eframe every so often and on exit.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings().save(storage);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let menu_state = MenuState {
             can_undo: self.history.can_undo() || self.stroke.is_some(),
             can_redo: self.history.can_redo(),
+            view_mode: self.view_mode,
+            recent_files: &self.recent_files,
+            environment_source: &self.environment_source,
         };
-        match ui::menu_bar::show(ui, &menu_state) {
+        // Closing with unsaved work: stop, and ask first.
+        let close_requested = ui.input(|i| i.viewport().close_requested());
+        if close_requested && !self.allow_close && self.has_unsaved_changes() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending = Some(Pending::Quit);
+        }
+
+        match ui::menu_bar::show(ui, &menu_state, &mut self.environment) {
             Some(MenuAction::OpenModel) => {
                 let picked = rfd::FileDialog::new()
                     .add_filter("glTF", &["glb", "gltf"])
                     .pick_file();
                 if let Some(path) = picked {
-                    self.load_model(&path, frame);
+                    self.request_open(path, frame);
                 }
             }
             Some(MenuAction::OpenProject) => {
@@ -508,21 +695,28 @@ impl eframe::App for RustPaintApp {
                     .add_filter("RustPaint project", &[PROJECT_EXTENSION])
                     .pick_file();
                 if let Some(path) = picked {
-                    self.load_project(&path, frame);
+                    self.request_open(path, frame);
                 }
+            }
+            Some(MenuAction::OpenRecent(path)) => self.request_open(path, frame),
+            Some(MenuAction::ClearRecent) => self.recent_files.clear(),
+            Some(MenuAction::LoadEnvironment) => self.load_environment(frame),
+            Some(MenuAction::SetEnvironment(built_in)) => {
+                self.set_environment(EnvironmentSource::BuiltIn(built_in), frame)
             }
             Some(MenuAction::SaveProject) => self.save_project(false),
             Some(MenuAction::SaveProjectAs) => self.save_project(true),
             Some(MenuAction::ExportTextures) => self.export_textures(),
             Some(MenuAction::Undo) => self.step_history(frame, false),
             Some(MenuAction::Redo) => self.step_history(frame, true),
+            Some(MenuAction::SetView(mode)) => self.view_mode = mode,
             None => {}
         }
 
         // Drag and drop (works on some platforms only, for now)
         let dropped = ui.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
         if let Some(path) = dropped {
-            self.open(&path, frame);
+            self.request_open(path, frame);
         }
 
         // Outer panels first, central panel last.
@@ -540,7 +734,7 @@ impl eframe::App for RustPaintApp {
         for action in actions {
             self.handle_layer_action(action, frame);
         }
-        let input = ui::viewport::show(ui, &mut self.camera);
+        let input = ui::viewport::show(ui, &mut self.camera, self.view_mode, self.environment);
         if let Some((from, to)) = input.paint {
             self.paint(input.rect, from, to, frame);
         }
@@ -552,7 +746,9 @@ impl eframe::App for RustPaintApp {
             ui::viewport::draw_brush_cursor(ui, input.rect, cursor);
         }
 
-        self.update_window_title(ui.ctx());
+        let ctx = ui.ctx().clone();
+        self.unsaved_changes_dialog(&ctx, frame);
+        self.update_window_title(&ctx);
     }
 }
 
