@@ -36,6 +36,16 @@ pub struct Draw {
     pub layer: u64,
     pub opacity: f32,
     pub blend: BlendMode,
+    pub mask: DrawMask,
+}
+
+/// How much of a layer a draw shows.
+#[derive(Clone, Copy)]
+pub enum DrawMask {
+    /// The same everywhere (0..1); 1 for a layer without a mask.
+    Uniform(f32),
+    /// The layer's mask texture in the slot's `GpuMasks`.
+    Texture,
 }
 
 pub struct Compositor {
@@ -48,6 +58,8 @@ pub struct Compositor {
     copy_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     params_buffer: wgpu::Buffer,
     params_bind_group: wgpu::BindGroup,
+    /// Bound as the mask of draws without a mask texture (never read).
+    no_mask: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     max_texture_size: u32,
     /// Scratch texture pairs, shared by all slots of the same size.
@@ -84,6 +96,18 @@ struct GpuLayer {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
+
+/// The GPU copies of the layer masks of one material slot, by layer id.
+/// Shared by the slot's channels.
+pub struct GpuMasks {
+    width: u32,
+    height: u32,
+    usable: bool,
+    masks: HashMap<u64, GpuLayer>,
+}
+
+/// Masks hold a plain value.
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 impl Compositor {
     pub fn new(device: &wgpu::Device) -> Self {
@@ -169,6 +193,7 @@ impl Compositor {
                 Some(&texture_layout),
                 Some(&params_layout),
                 Some(&texture_layout),
+                Some(&texture_layout),
             ],
             "fs_layer",
             SCRATCH_FORMAT,
@@ -205,6 +230,30 @@ impl Compositor {
                 }),
             }],
         });
+        let no_mask_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("no_mask"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: MASK_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let no_mask = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("no_mask"),
+            layout: &texture_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&no_mask_view),
+            }],
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("composite_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -219,6 +268,7 @@ impl Compositor {
             copy_pipelines,
             params_buffer,
             params_bind_group,
+            no_mask,
             sampler,
             max_texture_size: device.limits().max_texture_dimension_2d,
             scratch: Mutex::new(HashMap::new()),
@@ -332,7 +382,71 @@ impl Compositor {
         if !slot.usable || (image.width, image.height) != (slot.width, slot.height) {
             return;
         }
-        if let Some(layer) = slot.layers.get(&id) {
+        let format = slot.format;
+        self.upload(device, queue, &mut slot.layers, format, id, image, region);
+    }
+
+    /// Masks of a slot whose layers are `width` x `height`.
+    pub fn create_masks(&self, width: u32, height: u32) -> GpuMasks {
+        GpuMasks {
+            width,
+            height,
+            usable: width > 0
+                && height > 0
+                && width <= self.max_texture_size
+                && height <= self.max_texture_size,
+            masks: HashMap::new(),
+        }
+    }
+
+    /// Copies `region` of a mask image (all of it if the mask is new on the
+    /// GPU, or `replace` is set) into `masks` for layer `id`.
+    pub fn upload_mask(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        masks: &mut GpuMasks,
+        id: u64,
+        image: &Image,
+        region: Option<ImageRegion>,
+    ) {
+        if !masks.usable || (image.width, image.height) != (masks.width, masks.height) {
+            return;
+        }
+        self.upload(
+            device,
+            queue,
+            &mut masks.masks,
+            MASK_FORMAT,
+            id,
+            image,
+            region,
+        );
+    }
+
+    /// Frees GPU masks of layers not in `keep`.
+    pub fn retain_masks(&self, masks: &mut GpuMasks, keep: &HashSet<u64>) {
+        masks.masks.retain(|id, _| keep.contains(id));
+    }
+
+    pub fn has_mask(&self, masks: &GpuMasks, id: u64) -> bool {
+        masks.masks.contains_key(&id)
+    }
+
+    /// Writes `region` of `image` into the texture for `id` in `textures`,
+    /// creating it (with all of `image`) if there is none.
+    #[allow(clippy::too_many_arguments)]
+    fn upload(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        textures: &mut HashMap<u64, GpuLayer>,
+        format: wgpu::TextureFormat,
+        id: u64,
+        image: &Image,
+        region: Option<ImageRegion>,
+    ) {
+        if let Some(layer) = textures.get(&id) {
             let region = region.unwrap_or(ImageRegion {
                 x: 0,
                 y: 0,
@@ -354,7 +468,7 @@ impl Compositor {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: slot.format,
+                format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },
@@ -363,7 +477,7 @@ impl Compositor {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.texture_bind_group(device, &view);
-        slot.layers.insert(
+        textures.insert(
             id,
             GpuLayer {
                 texture,
@@ -382,12 +496,14 @@ impl Compositor {
     }
 
     /// Blends `draws` (bottom to top) into the slot's composite and rebuilds
-    /// its mips. Layers missing on the GPU are skipped.
+    /// its mips. Layers missing on the GPU are skipped; so are masks, which
+    /// then show the whole layer.
     pub fn composite(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         slot: &GpuSlot,
+        masks: &GpuMasks,
         draws: &[Draw],
     ) {
         let draws: Vec<(&GpuLayer, &Draw)> = draws
@@ -396,12 +512,25 @@ impl Compositor {
             .filter_map(|draw| Some((slot.layers.get(&draw.layer)?, draw)))
             .take(MAX_DRAWS)
             .collect();
+        let mask_bind_groups: Vec<Option<&wgpu::BindGroup>> = draws
+            .iter()
+            .map(|(_, draw)| match draw.mask {
+                DrawMask::Texture => masks.masks.get(&draw.layer).map(|mask| &mask.bind_group),
+                DrawMask::Uniform(_) => None,
+            })
+            .collect();
         let mut params = vec![0u8; draws.len() * PARAMS_STRIDE as usize];
         for (index, (_, draw)) in draws.iter().enumerate() {
             let start = index * PARAMS_STRIDE as usize;
-            params[start..start + 4].copy_from_slice(&draw.opacity.to_le_bytes());
-            params[start + 4..start + 8]
-                .copy_from_slice(&(draw.blend.index() as f32).to_le_bytes());
+            let (textured, uniform) = match (draw.mask, mask_bind_groups[index]) {
+                (_, Some(_)) => (1.0f32, 1.0f32),
+                (DrawMask::Uniform(value), None) => (0.0, value.clamp(0.0, 1.0)),
+                (DrawMask::Texture, None) => (0.0, 1.0),
+            };
+            let values = [draw.opacity, draw.blend.index() as f32, textured, uniform];
+            for (i, value) in values.iter().enumerate() {
+                params[start + i * 4..start + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
         }
         if !params.is_empty() {
             queue.write_buffer(&self.params_buffer, 0, &params);
@@ -436,6 +565,7 @@ impl Compositor {
             let offset = (index as u64 * PARAMS_STRIDE) as u32;
             pass.set_bind_group(1, &self.params_bind_group, &[offset]);
             pass.set_bind_group(2, &scratch.below[read], &[]);
+            pass.set_bind_group(3, mask_bind_groups[index].unwrap_or(&self.no_mask), &[]);
             pass.draw(0..3, 0..1);
         }
         let result = draws.len() % 2;
@@ -504,8 +634,8 @@ fn begin_pass<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Compositor, Draw};
-    use crate::document::{BlendMode, CLEAR, Document, Encoding};
+    use super::{Compositor, Draw, DrawMask};
+    use crate::document::{BlendMode, CLEAR, Document, Encoding, LayerMask, Plane};
     use crate::mesh::Channel;
     use crate::mesh::{Image, Material, primitives};
     use eframe::egui_wgpu::wgpu;
@@ -572,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_composite_matches_the_cpu_blend_in_every_mode() {
+    fn gpu_composite_matches_the_cpu_blend_in_every_mode_with_masks() {
         let Some((device, queue)) = gpu() else {
             eprintln!("no GPU adapter available; skipping");
             return;
@@ -592,14 +722,30 @@ mod tests {
                 pixel.copy_from_slice(&[20, 220, 90, 160]);
             }
         }
-        document.layers[1].textures[0] = [Some(paint.clone()), Some(paint), None];
+        document.layers[1].textures[0] = [Some(paint.clone()), Some(paint), None, None];
         document.layers[1].opacity = 0.6;
         let top = document.layers.len();
         document.insert_new_layer(top);
         let wash = Image::filled(width, height, [10, 10, 250, 60]);
-        document.layers[2].textures[0] = [Some(wash.clone()), Some(wash), None];
+        document.layers[2].textures[0] = [Some(wash.clone()), Some(wash), None, None];
+        // Layer 1 has a painted mask (a gradient across), layer 2 one that
+        // was never painted (the same value everywhere).
+        document.set_mask(1, Some(255)).unwrap();
+        let mut mask = Image::filled(width, height, [255; 4]);
+        for (index, pixel) in mask.rgba.chunks_exact_mut(4).enumerate() {
+            let value = ((index as u32 % width) * 255 / (width - 1)) as u8;
+            pixel.copy_from_slice(&[value, value, value, 255]);
+        }
+        document.layers[1].textures[0][Plane::Mask.index()] = Some(mask);
+        document.set_mask(2, Some(100)).unwrap();
 
         let compositor = Compositor::new(&device);
+        let mut masks = compositor.create_masks(width, height);
+        for layer in &document.layers {
+            if let LayerMask::Image(image) = document.layer_mask(layer, 0) {
+                compositor.upload_mask(&device, &queue, &mut masks, layer.id, image, None);
+            }
+        }
         for channel in [Channel::BaseColor, Channel::Roughness] {
             let encoding = channel.encoding();
             let mut slot = compositor.create_slot(&device, width, height, encoding);
@@ -617,10 +763,15 @@ mod tests {
                         layer: layer.id,
                         opacity: layer.opacity,
                         blend: layer.blend,
+                        mask: match layer.mask {
+                            LayerMask::None => DrawMask::Uniform(1.0),
+                            LayerMask::Uniform(value) => DrawMask::Uniform(value as f32 / 255.0),
+                            LayerMask::Image(_) => DrawMask::Texture,
+                        },
                     })
                     .collect();
                 assert_eq!(draws.len(), 3);
-                compositor.composite(&device, &queue, &slot, &draws);
+                compositor.composite(&device, &queue, &slot, &masks, &draws);
 
                 let gpu = read_back(&device, &queue, &slot, encoding);
                 let cpu = document.composite(0, channel).unwrap().rgba;

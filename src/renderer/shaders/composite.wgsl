@@ -23,10 +23,13 @@ fn vs_full_screen(@builtin(vertex_index) index: u32) -> FullScreen {
 // --- Layer pass
 
 @group(0) @binding(0) var layer_texture: texture_2d<f32>;
-// x = opacity, y = blend mode (`BlendMode::index`).
+// x = opacity, y = blend mode (`BlendMode::index`),
+// z = 1 when `mask_texture` is the layer's mask, w = the mask value otherwise.
 @group(1) @binding(0) var<uniform> layer_params: vec4<f32>;
 // Everything below this layer, premultiplied.
 @group(2) @binding(0) var below_texture: texture_2d<f32>;
+// The layer's mask (value in red), or a 1x1 stand-in when z is 0.
+@group(3) @binding(0) var mask_texture: texture_2d<f32>;
 
 // Must match `BlendMode::apply` in document.rs.
 fn blend_channel(mode: u32, below: f32, top: f32) -> f32 {
@@ -51,7 +54,9 @@ fn fs_layer(in: FullScreen) -> @location(0) vec4<f32> {
     let texel = vec2<i32>(in.position.xy);
     let top = textureLoad(layer_texture, texel, 0);
     let below = textureLoad(below_texture, texel, 0);
-    let alpha = top.a * layer_params.x;
+    let mask_texel = min(texel, vec2<i32>(textureDimensions(mask_texture)) - 1);
+    let mask = select(layer_params.w, textureLoad(mask_texture, mask_texel, 0).r, layer_params.z > 0.5);
+    let alpha = top.a * layer_params.x * mask;
     let mode = u32(layer_params.y + 0.5);
 
     let below_straight = select(vec3<f32>(0.0), below.rgb / below.a, below.a > 0.0);

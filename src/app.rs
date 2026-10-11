@@ -50,7 +50,10 @@ pub struct RustPaintApp {
     /// Id of the layer strokes go into.
     selected_layer: u64,
     layers_panel: LayersPanelState,
-    thumbnails: HashMap<u64, egui::TextureHandle>,
+    thumbnails: ui::layers_panel::Thumbnails,
+    /// The brush paints the selected layer's mask instead of its channels
+    /// (when it has one).
+    editing_mask: bool,
     /// Bumped on every document change, so thumbnails know when to refresh.
     revision: u64,
     thumbnails_revision: Option<u64>,
@@ -127,6 +130,7 @@ impl RustPaintApp {
             document,
             layers_panel: LayersPanelState::default(),
             thumbnails: HashMap::new(),
+            editing_mask: false,
             revision: 0,
             thumbnails_revision: None,
             opacity_drag: None,
@@ -158,6 +162,7 @@ impl RustPaintApp {
         self.selected_layer = document.layers[document.layers.len() - 1].id;
         self.document = document;
         self.thumbnails.clear();
+        self.editing_mask = false;
         self.revision += 1;
         self.opacity_drag = None;
         self.painter = None;
@@ -379,7 +384,11 @@ impl RustPaintApp {
         };
         let index = self.selected_index();
         if self.stroke.is_none() {
-            self.stroke = Stroke::begin(&self.document, index);
+            self.stroke = if self.painting_mask() {
+                Stroke::begin_on_mask(&self.document, index)
+            } else {
+                Stroke::begin(&self.document, index)
+            };
             if self.stroke.is_none() {
                 self.status = "The base layer can't be painted on. Select or add a layer.".into();
                 return;
@@ -408,10 +417,10 @@ impl RustPaintApp {
         };
         let dirty: Vec<Dirty> = changed
             .into_iter()
-            .map(|(material, channel, region)| Dirty::Pixels {
+            .map(|(material, plane, region)| Dirty::Pixels {
                 layer: id,
                 material,
-                channel,
+                plane,
                 region,
             })
             .collect();
@@ -421,22 +430,43 @@ impl RustPaintApp {
     /// Ends the current stroke and records it for undo.
     fn finish_stroke(&mut self) {
         if let Some(stroke) = self.stroke.take() {
-            let label = self.stroke_label(stroke.layer());
+            let label = self.stroke_label(stroke.layer(), stroke.on_mask());
             self.history.push(label, stroke.finish());
         }
     }
 
-    /// The history panel's name for a stroke on layer `id` with the current tool.
-    fn stroke_label(&self, id: u64) -> String {
+    /// Whether the brush paints the selected layer's mask.
+    fn painting_mask(&self) -> bool {
+        self.editing_mask && self.document.layers[self.selected_index()].mask.is_some()
+    }
+
+    /// The history panel's name for a stroke on layer `id` (on its mask, if
+    /// `on_mask`) with the current tool.
+    fn stroke_label(&self, id: u64, on_mask: bool) -> String {
         let name = self.layer_name(id);
+        let name = if on_mask {
+            format!("{name} mask")
+        } else {
+            name
+        };
         let erase = self.brush.erases();
+        // On a mask, painting reveals the layer and erasing hides it.
         match self.brush.tool {
+            Tool::Paint if on_mask => {
+                let verb = if erase { "Hide" } else { "Reveal" };
+                format!("{verb} on {name}")
+            }
             Tool::Paint if erase => format!("Erase on {name}"),
             Tool::Paint => format!("Paint on {name}"),
             Tool::Smear => format!("Smear on {name}"),
             Tool::Blur => format!("Blur on {name}"),
             Tool::Fill => {
-                let verb = if erase { "Erase" } else { "Fill" };
+                let verb = match (on_mask, erase) {
+                    (true, true) => "Hide",
+                    (true, false) => "Reveal",
+                    (false, true) => "Erase",
+                    (false, false) => "Fill",
+                };
                 match self.brush.fill_mode {
                     FillMode::Layer => format!("{verb} all of {name}"),
                     FillMode::Material => format!("{verb} material on {name}"),
@@ -515,6 +545,34 @@ impl RustPaintApp {
             LayerAction::Select(index) => {
                 if let Some(layer) = self.document.layers.get(index) {
                     self.selected_layer = layer.id;
+                    self.editing_mask = false;
+                }
+            }
+            LayerAction::EditMask(index, on_mask) => {
+                if let Some(layer) = self.document.layers.get(index) {
+                    self.selected_layer = layer.id;
+                    self.editing_mask = on_mask;
+                }
+            }
+            LayerAction::AddMask { layer, hide } => {
+                let value = if hide { 0 } else { 255 };
+                if let Some(change) = self.document.set_mask(layer, Some(value)) {
+                    let id = self.document.layers[layer].id;
+                    self.history
+                        .push(format!("Add mask to {}", self.name_at(layer)), vec![change]);
+                    self.selected_layer = id;
+                    // Ready to paint it.
+                    self.editing_mask = true;
+                    self.show_changes(&[Dirty::Mask { layer: id }], frame);
+                }
+            }
+            LayerAction::DeleteMask(layer) => {
+                if let Some(change) = self.document.set_mask(layer, None) {
+                    let id = self.document.layers[layer].id;
+                    let label = format!("Delete mask of {}", self.name_at(layer));
+                    self.history.push(label, vec![change]);
+                    self.editing_mask = false;
+                    self.show_changes(&[Dirty::Mask { layer: id }], frame);
                 }
             }
             LayerAction::Add => {
@@ -627,16 +685,25 @@ impl RustPaintApp {
         let mut fresh = HashMap::new();
         for index in 0..self.document.layers.len() {
             let id = self.document.layers[index].id;
-            let image = ui::layers_panel::thumbnail(&self.document, index);
-            let options = egui::TextureOptions::LINEAR;
-            let handle = match self.thumbnails.remove(&id) {
-                Some(mut handle) => {
-                    handle.set(image, options);
-                    handle
-                }
-                None => ctx.load_texture(format!("layer-thumbnail-{id}"), image, options),
-            };
-            fresh.insert(id, handle);
+            let paint = Some(ui::layers_panel::thumbnail(&self.document, index));
+            let mask = ui::layers_panel::mask_thumbnail(&self.document, index);
+            for (is_mask, image) in [(false, paint), (true, mask)] {
+                let Some(image) = image else {
+                    continue;
+                };
+                let options = egui::TextureOptions::LINEAR;
+                let handle = match self.thumbnails.remove(&(id, is_mask)) {
+                    Some(mut handle) => {
+                        handle.set(image, options);
+                        handle
+                    }
+                    None => {
+                        let name = format!("layer-thumbnail-{id}-{is_mask}");
+                        ctx.load_texture(name, image, options)
+                    }
+                };
+                fresh.insert((id, is_mask), handle);
+            }
         }
         self.thumbnails = fresh;
     }
@@ -1012,7 +1079,8 @@ impl eframe::App for RustPaintApp {
 
         // Outer panels first, central panel last.
         ui::status_bar::show(ui, &self.status);
-        ui::tools_panel::show(ui, &mut self.brush);
+        let on_mask = self.painting_mask();
+        ui::tools_panel::show(ui, &mut self.brush, on_mask);
         self.update_thumbnails(ui.ctx());
         let selected = self.selected_index();
         // Right column: layers, with the undo history docked below them.
@@ -1025,6 +1093,7 @@ impl eframe::App for RustPaintApp {
                     ui,
                     &self.document,
                     selected,
+                    on_mask,
                     &self.thumbnails,
                     &mut self.layers_panel,
                 );

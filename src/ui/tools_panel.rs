@@ -5,13 +5,22 @@ const BUTTON_HEIGHT: f32 = 28.0;
 const ICON_SIZE: f32 = 18.0;
 const ERASE_ICON: egui::ImageSource<'static> = egui::include_image!("../../assets/icons/erase.svg");
 
-pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
+/// `on_mask`: the brush paints the selected layer's mask.
+pub fn show(ui: &mut egui::Ui, brush: &mut Brush, on_mask: bool) {
     egui::Panel::left("tools_panel")
         .resizable(true)
         .default_size(240.0)
         .show(ui, |ui| {
             ui.heading("Brush");
             ui.separator();
+            if on_mask {
+                let text = egui::RichText::new("Painting the layer's mask")
+                    .color(ui.visuals().selection.stroke.color);
+                ui.label(text).on_hover_text(
+                    "Paint shows the layer, Erase hides it. Click the layer's \
+                     paint thumbnail to paint on the layer again.",
+                );
+            }
 
             // Tools in two columns of equal width.
             let spacing = ui.spacing().item_spacing.x;
@@ -78,20 +87,23 @@ pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
                 "Tick the channels a stroke works on, and the value Paint and Fill put there",
             );
             // Smear and blur rework what is there; the values don't apply.
-            let values = !moves_paint && !brush.erases();
-            egui::Grid::new("brush_channels")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.checkbox(&mut brush.paint_color, "Base color");
-                    ui.add_enabled_ui(values, |ui| ui.color_edit_button_rgb(&mut brush.color));
-                    ui.end_row();
-                    ui.checkbox(&mut brush.paint_roughness, "Roughness");
-                    ui.add_enabled(values, egui::Slider::new(&mut brush.roughness, 0.0..=1.0));
-                    ui.end_row();
-                    ui.checkbox(&mut brush.paint_metallic, "Metallic");
-                    ui.add_enabled(values, egui::Slider::new(&mut brush.metallic, 0.0..=1.0));
-                    ui.end_row();
-                });
+            // A mask covers all channels and has no values of its own.
+            let values = !moves_paint && !brush.erases() && !on_mask;
+            ui.add_enabled_ui(!on_mask, |ui| {
+                egui::Grid::new("brush_channels")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.checkbox(&mut brush.paint_color, "Base color");
+                        ui.add_enabled_ui(values, |ui| ui.color_edit_button_rgb(&mut brush.color));
+                        ui.end_row();
+                        ui.checkbox(&mut brush.paint_roughness, "Roughness");
+                        ui.add_enabled(values, egui::Slider::new(&mut brush.roughness, 0.0..=1.0));
+                        ui.end_row();
+                        ui.checkbox(&mut brush.paint_metallic, "Metallic");
+                        ui.add_enabled(values, egui::Slider::new(&mut brush.metallic, 0.0..=1.0));
+                        ui.end_row();
+                    });
+            });
             ui.add_space(8.0);
             ui.checkbox(&mut brush.screen_space, "Screen-space brush")
                 .on_hover_text(

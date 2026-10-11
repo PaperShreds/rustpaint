@@ -36,6 +36,15 @@ texture get a blank 2048×2048 canvas in their base color.
 Each layer has an opacity and a blend mode (Normal, Multiply, Screen, Overlay,
 Darken, Lighten, Add). Layers are combined on the GPU, in linear light.
 
+A layer can have a **mask** (the **Mask** menu above the layers): a greyscale
+image that hides parts of the layer without erasing its paint. Add one that
+shows the whole layer or one that hides it, then click the mask thumbnail next
+to the layer's to paint on it. On a mask, every tool works: Paint shows the
+layer, Paint with **Erase** hides it, Fill shows or hides a whole material or
+UV island, and Blur and Smear soften or push the mask's edges. Click the
+layer's own thumbnail to paint its colours again. A mask applies to all
+channels, and is saved with the project and used for exports.
+
 The brush size is in screen pixels, so zooming in paints a smaller part of the
 model, and parts further away get a bigger share of it. Tick **Keep size on
 model** to give the brush one size on the model instead: it scales with zooming
@@ -101,8 +110,8 @@ channel with its visible layers combined: `<model>_<material>_BaseColor.png`,
 `_Roughness.png`, and `_Metallic.png` (greyscale). It asks before replacing
 existing files.
 
-Layer masks, and normal and height maps, are not implemented yet, and the
-project file format may still change.
+Normal and height maps are not implemented yet, and the project file format may
+still change (projects with masks don't open in older versions of RustPaint).
 Avoid using it as the only copy of important work.
 
 ## Run

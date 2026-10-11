@@ -10,7 +10,7 @@
 //! blended from the image as it was when the stroke started. Overlapping
 //! segments of one stroke therefore never darken each other.
 
-use crate::document::{CLEAR, Change, Document, Layer, Tile};
+use crate::document::{CLEAR, Change, Document, Layer, Plane, Tile};
 use crate::mesh::{Channel, Encoding, Image, ImageRegion, Mesh};
 use crate::painting::brush::{Brush, FillMode, Tool};
 use crate::painting::history;
@@ -140,11 +140,13 @@ impl SlotStroke {
 }
 
 /// One continuous brush stroke into one layer, on every slot the layer
-/// targets and every channel the brush paints.
+/// targets: into every channel the brush paints, or into the layer's mask.
 pub struct Stroke {
     layer: u64,
-    /// Per material slot and channel, created when the stroke first reaches it.
-    slots: Vec<[Option<SlotStroke>; Channel::COUNT]>,
+    /// Paints the layer's mask instead of its channels.
+    on_mask: bool,
+    /// Per material slot and plane, created when the stroke first reaches it.
+    slots: Vec<[Option<SlotStroke>; Plane::COUNT]>,
     /// When the brush may not paint over edges: which triangles belong to the
     /// face the stroke started on. Found on the first segment that hits the model.
     face: Option<Vec<bool>>,
@@ -159,11 +161,27 @@ impl Stroke {
         }
         Some(Self {
             layer: layer.id,
+            on_mask: false,
             slots: (0..document.mesh.materials.len())
                 .map(|_| Default::default())
                 .collect(),
             face: None,
         })
+    }
+
+    /// Starts a stroke on the mask of the layer at `layer_index`: painting
+    /// shows the layer there, erasing hides it. `None` if it has no mask.
+    pub fn begin_on_mask(document: &Document, layer_index: usize) -> Option<Self> {
+        document.layers.get(layer_index)?.mask?;
+        Some(Self {
+            on_mask: true,
+            ..Self::begin(document, layer_index)?
+        })
+    }
+
+    /// Whether the stroke paints the layer's mask.
+    pub fn on_mask(&self) -> bool {
+        self.on_mask
     }
 
     /// Id of the layer being painted.
@@ -184,14 +202,14 @@ impl Stroke {
     pub fn finish(self) -> Vec<Change> {
         let layer = self.layer;
         let mut changes = Vec::new();
-        for (material, channels) in self.slots.into_iter().enumerate() {
-            for (channel, slot) in Channel::ALL.into_iter().zip(channels) {
+        for (material, planes) in self.slots.into_iter().enumerate() {
+            for (plane, slot) in Plane::ALL.into_iter().zip(planes) {
                 let tiles = slot.map(SlotStroke::into_tiles).unwrap_or_default();
                 if !tiles.is_empty() {
                     changes.push(Change::Pixels {
                         layer,
                         material,
-                        channel,
+                        plane,
                         tiles,
                     });
                 }
@@ -313,7 +331,7 @@ impl StrokePainter {
         from: Pos2,
         to: Pos2,
         brush: &Brush,
-    ) -> Vec<(usize, Channel, ImageRegion)> {
+    ) -> Vec<(usize, Plane, ImageRegion)> {
         if layer.id != stroke.layer || self.viewport.height() <= 0.0 {
             return Vec::new();
         }
@@ -349,7 +367,7 @@ impl StrokePainter {
                 target.effect = Effect::Blur(reach * travel.sqrt());
                 // Blur only within the UV islands, so paint doesn't drain
                 // into the unused texture space around them.
-                target.masks = slot_sizes
+                target.uv_masks = slot_sizes
                     .iter()
                     .enumerate()
                     .map(|(material, &(width, height))| {
@@ -379,7 +397,7 @@ impl StrokePainter {
         slot_sizes: &[(u32, u32)],
         at: Pos2,
         brush: &Brush,
-    ) -> Vec<(usize, Channel, ImageRegion)> {
+    ) -> Vec<(usize, Plane, ImageRegion)> {
         if layer.id != stroke.layer {
             return Vec::new();
         }
@@ -918,18 +936,26 @@ impl StrokePainter {
     }
 }
 
-/// What the brush puts into each channel it paints: linear colour for base
-/// colour, the value itself for data channels.
-fn brush_values(brush: &Brush) -> Vec<(Channel, [f32; 3])> {
+/// What the brush puts into each plane it paints: linear colour for base
+/// colour, the value itself for data channels. On a mask: white shows the
+/// layer, and erasing paints black, which hides it.
+fn brush_values(brush: &Brush, on_mask: bool) -> Vec<(Plane, [f32; 3])> {
+    if on_mask {
+        let value = if brush.erases() { 0.0 } else { 1.0 };
+        return vec![(Plane::Mask, [value; 3])];
+    }
     let mut values = Vec::new();
     if brush.paint_color {
-        values.push((Channel::BaseColor, brush.color.map(srgb_float_to_linear)));
+        let color = brush.color.map(srgb_float_to_linear);
+        values.push((Plane::Channel(Channel::BaseColor), color));
     }
     if brush.paint_roughness {
-        values.push((Channel::Roughness, [brush.roughness.clamp(0.0, 1.0); 3]));
+        let roughness = [brush.roughness.clamp(0.0, 1.0); 3];
+        values.push((Plane::Channel(Channel::Roughness), roughness));
     }
     if brush.paint_metallic {
-        values.push((Channel::Metallic, [brush.metallic.clamp(0.0, 1.0); 3]));
+        let metallic = [brush.metallic.clamp(0.0, 1.0); 3];
+        values.push((Plane::Channel(Channel::Metallic), metallic));
     }
     values
 }
@@ -939,15 +965,15 @@ struct LayerTarget<'a> {
     layer: &'a mut Layer,
     stroke: &'a mut Stroke,
     slot_sizes: &'a [(u32, u32)],
-    values: Vec<(Channel, [f32; 3])>,
+    values: Vec<(Plane, [f32; 3])>,
     opacity: f32,
     effect: Effect,
     /// Per slot, the texels the blur may use (see `StrokePainter::uv_mask`).
-    masks: Vec<Option<Rc<Vec<bool>>>>,
+    uv_masks: Vec<Option<UvMask>>,
     /// Per slot, the texels blur or smear covered in this segment.
     covered: Vec<Vec<Covered>>,
-    /// Changed region per slot and channel.
-    regions: Vec<[Option<ImageRegion>; Channel::COUNT]>,
+    /// Changed region per slot and plane.
+    regions: Vec<[Option<ImageRegion>; Plane::COUNT]>,
 }
 
 /// What a stroke does to the texels it covers.
@@ -970,19 +996,21 @@ impl<'a> LayerTarget<'a> {
         slot_sizes: &'a [(u32, u32)],
         brush: &Brush,
     ) -> Self {
+        let on_mask = stroke.on_mask;
         Self {
             layer,
             stroke,
             slot_sizes,
-            values: brush_values(brush),
+            values: brush_values(brush, on_mask),
             opacity: brush.opacity.clamp(0.0, 1.0),
             effect: match brush.tool {
                 Tool::Blur => Effect::Blur(0.0),
                 Tool::Smear => Effect::Smear(Vec3::ZERO),
-                Tool::Paint | Tool::Fill if brush.erases() => Effect::Erase,
+                // A mask is erased by painting black (see `brush_values`).
+                Tool::Paint | Tool::Fill if brush.erases() && !on_mask => Effect::Erase,
                 Tool::Paint | Tool::Fill => Effect::Paint,
             },
-            masks: Vec::new(),
+            uv_masks: Vec::new(),
             covered: vec![Vec::new(); slot_sizes.len()],
             regions: vec![Default::default(); slot_sizes.len()],
         }
@@ -1001,13 +1029,13 @@ impl<'a> LayerTarget<'a> {
         }
     }
 
-    /// The texel region that changed, per slot and channel.
-    fn changed(self) -> Vec<(usize, Channel, ImageRegion)> {
+    /// The texel region that changed, per slot and plane.
+    fn changed(self) -> Vec<(usize, Plane, ImageRegion)> {
         let mut changed = Vec::new();
         for (material, regions) in self.regions.into_iter().enumerate() {
-            for (channel, region) in Channel::ALL.into_iter().zip(regions) {
+            for (plane, region) in Plane::ALL.into_iter().zip(regions) {
                 if let Some(region) = region {
-                    changed.push((material, channel, region));
+                    changed.push((material, plane, region));
                 }
             }
         }
@@ -1021,21 +1049,30 @@ impl<'a> LayerTarget<'a> {
             return None;
         }
         let (width, height) = *self.slot_sizes.get(material)?;
+        // Where a mask hasn't been painted, it has its starting value.
+        let unpainted_mask = self.layer.mask.unwrap_or(255);
         let textures = self.layer.textures.get_mut(material)?;
         let strokes = self.stroke.slots.get_mut(material)?;
         let regions = self.regions.get_mut(material)?;
         let covered = self.covered.get_mut(material)?;
         let mut channels = Vec::new();
-        for (((channel, texture), stroke), region) in Channel::ALL
+        for (((plane, texture), stroke), region) in Plane::ALL
             .into_iter()
             .zip(textures.iter_mut())
             .zip(strokes.iter_mut())
             .zip(regions.iter_mut())
         {
-            let Some(&(_, value)) = self.values.iter().find(|(c, _)| *c == channel) else {
+            let Some(&(_, value)) = self.values.iter().find(|(p, _)| *p == plane) else {
                 continue;
             };
-            let image = texture.get_or_insert_with(|| Image::filled(width, height, CLEAR));
+            let image = texture.get_or_insert_with(|| match plane {
+                Plane::Mask => Image::filled(
+                    width,
+                    height,
+                    [unpainted_mask, unpainted_mask, unpainted_mask, 255],
+                ),
+                Plane::Channel(_) => Image::filled(width, height, CLEAR),
+            });
             if (image.width, image.height) != (width, height) {
                 continue;
             }
@@ -1045,7 +1082,7 @@ impl<'a> LayerTarget<'a> {
                 stroke,
                 region,
                 value,
-                encoding: channel.encoding(),
+                encoding: plane.encoding(),
             });
         }
         (!channels.is_empty()).then_some(SlotTarget {
@@ -1054,7 +1091,7 @@ impl<'a> LayerTarget<'a> {
             height,
             opacity: self.opacity,
             effect: self.effect,
-            mask: self.masks.get(material).cloned().flatten(),
+            uv_mask: self.uv_masks.get(material).cloned().flatten(),
             covered,
         })
     }
@@ -1210,7 +1247,7 @@ struct SlotTarget<'a> {
     opacity: f32,
     effect: Effect,
     /// Texels the blur may use; `None` means all.
-    mask: Option<Rc<Vec<bool>>>,
+    uv_mask: Option<UvMask>,
     /// Blur and smear: the texels covered so far in this segment.
     covered: &'a mut Vec<Covered>,
 }
@@ -1352,7 +1389,7 @@ impl SlotTarget<'_> {
                 .or_default()
                 .push(*c);
         }
-        let mask = self.mask.clone();
+        let mask = self.uv_mask.clone();
         let tiles: Vec<_> = tiles.into_iter().collect();
         let mask = mask.as_deref().map(Vec::as_slice);
         for target in &mut self.channels {
@@ -1620,7 +1657,7 @@ fn srgb_float_to_linear(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{Stroke, StrokePainter};
-    use crate::document::Document;
+    use crate::document::{Document, Plane};
     use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
     use crate::painting::brush::{Brush, FillMode, Tool};
@@ -2206,7 +2243,7 @@ mod tests {
         assert!(
             changed
                 .iter()
-                .all(|(_, channel, _)| *channel == Channel::Roughness)
+                .all(|(_, plane, _)| *plane == Plane::Channel(Channel::Roughness))
         );
         assert!(!changed.is_empty());
 
@@ -2229,7 +2266,7 @@ mod tests {
         assert!(matches!(
             changes.as_slice(),
             [crate::document::Change::Pixels {
-                channel: Channel::Roughness,
+                plane: Plane::Channel(Channel::Roughness),
                 ..
             }]
         ));
@@ -2470,5 +2507,75 @@ mod tests {
         assert_eq!(alpha(20, 64), 0);
         assert_eq!(alpha(100, 64), 255);
         assert_eq!(alpha(64, 120), 255);
+    }
+
+    #[test]
+    fn painting_a_mask_changes_only_the_mask() {
+        let painter = StrokePainter::new(&test_mesh(), &test_camera(), viewport());
+        let mut document = Document::new(test_mesh());
+        let sizes = document.slot_sizes();
+        document.set_mask(1, Some(255)).unwrap();
+        // With erase on, a mask stroke hides the layer (paints black).
+        let mut hide = brush(30.0, false);
+        hide.erase = true;
+        let mut stroke = Stroke::begin_on_mask(&document, 1).unwrap();
+        let at = Pos2::new(76.0, 145.0);
+        let changed =
+            painter.paint_segment(&mut stroke, &mut document.layers[1], &sizes, at, at, &hide);
+        assert!(!changed.is_empty());
+        assert!(changed.iter().all(|(_, plane, _)| *plane == Plane::Mask));
+        let layer = &document.layers[1];
+        assert!(layer.textures[0][0].is_none(), "colour untouched");
+        let mask = layer.textures[0][Plane::Mask.index()].as_ref().unwrap();
+        assert!(
+            mask.rgba.chunks_exact(4).any(|pixel| pixel[0] == 0),
+            "hidden somewhere"
+        );
+        assert!(
+            mask.rgba.chunks_exact(4).any(|pixel| pixel[0] == 255),
+            "shown elsewhere"
+        );
+        assert!(
+            mask.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255),
+            "masks stay opaque"
+        );
+
+        // Undo restores the unpainted mask.
+        let mut history = crate::painting::history::History::default();
+        history.push("Test", stroke.finish());
+        history.undo(&mut document);
+        let mask = document.layers[1].textures[0][Plane::Mask.index()]
+            .as_ref()
+            .unwrap();
+        assert!(mask.rgba.chunks_exact(4).all(|pixel| pixel[0] == 255));
+
+        // A layer without a mask can't be painted on as one.
+        assert!(Stroke::begin_on_mask(&document, 0).is_none());
+        document.set_mask(1, None).unwrap();
+        assert!(Stroke::begin_on_mask(&document, 1).is_none());
+    }
+
+    #[test]
+    fn fill_reveals_one_island_of_a_hide_all_mask() {
+        let painter = StrokePainter::new(&test_mesh(), &test_camera(), viewport());
+        let mut document = Document::new(test_mesh());
+        let sizes = document.slot_sizes();
+        document.set_mask(1, Some(0)).unwrap();
+        let reveal = Brush {
+            tool: Tool::Fill,
+            fill_mode: FillMode::UvIsland,
+            ..brush(1.0, false)
+        };
+        let mut stroke = Stroke::begin_on_mask(&document, 1).unwrap();
+        let at = Pos2::new(76.0, 145.0);
+        painter.fill(&mut stroke, &mut document.layers[1], &sizes, at, &reveal);
+        let mask = document.layers[1].textures[0][Plane::Mask.index()]
+            .as_ref()
+            .unwrap();
+        let value = |x: u32, y: u32| mask.rgba[((y * TEXTURE_SIZE + x) * 4) as usize];
+        // The left island is revealed; the right one and empty space stay hidden.
+        assert_eq!(value(20, 64), 255);
+        assert_eq!(value(100, 64), 0);
+        assert_eq!(value(64, 120), 0);
     }
 }

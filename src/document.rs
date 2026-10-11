@@ -4,6 +4,10 @@
 //! one texture per slot it paints on. Layer 0 is the model's own textures
 //! ("Base"); it can be hidden but not painted on, moved or deleted.
 //!
+//! A layer can have a mask: a greyscale image per slot that hides (black) or
+//! shows (white) the layer's paint, in all channels. The images live next to
+//! the channels as the layer's `Plane::Mask`.
+//!
 //! The viewport blends the visible layers on the GPU. `composite` does the same
 //! on the CPU, for export.
 
@@ -12,6 +16,39 @@ use crate::mesh::{Image, ImageRegion, Mesh};
 
 /// A transparent pixel, the starting content of a paint layer.
 pub const CLEAR: [u8; 4] = [0, 0, 0, 0];
+
+/// One of a layer's images on a slot: a material channel, or its mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Plane {
+    Channel(Channel),
+    Mask,
+}
+
+impl Plane {
+    pub const COUNT: usize = Channel::COUNT + 1;
+    pub const ALL: [Plane; Plane::COUNT] = [
+        Plane::Channel(Channel::BaseColor),
+        Plane::Channel(Channel::Roughness),
+        Plane::Channel(Channel::Metallic),
+        Plane::Mask,
+    ];
+
+    /// Position in a layer's per-slot image array (channels first).
+    pub fn index(self) -> usize {
+        match self {
+            Plane::Channel(channel) => channel.index(),
+            Plane::Mask => Channel::COUNT,
+        }
+    }
+
+    /// Masks hold a plain value, like the data channels.
+    pub fn encoding(self) -> Encoding {
+        match self {
+            Plane::Channel(channel) => channel.encoding(),
+            Plane::Mask => Encoding::Linear,
+        }
+    }
+}
 
 /// How a layer combines with the layers below it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,9 +126,14 @@ pub struct Layer {
     pub blend: BlendMode,
     /// Which material slots the layer paints on (and shows on), by slot index.
     pub targets: Vec<bool>,
-    /// Paint per material slot and channel; `None` until first painted.
-    /// Always empty for the base layer, whose pixels are the mesh's textures.
-    pub textures: Vec<[Option<Image>; Channel::COUNT]>,
+    /// Images per material slot and plane (`Plane::index`); `None` until
+    /// first painted. Always empty for the base layer, whose pixels are the
+    /// mesh's textures.
+    pub textures: Vec<[Option<Image>; Plane::COUNT]>,
+    /// If the layer has a mask: its value where it hasn't been painted (255
+    /// shows the layer there, 0 hides it). Painted masks are `Plane::Mask`
+    /// images: opaque, the value in every colour channel.
+    pub mask: Option<u8>,
 }
 
 impl Layer {
@@ -135,6 +177,29 @@ pub struct VisibleLayer<'a> {
     pub image: &'a Image,
     pub opacity: f32,
     pub blend: BlendMode,
+    pub mask: LayerMask<'a>,
+}
+
+/// How much of a layer shows, texel by texel.
+#[derive(Clone, Copy)]
+pub enum LayerMask<'a> {
+    /// No mask: all of it.
+    None,
+    /// A mask nobody painted on this slot: the same everywhere (0..255).
+    Uniform(u8),
+    /// A painted mask; the value is in red.
+    Image(&'a Image),
+}
+
+impl LayerMask<'_> {
+    /// The mask value (0..255) at a pixel's byte offset.
+    pub fn at(&self, offset: usize) -> u8 {
+        match self {
+            LayerMask::None => 255,
+            LayerMask::Uniform(value) => *value,
+            LayerMask::Image(image) => image.rgba[offset],
+        }
+    }
 }
 
 /// Settings of a layer that can be changed (and undone) as one.
@@ -156,11 +221,11 @@ pub struct Tile {
 /// One undoable change. Applying it performs the change and turns it into its
 /// own inverse, so the same value serves undo and redo.
 pub enum Change {
-    /// Swap pixels of a layer texture with the stored ones.
+    /// Swap pixels of a layer image with the stored ones.
     Pixels {
         layer: u64,
         material: usize,
-        channel: Channel,
+        plane: Plane,
         tiles: Vec<Tile>,
     },
     /// With `stored` set: insert it at `index`. Without: remove the layer at
@@ -170,6 +235,13 @@ pub enum Change {
     Move { from: usize, to: usize },
     /// Swap a layer's settings with the stored ones.
     Props { layer: u64, props: LayerProps },
+    /// Swap a layer's mask (`Layer::mask` plus its images, one per slot)
+    /// with the stored one. Adds, removes or replaces the mask.
+    Mask {
+        layer: u64,
+        mask: Option<u8>,
+        images: Vec<Option<Image>>,
+    },
 }
 
 impl Change {
@@ -180,6 +252,7 @@ impl Change {
                 stored: Some(layer),
                 ..
             } => layer.bytes(),
+            Change::Mask { images, .. } => images.iter().flatten().map(|i| i.rgba.len()).sum(),
             _ => 0,
         }
     }
@@ -187,15 +260,17 @@ impl Change {
 
 /// What a change touched, so the GPU copy can be brought up to date.
 pub enum Dirty {
-    /// Pixels of one layer texture changed.
+    /// Pixels of one layer image changed.
     Pixels {
         layer: u64,
         material: usize,
-        channel: Channel,
+        plane: Plane,
         region: ImageRegion,
     },
     /// Layers were added, removed, reordered, or their settings changed.
     Layers,
+    /// A layer's mask was added, removed or replaced as a whole.
+    Mask { layer: u64 },
 }
 
 pub struct Document {
@@ -229,6 +304,7 @@ impl Document {
             blend: BlendMode::Normal,
             targets: vec![true; slots],
             textures: Vec::new(),
+            mask: None,
         };
         let next_layer_id = layers.iter().map(|layer| layer.id).max().unwrap_or(0) + 1;
         Self {
@@ -273,6 +349,37 @@ impl Document {
         }
     }
 
+    /// How much of `layer` shows on `material`.
+    pub fn layer_mask<'a>(&'a self, layer: &'a Layer, material: usize) -> LayerMask<'a> {
+        let Some(value) = layer.mask else {
+            return LayerMask::None;
+        };
+        let size = self.slot_sizes().get(material).copied();
+        let image = layer
+            .textures
+            .get(material)
+            .and_then(|planes| planes[Plane::Mask.index()].as_ref())
+            .filter(|image| Some((image.width, image.height)) == size);
+        image.map_or(LayerMask::Uniform(value), LayerMask::Image)
+    }
+
+    /// Adds a mask to the layer at `index` (showing it all, or hiding it
+    /// all), or removes its mask with `value` `None`. Returns the change
+    /// that undoes it, or `None` if there's nothing to do.
+    pub fn set_mask(&mut self, index: usize, value: Option<u8>) -> Option<Change> {
+        let layer = self.layers.get(index).filter(|layer| !layer.is_base())?;
+        if layer.mask.is_none() && value.is_none() {
+            return None;
+        }
+        let mut change = Change::Mask {
+            layer: layer.id,
+            mask: value,
+            images: vec![None; self.mesh.materials.len()],
+        };
+        self.apply(&mut change)?;
+        Some(change)
+    }
+
     /// What shows on `material`, bottom to top: each visible layer that targets
     /// the slot and has pixels there.
     pub fn visible_layers(&self, material: usize, channel: Channel) -> Vec<VisibleLayer<'_>> {
@@ -287,6 +394,7 @@ impl Document {
                     image,
                     opacity: layer.opacity.clamp(0.0, 1.0),
                     blend: layer.blend,
+                    mask: self.layer_mask(layer, material),
                 })
             })
             .collect()
@@ -305,6 +413,7 @@ impl Document {
             blend: BlendMode::Normal,
             targets: vec![true; slots],
             textures: (0..slots).map(|_| Default::default()).collect(),
+            mask: None,
         }
     }
 
@@ -326,12 +435,12 @@ impl Document {
             Change::Pixels {
                 layer,
                 material,
-                channel,
+                plane,
                 tiles,
             } => {
                 let index = self.layer_index(*layer)?;
                 let image =
-                    self.layers[index].textures.get_mut(*material)?[channel.index()].as_mut()?;
+                    self.layers[index].textures.get_mut(*material)?[plane.index()].as_mut()?;
                 let fits = tiles.iter().all(|tile| {
                     tile.region.x + tile.region.width <= image.width
                         && tile.region.y + tile.region.height <= image.height
@@ -351,7 +460,7 @@ impl Document {
                 Some(Dirty::Pixels {
                     layer: *layer,
                     material: *material,
-                    channel: *channel,
+                    plane: *plane,
                     region,
                 })
             }
@@ -392,6 +501,22 @@ impl Document {
                 self.layers[index].set_props(std::mem::replace(props, previous));
                 Some(Dirty::Layers)
             }
+            Change::Mask {
+                layer,
+                mask,
+                images,
+            } => {
+                let index = self.layer_index(*layer)?;
+                let target = &mut self.layers[index];
+                if target.is_base() || images.len() != target.textures.len() {
+                    return None;
+                }
+                std::mem::swap(&mut target.mask, mask);
+                for (planes, image) in target.textures.iter_mut().zip(images.iter_mut()) {
+                    std::mem::swap(&mut planes[Plane::Mask.index()], image);
+                }
+                Some(Dirty::Mask { layer: *layer })
+            }
         }
     }
 
@@ -410,8 +535,10 @@ impl Document {
 /// Blends one pixel through the layer stack. Same maths as `fs_layer` in
 /// `composite.wgsl`: premultiplied, with the W3C formula for blend modes.
 fn composite_pixel(sources: &[VisibleLayer], offset: usize, encoding: Encoding) -> [u8; 4] {
-    let contributes =
-        |layer: &&VisibleLayer| layer.image.rgba[offset + 3] != 0 && layer.opacity > 0.0;
+    let shown = |layer: &VisibleLayer| layer.mask.at(offset);
+    let contributes = |layer: &&VisibleLayer| {
+        layer.image.rgba[offset + 3] != 0 && layer.opacity > 0.0 && shown(layer) != 0
+    };
     // A fully opaque Normal layer hides everything below it.
     let start = sources
         .iter()
@@ -419,13 +546,18 @@ fn composite_pixel(sources: &[VisibleLayer], offset: usize, encoding: Encoding) 
             layer.blend == BlendMode::Normal
                 && layer.opacity == 1.0
                 && layer.image.rgba[offset + 3] == 255
+                && shown(layer) == 255
         })
         .unwrap_or(0);
     let mut contributors = sources[start..].iter().filter(contributes);
     let Some(first) = contributors.next() else {
         return CLEAR;
     };
-    if contributors.next().is_none() && first.opacity == 1.0 && first.blend == BlendMode::Normal {
+    if contributors.next().is_none()
+        && first.opacity == 1.0
+        && first.blend == BlendMode::Normal
+        && shown(first) == 255
+    {
         // A single Normal layer shows through unchanged.
         let mut pixel = [0; 4];
         pixel.copy_from_slice(&first.image.rgba[offset..offset + 4]);
@@ -435,7 +567,9 @@ fn composite_pixel(sources: &[VisibleLayer], offset: usize, encoding: Encoding) 
     let mut color = [0.0f32; 3]; // premultiplied
     let mut coverage = 0.0f32;
     for layer in &sources[start..] {
-        let alpha = layer.image.rgba[offset + 3] as f32 / 255.0 * layer.opacity;
+        let alpha = layer.image.rgba[offset + 3] as f32 / 255.0
+            * layer.opacity
+            * (shown(layer) as f32 / 255.0);
         if alpha == 0.0 {
             continue;
         }
@@ -476,7 +610,7 @@ fn swap_tile(image: &mut Image, tile: &mut Tile) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlendMode, CLEAR, Change, Document};
+    use super::{BlendMode, CLEAR, Change, Document, Plane};
     use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, Material, primitives};
 
@@ -614,7 +748,7 @@ mod tests {
         let mut change = Change::Pixels {
             layer: id,
             material: 0,
-            channel: Channel::BaseColor,
+            plane: Plane::Channel(Channel::BaseColor),
             tiles: vec![super::Tile {
                 region,
                 pixels: vec![0, 255, 0, 255],
@@ -674,5 +808,80 @@ mod tests {
         );
         document.layers[1].blend = BlendMode::Screen;
         assert!(pixel(&document)[0] > 0.99, "screen onto white stays white");
+    }
+
+    #[test]
+    fn a_mask_hides_the_layer_where_it_is_black() {
+        let mut document = document();
+        // Green over the red slot, on every pixel.
+        let (w, h) = document.slot_sizes()[0];
+        document.layers[1].textures[0][0] = Some(Image::filled(w, h, [0, 255, 0, 255]));
+        let undo = document.set_mask(1, Some(255)).unwrap();
+        // A painted mask: black at pixel 0, half at pixel 1; white elsewhere.
+        let mut mask = Image::filled(w, h, [255, 255, 255, 255]);
+        mask.rgba[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        mask.rgba[4..8].copy_from_slice(&[128, 128, 128, 255]);
+        document.layers[1].textures[0][Plane::Mask.index()] = Some(mask);
+
+        let composite = document.composite(0, Channel::BaseColor).unwrap();
+        assert_eq!(
+            composite.rgba[0..4],
+            [255, 0, 0, 255],
+            "hidden: the red below"
+        );
+        assert_eq!(
+            composite.rgba[8..12],
+            [0, 255, 0, 255],
+            "shown: the green layer"
+        );
+        let half = &composite.rgba[4..8];
+        assert!(
+            half[0] > 100 && half[1] > 100,
+            "half shown: a mix, got {half:?}"
+        );
+
+        // The other slot has no painted mask: the unpainted value applies.
+        document.layers[1].textures[1][0] = Some(Image::filled(w, h, [0, 255, 0, 255]));
+        assert_eq!(
+            document.composite(1, Channel::BaseColor).unwrap().rgba[0..4],
+            [0, 255, 0, 255]
+        );
+
+        // Undoing the "add mask" removes it, painted image included.
+        let mut undo = undo;
+        document.apply(&mut undo);
+        assert_eq!(document.layers[1].mask, None);
+        assert!(document.layers[1].textures[0][Plane::Mask.index()].is_none());
+        assert_eq!(
+            document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
+            [0, 255, 0, 255]
+        );
+        // ...and redoing brings it back as it was.
+        document.apply(&mut undo);
+        assert_eq!(document.layers[1].mask, Some(255));
+        assert_eq!(
+            document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
+            [255, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn a_hide_all_mask_hides_the_whole_layer() {
+        let mut document = document();
+        let (w, h) = document.slot_sizes()[0];
+        document.layers[1].textures[0][0] = Some(Image::filled(w, h, [0, 255, 0, 255]));
+        document.set_mask(1, Some(0)).unwrap();
+        assert_eq!(
+            document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
+            [255, 0, 0, 255]
+        );
+        // Removing it shows the layer again; the base layer has no mask.
+        document.set_mask(1, None).unwrap();
+        assert_eq!(
+            document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
+            [0, 255, 0, 255]
+        );
+        assert!(document.set_mask(0, Some(255)).is_none());
+        assert!(document.set_mask(1, None).is_none(), "nothing to remove");
     }
 }

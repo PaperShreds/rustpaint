@@ -1,4 +1,4 @@
-use crate::document::{BlendMode, Document, Layer};
+use crate::document::{BlendMode, Document, Layer, LayerMask};
 use crate::mesh::{Channel, Image};
 use eframe::egui;
 use egui::containers::menu::{MenuButton, MenuConfig};
@@ -26,6 +26,14 @@ pub enum LayerAction {
     },
     Rename(usize, String),
     SetBlend(usize, BlendMode),
+    /// Select the layer, and paint on its mask (true) or its channels.
+    EditMask(usize, bool),
+    /// Give the layer a mask that shows it all, or (`hide`) hides it all.
+    AddMask {
+        layer: usize,
+        hide: bool,
+    },
+    DeleteMask(usize),
     /// `done` is false while the slider is still being dragged.
     Opacity {
         layer: usize,
@@ -41,12 +49,17 @@ pub struct LayersPanelState {
     renaming: Option<(u64, String)>,
 }
 
-/// Draws the layers panel's contents into `ui`.
+/// Layer thumbnails by (layer id, whether it shows the mask).
+pub type Thumbnails = HashMap<(u64, bool), egui::TextureHandle>;
+
+/// Draws the layers panel's contents into `ui`. `on_mask` says whether the
+/// selected layer's mask, rather than its paint, is being painted.
 pub fn show(
     ui: &mut egui::Ui,
     document: &Document,
     selected: usize,
-    thumbnails: &HashMap<u64, egui::TextureHandle>,
+    on_mask: bool,
+    thumbnails: &Thumbnails,
     state: &mut LayersPanelState,
 ) -> Vec<LayerAction> {
     let mut actions = Vec::new();
@@ -84,6 +97,42 @@ pub fn show(
                 to: selected - 1,
             });
         }
+        let has_mask = current.mask.is_some();
+        ui.add_enabled_ui(editable, |ui| {
+            ui.menu_button("Mask ⏷", |ui| {
+                let add = |ui: &mut egui::Ui, label, hint| {
+                    ui.add_enabled(!has_mask, egui::Button::new(label))
+                        .on_hover_text(hint)
+                        .clicked()
+                };
+                if add(
+                    ui,
+                    "Add mask (show all)",
+                    "Then paint with Erase on to hide parts",
+                ) {
+                    actions.push(LayerAction::AddMask {
+                        layer: selected,
+                        hide: false,
+                    });
+                }
+                if add(ui, "Add mask (hide all)", "Then paint to reveal parts") {
+                    actions.push(LayerAction::AddMask {
+                        layer: selected,
+                        hide: true,
+                    });
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(has_mask, egui::Button::new("Delete mask"))
+                    .clicked()
+                {
+                    actions.push(LayerAction::DeleteMask(selected));
+                }
+            })
+            .response
+            .on_hover_text("A mask hides parts of a layer without erasing its paint")
+            .on_disabled_hover_text("The base layer can't have a mask");
+        });
     });
 
     let mut blend = current.blend;
@@ -130,7 +179,7 @@ pub fn show(
                         document,
                         layer,
                         index,
-                        selected,
+                        (selected, on_mask),
                         thumbnails,
                         state,
                         &mut actions,
@@ -148,8 +197,8 @@ fn layer_row(
     document: &Document,
     layer: &Layer,
     index: usize,
-    selected: usize,
-    thumbnails: &HashMap<u64, egui::TextureHandle>,
+    (selected, on_mask): (usize, bool),
+    thumbnails: &Thumbnails,
     state: &mut LayersPanelState,
     actions: &mut Vec<LayerAction>,
 ) {
@@ -162,15 +211,43 @@ fn layer_row(
         actions.push(LayerAction::SetVisible(index, visible));
     }
 
-    let size = egui::Vec2::splat(THUMBNAIL_POINTS);
-    match thumbnails.get(&layer.id) {
-        Some(texture) => {
-            ui.image((texture.id(), size));
+    // The layer's paint and, if it has one, its mask. Clicking one picks
+    // what the brush paints on; that one is framed.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let parts = [
+            (false, "Paint on the layer"),
+            (
+                true,
+                "Paint on the mask: white shows the layer, black hides it",
+            ),
+        ];
+        for (mask, hint) in parts {
+            if mask && layer.mask.is_none() {
+                continue;
+            }
+            let size = egui::Vec2::splat(THUMBNAIL_POINTS);
+            let response = match thumbnails.get(&(layer.id, mask)) {
+                Some(texture) => {
+                    ui.add(egui::Image::new((texture.id(), size)).sense(egui::Sense::click()))
+                }
+                None => ui.allocate_response(size, egui::Sense::click()),
+            };
+            let active = index == selected && on_mask == mask && layer.mask.is_some();
+            if active {
+                let stroke = ui.visuals().selection.stroke;
+                ui.painter().rect_stroke(
+                    response.rect.expand(2.0),
+                    2.0,
+                    egui::Stroke::new(2.0, stroke.color),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if !layer.is_base() && response.on_hover_text(hint).clicked() {
+                actions.push(LayerAction::EditMask(index, mask));
+            }
         }
-        None => {
-            ui.allocate_space(size);
-        }
-    }
+    });
 
     if let Some((_, text)) = state.renaming.as_mut().filter(|(id, _)| *id == layer.id) {
         let response = ui.add(egui::TextEdit::singleline(text).desired_width(120.0));
@@ -226,6 +303,30 @@ fn slot_summary(document: &Document, layer: &Layer) -> String {
         [slot] => format!("{} ⏷", document.mesh.materials[*slot].name),
         _ => format!("{} slots ⏷", ticked.len()),
     }
+}
+
+/// A greyscale preview of the layer's mask on its first ticked slot, or
+/// `None` without a mask.
+pub fn mask_thumbnail(document: &Document, index: usize) -> Option<egui::ColorImage> {
+    let layer = &document.layers[index];
+    layer.mask?;
+    let slot = (0..layer.targets.len())
+        .find(|&slot| layer.targets[slot])
+        .unwrap_or(0);
+    let n = THUMBNAIL_PIXELS;
+    let value = |x: usize, y: usize| match document.layer_mask(layer, slot) {
+        LayerMask::None => 255,
+        LayerMask::Uniform(value) => value,
+        LayerMask::Image(image) => {
+            let px = ((x as u32 * image.width) / n as u32).min(image.width - 1);
+            let py = ((y as u32 * image.height) / n as u32).min(image.height - 1);
+            image.rgba[((py * image.width + px) * 4) as usize]
+        }
+    };
+    let pixels = (0..n * n)
+        .map(|i| egui::Color32::from_gray(value(i % n, i / n)))
+        .collect();
+    Some(egui::ColorImage::new([n, n], pixels))
 }
 
 /// A small preview of the layer on its first ticked slot (base colour, or

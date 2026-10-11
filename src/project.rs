@@ -3,12 +3,14 @@
 //! Layout: magic, the mesh with its base colour textures, then (version 3)
 //! each material's roughness and metallic, then the paint layers. Layer
 //! textures are mostly transparent, so only their 64x64 tiles that contain
-//! paint are stored. Older versions still open: version 1 has no layers,
-//! version 2 has base colour layers only and no blend modes.
+//! paint are stored. Version 4 adds layer masks: the value where the mask
+//! is unpainted, then the tiles that differ from it, one byte per pixel.
+//! Older versions still open: version 1 has no layers, version 2 has base
+//! colour layers only and no blend modes, version 3 has no masks.
 //! All counts are validated before allocating, so a damaged or hostile file
 //! produces an error instead of a crash.
 
-use crate::document::{BlendMode, CLEAR, Channel, Document, Layer, LayerProps};
+use crate::document::{BlendMode, CLEAR, Channel, Document, Layer, LayerProps, Plane};
 use crate::files;
 use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
 use crate::painting::history::TILE_SIZE;
@@ -18,6 +20,7 @@ use std::path::Path;
 const MAGIC_V1: &[u8; 8] = b"RPAINT01";
 const MAGIC_V2: &[u8; 8] = b"RPAINT02";
 const MAGIC_V3: &[u8; 8] = b"RPAINT03";
+const MAGIC_V4: &[u8; 8] = b"RPAINT04";
 /// Channels after base colour, stored one byte per pixel per material.
 const DATA_CHANNELS: [Channel; 2] = [Channel::Roughness, Channel::Metallic];
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -58,7 +61,7 @@ pub fn save(path: &Path, document: &Document) -> Result<(), String> {
 /// The project file's contents for `document`.
 pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
     let mut bytes = encode_mesh(&document.mesh)?;
-    bytes[..MAGIC_V3.len()].copy_from_slice(MAGIC_V3);
+    bytes[..MAGIC_V4.len()].copy_from_slice(MAGIC_V4);
     for material in &document.mesh.materials {
         for channel in DATA_CHANNELS {
             let image = material.channel(channel);
@@ -143,7 +146,7 @@ fn encode_mesh(mesh: &Mesh) -> Result<Vec<u8>, String> {
 fn decode(bytes: &[u8]) -> Result<Document, String> {
     let mut reader = Reader { bytes, offset: 0 };
     let magic = reader.take(MAGIC_V1.len())?;
-    let version = [MAGIC_V1, MAGIC_V2, MAGIC_V3]
+    let version = [MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4]
         .iter()
         .position(|known| magic == *known)
         .ok_or("not a supported RustPaint project file")?
@@ -276,6 +279,8 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
         if layer.is_base() {
             continue;
         }
+        bytes.push(layer.mask.is_some() as u8);
+        bytes.push(layer.mask.unwrap_or(0));
         for (slot, channel) in
             (0..slots).flat_map(|slot| Channel::ALL.map(|channel| (slot, channel)))
         {
@@ -301,8 +306,79 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
                 }
             }
         }
+        if let Some(unpainted) = layer.mask {
+            for slot in 0..slots {
+                let image = layer
+                    .textures
+                    .get(slot)
+                    .and_then(|planes| planes[Plane::Mask.index()].as_ref());
+                encode_mask(bytes, image, unpainted)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// A mask image's tiles that differ from its unpainted value, one byte per pixel.
+fn encode_mask(bytes: &mut Vec<u8>, image: Option<&Image>, unpainted: u8) -> Result<(), String> {
+    let Some(image) = image else {
+        return write_count(bytes, 0);
+    };
+    let differs = |region: ImageRegion| {
+        (region.y..region.y + region.height).any(|y| {
+            let start = ((y * image.width + region.x) * 4) as usize;
+            image.rgba[start..start + (region.width * 4) as usize]
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] != unpainted)
+        })
+    };
+    let painted: Vec<(usize, ImageRegion)> = (0..tile_count(image.width, image.height))
+        .map(|index| (index, tile_region(index, image.width, image.height)))
+        .filter(|(_, region)| differs(*region))
+        .collect();
+    write_count(bytes, painted.len())?;
+    for (index, region) in painted {
+        write_count(bytes, index)?;
+        for y in region.y..region.y + region.height {
+            let start = ((y * image.width + region.x) * 4) as usize;
+            let row = &image.rgba[start..start + (region.width * 4) as usize];
+            bytes.extend(row.chunks_exact(4).map(|pixel| pixel[0]));
+        }
+    }
+    Ok(())
+}
+
+/// One mask image: its painted tiles over the unpainted value, or `None` when
+/// nothing was painted.
+fn decode_mask(
+    reader: &mut Reader,
+    width: u32,
+    height: u32,
+    unpainted: u8,
+    budget: &mut usize,
+) -> Result<Option<Image>, String> {
+    let tiles = tile_count(width, height);
+    let painted = reader.count(tiles, "mask tile")?;
+    if painted == 0 {
+        return Ok(None);
+    }
+    let bytes = (width as usize) * (height as usize) * 4;
+    *budget = budget
+        .checked_sub(bytes)
+        .ok_or("project layers need more memory than supported")?;
+    let mut image = Image::filled(width, height, [unpainted, unpainted, unpainted, 255]);
+    for _ in 0..painted {
+        let tile = reader.count(tiles - 1, "mask tile index")?;
+        let region = tile_region(tile, width, height);
+        for y in region.y..region.y + region.height {
+            let row = reader.take(region.width as usize)?;
+            let start = ((y * width + region.x) * 4) as usize;
+            for (pixel, &value) in image.rgba[start..].chunks_exact_mut(4).zip(row) {
+                pixel.copy_from_slice(&[value, value, value, 255]);
+            }
+        }
+    }
+    Ok(Some(image))
 }
 
 fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Document, String> {
@@ -360,14 +436,27 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Docu
             continue;
         }
 
-        let mut textures: Vec<[Option<Image>; Channel::COUNT]> = Vec::with_capacity(sizes.len());
+        let mask = if version >= 4 {
+            let has_mask = reader.flag("layer mask")?;
+            let unpainted = reader.take(1)?[0];
+            has_mask.then_some(unpainted)
+        } else {
+            None
+        };
+        let mut textures: Vec<[Option<Image>; Plane::COUNT]> = Vec::with_capacity(sizes.len());
         for &(width, height) in &sizes {
-            let mut slot: [Option<Image>; Channel::COUNT] = Default::default();
+            let mut slot: [Option<Image>; Plane::COUNT] = Default::default();
             for channel in channels {
                 slot[channel.index()] =
                     decode_layer_texture(reader, width, height, &mut texture_budget)?;
             }
             textures.push(slot);
+        }
+        if let Some(unpainted) = mask {
+            for (slot, &(width, height)) in textures.iter_mut().zip(&sizes) {
+                slot[Plane::Mask.index()] =
+                    decode_mask(reader, width, height, unpainted, &mut texture_budget)?;
+            }
         }
         layers.push(Layer {
             id: index as u64,
@@ -377,6 +466,7 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Docu
             blend: props.blend,
             targets: props.targets,
             textures,
+            mask,
         });
     }
 
@@ -651,6 +741,11 @@ mod tests {
         document.mesh.materials[0].metallic.rgba[0..3].fill(200);
         document.insert_new_layer(2);
         document.layers[2].visible = false;
+        // A mask that hides everything except one painted corner.
+        document.set_mask(1, Some(0)).unwrap();
+        let mut mask = Image::filled(w, h, [0, 0, 0, 255]);
+        mask.rgba[last..].copy_from_slice(&[200, 200, 200, 255]);
+        document.layers[1].textures[0][crate::document::Plane::Mask.index()] = Some(mask);
         document.layers[0].targets[0] = false;
         document
     }
@@ -676,6 +771,13 @@ mod tests {
                 .map(|image| image.rgba.clone())
         };
         assert_eq!(painted(&decoded), painted(&document));
+        let mask = |document: &Document| {
+            let layer = &document.layers[1];
+            let image = layer.textures[0][crate::document::Plane::Mask.index()].as_ref();
+            (layer.mask, image.map(|image| image.rgba.clone()))
+        };
+        assert_eq!(mask(&decoded), mask(&document));
+        assert_eq!(decoded.layers[2].mask, None);
         assert!(
             decoded.layers[2]
                 .textures
@@ -696,11 +798,12 @@ mod tests {
                 channel.name()
             );
         }
-        // Only the painted tiles (one per painted channel) are stored, plus
-        // one byte per pixel for each data channel of the model.
+        // Only the painted tiles (one per painted channel, and one of the
+        // mask at a byte per pixel) are stored, plus one byte per pixel for
+        // each data channel of the model.
         let (w, h) = document.slot_sizes()[0];
         let base = encode_mesh(&document.mesh).unwrap().len() + 2 * (w * h) as usize;
-        assert!(bytes.len() < base + 2 * 64 * 64 * 4 + 1024);
+        assert!(bytes.len() < base + 2 * 64 * 64 * 4 + 64 * 64 + 1024);
     }
 
     #[test]

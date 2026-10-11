@@ -1,6 +1,6 @@
-use crate::document::{Channel, Dirty, Document};
+use crate::document::{Channel, Dirty, Document, LayerMask, Plane};
 use crate::mesh::{Mesh, SubMesh, Vertex};
-use crate::renderer::compositor::{Compositor, Draw, GpuSlot};
+use crate::renderer::compositor::{Compositor, Draw, DrawMask, GpuMasks, GpuSlot};
 use crate::renderer::environment::{self, HdrImage};
 use crate::renderer::texture;
 use eframe::egui;
@@ -88,6 +88,8 @@ impl ViewMode {
 /// the bind group the mesh shader samples the composites through.
 struct GpuMaterial {
     slots: [GpuSlot; Channel::COUNT],
+    /// Layer masks, shared by the channels.
+    masks: GpuMasks,
     bind_group: wgpu::BindGroup,
 }
 
@@ -137,6 +139,15 @@ fn create_gpu_materials(
         .into_iter()
         .enumerate()
         .map(|(material, (width, height))| {
+            let mut masks = compositor.create_masks(width, height);
+            sync_masks(
+                render_state,
+                compositor,
+                &mut masks,
+                document,
+                material,
+                None,
+            );
             let slots = Channel::ALL.map(|channel| {
                 let mut slot = compositor.create_slot(device, width, height, channel.encoding());
                 sync_slot(
@@ -147,7 +158,15 @@ fn create_gpu_materials(
                     material,
                     channel,
                 );
-                composite_slot(render_state, compositor, &slot, document, material, channel);
+                composite_slot(
+                    render_state,
+                    compositor,
+                    &slot,
+                    &masks,
+                    document,
+                    material,
+                    channel,
+                );
                 slot
             });
             let texture = |channel: Channel| wgpu::BindGroupEntry {
@@ -167,7 +186,11 @@ fn create_gpu_materials(
                     },
                 ],
             });
-            GpuMaterial { slots, bind_group }
+            GpuMaterial {
+                slots,
+                masks,
+                bind_group,
+            }
         })
         .collect()
 }
@@ -195,10 +218,34 @@ fn sync_slot(
     compositor.retain_layers(slot, &keep);
 }
 
+/// Makes `masks` hold the painted masks of every layer on `material`. The
+/// mask of layer `replaced` (swapped out as a whole) is uploaded again in full.
+fn sync_masks(
+    render_state: &egui_wgpu::RenderState,
+    compositor: &Compositor,
+    masks: &mut GpuMasks,
+    document: &Document,
+    material: usize,
+    replaced: Option<u64>,
+) {
+    let mut keep = HashSet::new();
+    for layer in &document.layers {
+        if let LayerMask::Image(image) = document.layer_mask(layer, material) {
+            keep.insert(layer.id);
+            if replaced == Some(layer.id) || !compositor.has_mask(masks, layer.id) {
+                let (device, queue) = (&render_state.device, &render_state.queue);
+                compositor.upload_mask(device, queue, masks, layer.id, image, None);
+            }
+        }
+    }
+    compositor.retain_masks(masks, &keep);
+}
+
 fn composite_slot(
     render_state: &egui_wgpu::RenderState,
     compositor: &Compositor,
     slot: &GpuSlot,
+    masks: &GpuMasks,
     document: &Document,
     material: usize,
     channel: Channel,
@@ -210,9 +257,15 @@ fn composite_slot(
             layer: layer.id,
             opacity: layer.opacity,
             blend: layer.blend,
+            mask: match layer.mask {
+                LayerMask::None => DrawMask::Uniform(1.0),
+                LayerMask::Uniform(value) => DrawMask::Uniform(value as f32 / 255.0),
+                LayerMask::Image(_) => DrawMask::Texture,
+            },
         })
         .collect();
-    compositor.composite(&render_state.device, &render_state.queue, slot, &draws);
+    let (device, queue) = (&render_state.device, &render_state.queue);
+    compositor.composite(device, queue, slot, masks, &draws);
 }
 
 /// Replaces the model shown in the viewport.
@@ -248,10 +301,36 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
     let compositor = &viewport.compositor;
     let (device, queue) = (&render_state.device, &render_state.queue);
 
-    if dirty.iter().any(|change| matches!(change, Dirty::Layers)) {
+    let replaced: Vec<u64> = dirty
+        .iter()
+        .filter_map(|change| match change {
+            Dirty::Mask { layer } => Some(*layer),
+            _ => None,
+        })
+        .collect();
+    let layers_changed = dirty.iter().any(|change| matches!(change, Dirty::Layers));
+    if layers_changed || !replaced.is_empty() {
         for (material, gpu) in viewport.materials.iter_mut().enumerate() {
             for (slot, channel) in gpu.slots.iter_mut().zip(Channel::ALL) {
                 sync_slot(render_state, compositor, slot, document, material, channel);
+            }
+            sync_masks(
+                render_state,
+                compositor,
+                &mut gpu.masks,
+                document,
+                material,
+                None,
+            );
+            for layer in &replaced {
+                sync_masks(
+                    render_state,
+                    compositor,
+                    &mut gpu.masks,
+                    document,
+                    material,
+                    Some(*layer),
+                );
             }
         }
     }
@@ -261,7 +340,32 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
             Dirty::Pixels {
                 layer,
                 material,
-                channel,
+                plane: Plane::Mask,
+                region,
+            } => {
+                let Some(gpu) = viewport.materials.get_mut(*material) else {
+                    continue;
+                };
+                let mask = document
+                    .layer_index(*layer)
+                    .map(|index| document.layer_mask(&document.layers[index], *material));
+                if let Some(LayerMask::Image(image)) = mask {
+                    compositor.upload_mask(
+                        device,
+                        queue,
+                        &mut gpu.masks,
+                        *layer,
+                        image,
+                        Some(*region),
+                    );
+                    // A mask shows in every channel.
+                    touched.extend(Channel::ALL.map(|channel| (*material, channel)));
+                }
+            }
+            Dirty::Pixels {
+                layer,
+                material,
+                plane: Plane::Channel(channel),
                 region,
             } => {
                 let Some(gpu) = viewport.materials.get_mut(*material) else {
@@ -282,7 +386,7 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
                     touched.insert((*material, *channel));
                 }
             }
-            Dirty::Layers => {
+            Dirty::Layers | Dirty::Mask { .. } => {
                 for material in 0..viewport.materials.len() {
                     touched.extend(Channel::ALL.map(|channel| (material, channel)));
                 }
@@ -292,7 +396,15 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
     for (material, channel) in touched {
         if let Some(gpu) = viewport.materials.get(material) {
             let slot = &gpu.slots[channel.index()];
-            composite_slot(render_state, compositor, slot, document, material, channel);
+            composite_slot(
+                render_state,
+                compositor,
+                slot,
+                &gpu.masks,
+                document,
+                material,
+                channel,
+            );
         }
     }
 }

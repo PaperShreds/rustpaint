@@ -162,7 +162,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::History;
-    use crate::document::{CLEAR, Change, Document, Tile};
+    use crate::document::{CLEAR, Change, Document, Plane, Tile};
     use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, primitives};
 
@@ -187,7 +187,7 @@ mod tests {
         Change::Pixels {
             layer: id,
             material: 0,
-            channel: Channel::BaseColor,
+            plane: Plane::Channel(Channel::BaseColor),
             tiles: vec![Tile {
                 region,
                 pixels: before,
