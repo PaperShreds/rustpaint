@@ -1,7 +1,7 @@
 use crate::document::{Change, Dirty, Document, LayerProps};
 use crate::export;
 use crate::mesh::{self, Image, Mesh};
-use crate::painting::brush::Brush;
+use crate::painting::brush::{self, Brush, Tool};
 use crate::painting::history::History;
 use crate::painting::stroke::{Stroke, StrokePainter};
 use crate::project;
@@ -31,6 +31,8 @@ enum Pending {
 pub struct RustPaintApp {
     pub brush: Brush,
     pub camera: OrbitCamera,
+    /// Camera distance last frame, to scale the brush with zooming.
+    zoom_distance: f32,
     pub view_mode: ViewMode,
     pub environment: EnvironmentSettings,
     environment_source: EnvironmentSource,
@@ -91,6 +93,7 @@ impl RustPaintApp {
         Self {
             brush: settings.brush,
             camera: OrbitCamera::default(),
+            zoom_distance: OrbitCamera::default().distance,
             view_mode: settings.view_mode,
             environment: settings.environment,
             environment_source,
@@ -123,6 +126,8 @@ impl RustPaintApp {
         }
         let (center, radius) = document.mesh.bounds();
         self.camera.frame(center, radius);
+        // Reframing for a new model isn't a zoom: leave the brush alone.
+        self.zoom_distance = self.camera.distance;
         self.selected_layer = document.layers[document.layers.len() - 1].id;
         self.document = document;
         self.thumbnails.clear();
@@ -327,6 +332,9 @@ impl RustPaintApp {
                 self.status = "The base layer can't be painted on. Select or add a layer.".into();
                 return;
             }
+        } else if self.brush.tool == Tool::Fill {
+            // One fill per click: the rest of the drag does nothing.
+            return;
         }
         let Some(stroke) = self.stroke.as_mut() else {
             return;
@@ -335,7 +343,17 @@ impl RustPaintApp {
         let sizes = self.document.slot_sizes();
         let layer = &mut self.document.layers[index];
         let id = layer.id;
-        let changed = painter.paint_segment(stroke, layer, &sizes, from, to, &self.brush);
+        let changed = if self.brush.tool == Tool::Fill {
+            let changed = painter.fill(stroke, layer, &sizes, to, &self.brush);
+            if changed.is_empty() {
+                self.status = "Nothing to fill there: click the model where it uses a \
+                               material this layer paints on."
+                    .into();
+            }
+            changed
+        } else {
+            painter.paint_segment(stroke, layer, &sizes, from, to, &self.brush)
+        };
         let dirty: Vec<Dirty> = changed
             .into_iter()
             .map(|(material, channel, region)| Dirty::Pixels {
@@ -529,6 +547,17 @@ impl RustPaintApp {
             .map_or(circle, BrushCursor::Outline)
     }
 
+    /// With "Keep size on model", zooming in makes the brush bigger on screen
+    /// (and zooming out smaller), so it keeps covering the same area.
+    fn follow_zoom(&mut self) {
+        let distance = self.camera.distance;
+        if self.brush.keep_size_on_model && distance != self.zoom_distance {
+            self.brush.size = (self.brush.size * self.zoom_distance / distance)
+                .clamp(brush::MIN_SIZE, brush::MAX_SIZE);
+        }
+        self.zoom_distance = distance;
+    }
+
     /// Opens a file, first asking about unsaved changes if there are any.
     fn request_open(&mut self, path: PathBuf, frame: &eframe::Frame) {
         if self.has_unsaved_changes() {
@@ -638,8 +667,9 @@ impl RustPaintApp {
             environment_source: self.environment_source.clone(),
             environment: self.environment,
             view_mode: self.view_mode,
+            // Always start with the paint brush.
             brush: Brush {
-                erase: false,
+                tool: Tool::Paint,
                 ..self.brush.clone()
             },
         }
@@ -735,6 +765,7 @@ impl eframe::App for RustPaintApp {
             self.handle_layer_action(action, frame);
         }
         let input = ui::viewport::show(ui, &mut self.camera, self.view_mode, self.environment);
+        self.follow_zoom();
         if let Some((from, to)) = input.paint {
             self.paint(input.rect, from, to, frame);
         }
@@ -742,8 +773,12 @@ impl eframe::App for RustPaintApp {
             self.finish_stroke();
         }
         if let Some(pointer) = input.cursor {
-            let cursor = self.brush_cursor(input.rect, pointer, input.camera_moved);
-            ui::viewport::draw_brush_cursor(ui, input.rect, cursor);
+            if self.brush.tool == Tool::Fill {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            } else {
+                let cursor = self.brush_cursor(input.rect, pointer, input.camera_moved);
+                ui::viewport::draw_brush_cursor(ui, input.rect, cursor);
+            }
         }
 
         let ctx = ui.ctx().clone();

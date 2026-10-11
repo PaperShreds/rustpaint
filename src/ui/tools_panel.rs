@@ -1,4 +1,4 @@
-use crate::painting::brush::Brush;
+use crate::painting::brush::{self, Brush, FillMode, Tool};
 use eframe::egui;
 
 pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
@@ -10,13 +10,36 @@ pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
             ui.separator();
 
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut brush.erase, false, "Paint");
-                ui.selectable_value(&mut brush.erase, true, "Erase")
+                ui.selectable_value(&mut brush.tool, Tool::Paint, "Paint");
+                ui.selectable_value(&mut brush.tool, Tool::Erase, "Erase")
                     .on_hover_text("Remove paint from the selected layer");
+                ui.selectable_value(&mut brush.tool, Tool::Fill, "Fill")
+                    .on_hover_text("Click the model to fill the selected layer");
             });
 
-            ui.add(egui::Slider::new(&mut brush.size, 1.0..=512.0).text("Size"));
-            ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
+            if brush.tool == Tool::Fill {
+                egui::ComboBox::from_label("Fill")
+                    .selected_text(brush.fill_mode.name())
+                    .show_ui(ui, |ui| {
+                        for mode in FillMode::ALL {
+                            ui.selectable_value(&mut brush.fill_mode, mode, mode.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Whole layer: every material the layer paints on.\n\
+                         Clicked material: the material under the cursor.\n\
+                         Clicked UV island: the connected UV piece under the cursor.",
+                    );
+            } else {
+                // Zooming may take the size past the slider's end; keep it.
+                ui.add(
+                    egui::Slider::new(&mut brush.size, brush::MIN_SIZE..=brush::SLIDER_MAX_SIZE)
+                        .clamping(egui::SliderClamping::Edits)
+                        .text("Size"),
+                );
+                ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
+            }
             ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
 
             ui.add_space(8.0);
@@ -44,6 +67,12 @@ pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
                 .on_hover_text(
                     "When off, a stroke stays on the face where it started. \
                      Faces are bounded by the model's hard (flat-shaded) edges.",
+                );
+            ui.checkbox(&mut brush.keep_size_on_model, "Keep size on model")
+                .on_hover_text(
+                    "The brush covers the same area of the model when you zoom, and on \
+                     near and far parts alike. When off, it keeps its size on screen, \
+                     so it covers more of the model further away.",
                 );
         });
 }

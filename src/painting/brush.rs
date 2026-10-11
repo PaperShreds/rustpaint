@@ -1,5 +1,60 @@
+/// Brush diameter limits, in screen pixels. The size slider stops at
+/// `SLIDER_MAX_SIZE`; zooming with `keep_size_on_model` can go further.
+pub const MIN_SIZE: f32 = 1.0;
+pub const SLIDER_MAX_SIZE: f32 = 512.0;
+pub const MAX_SIZE: f32 = 2048.0;
+
+/// What a click or drag in the viewport does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tool {
+    #[default]
+    Paint,
+    /// Remove paint from the layer.
+    Erase,
+    /// Fill an area of the layer with the brush's values in one click.
+    Fill,
+}
+
+/// How much of the layer the fill tool covers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FillMode {
+    /// Every material slot the layer paints on.
+    #[default]
+    Layer,
+    /// The material slot under the cursor.
+    Material,
+    /// The UV island under the cursor: triangles joined by shared UV edges.
+    UvIsland,
+}
+
+impl FillMode {
+    pub const ALL: [FillMode; 3] = [FillMode::Layer, FillMode::Material, FillMode::UvIsland];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FillMode::Layer => "Whole layer",
+            FillMode::Material => "Clicked material",
+            FillMode::UvIsland => "Clicked UV island",
+        }
+    }
+
+    /// Stable name for the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            FillMode::Layer => "layer",
+            FillMode::Material => "material",
+            FillMode::UvIsland => "uv_island",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Brush {
+    /// Diameter in screen pixels.
     pub size: f32,
     pub hardness: f32,
     pub opacity: f32,
@@ -15,8 +70,12 @@ pub struct Brush {
     /// Let a stroke continue across hard edges, instead of staying on the
     /// face (the area bounded by hard edges) where it started.
     pub paint_over_edges: bool,
-    /// Remove paint from the layer instead of adding it.
-    pub erase: bool,
+    /// Give the surface brush one size on the model, measured at the depth
+    /// of the orbit centre and scaled with zooming. Otherwise it keeps its
+    /// size on screen, so it covers more of the model further away.
+    pub keep_size_on_model: bool,
+    pub tool: Tool,
+    pub fill_mode: FillMode,
 }
 
 impl Default for Brush {
@@ -33,7 +92,9 @@ impl Default for Brush {
             metallic: 0.0,
             screen_space: false,
             paint_over_edges: true,
-            erase: false,
+            keep_size_on_model: false,
+            tool: Tool::Paint,
+            fill_mode: FillMode::Layer,
         }
     }
 }

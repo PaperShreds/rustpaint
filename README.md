@@ -37,6 +37,21 @@ blank 2048×2048 canvas in their base color.
 Each layer has an opacity and a blend mode (Normal, Multiply, Screen, Overlay,
 Darken, Lighten, Add). Layers are combined on the GPU, in linear light.
 
+The brush size is in screen pixels, so zooming in paints a smaller part of the
+model, and parts further away get a bigger share of it. Tick **Keep size on
+model** to give the brush one size on the model instead: it scales with zooming
+and is the same on near and far parts.
+
+The **Fill** tool fills the selected layer with the ticked channels in one
+click: the whole layer, the material under the cursor, or the UV island under
+the cursor (the connected piece of the UV layout). Undo removes the fill.
+
+When a stroke changes metallic with a soft brush, its edge mixes the two
+materials' values: painting dielectric over a white metal gives a pale ring,
+because the metal's white base color becomes visible as a diffuse color there.
+Engines show the same with the exported textures. Use a hard brush (hardness
+near 1) where metal meets non-metal.
+
 The brush paints the channels ticked under **Channels**: base color, roughness,
 and metallic, each with its own value. Imported models bring their glTF
 roughness and metallic along. **View** switches the viewport between the lit

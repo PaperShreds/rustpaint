@@ -5,7 +5,7 @@
 //! as plain `key = value` lines. Unknown keys and unreadable values are
 //! skipped, so an old or hand-edited file never stops the program starting.
 
-use crate::painting::brush::Brush;
+use crate::painting::brush::{self, Brush, FillMode};
 use crate::renderer::environment::{BuiltIn, EnvironmentSource};
 use crate::renderer::viewport::{EnvironmentSettings, ViewMode};
 use std::path::{Path, PathBuf};
@@ -79,6 +79,11 @@ impl Settings {
         put("brush_metallic", brush.metallic.to_string());
         put("brush_screen_space", brush.screen_space.to_string());
         put("brush_paint_over_edges", brush.paint_over_edges.to_string());
+        put(
+            "brush_keep_size_on_model",
+            brush.keep_size_on_model.to_string(),
+        );
+        put("fill_mode", brush.fill_mode.key().to_string());
         lines.join("\n") + "\n"
     }
 
@@ -138,7 +143,7 @@ impl Settings {
                     self.view_mode = *mode;
                 }
             }
-            "brush_size" => number(value, &mut brush.size, 1.0..=500.0),
+            "brush_size" => number(value, &mut brush.size, brush::MIN_SIZE..=brush::MAX_SIZE),
             "brush_hardness" => number(value, &mut brush.hardness, 0.0..=1.0),
             "brush_opacity" => number(value, &mut brush.opacity, 0.0..=1.0),
             "brush_paint_color" => flag(value, &mut brush.paint_color),
@@ -158,6 +163,12 @@ impl Settings {
             "brush_metallic" => number(value, &mut brush.metallic, 0.0..=1.0),
             "brush_screen_space" => flag(value, &mut brush.screen_space),
             "brush_paint_over_edges" => flag(value, &mut brush.paint_over_edges),
+            "brush_keep_size_on_model" => flag(value, &mut brush.keep_size_on_model),
+            "fill_mode" => {
+                if let Some(mode) = FillMode::from_key(value.trim()) {
+                    brush.fill_mode = mode;
+                }
+            }
             _ => {}
         }
     }
@@ -178,11 +189,13 @@ mod tests {
 
     #[test]
     fn settings_survive_a_round_trip() {
-        let mut settings = Settings::default();
-        settings.recent_files = vec![
-            PathBuf::from("/models/car with spaces.glb"),
-            PathBuf::from("/projects/car = final.rustpaint"),
-        ];
+        let mut settings = Settings {
+            recent_files: vec![
+                PathBuf::from("/models/car with spaces.glb"),
+                PathBuf::from("/projects/car = final.rustpaint"),
+            ],
+            ..Default::default()
+        };
         settings.environment_source = EnvironmentSource::File(PathBuf::from("/hdri/sky.exr"));
         settings.environment.rotation_degrees = 90.5;
         settings.environment.intensity = 2.0;
@@ -193,6 +206,8 @@ mod tests {
         settings.brush.color = [0.25, 0.5, 1.0];
         settings.brush.paint_metallic = true;
         settings.brush.screen_space = true;
+        settings.brush.keep_size_on_model = true;
+        settings.brush.fill_mode = FillMode::UvIsland;
 
         assert_eq!(Settings::from_text(&settings.to_text()), settings);
 

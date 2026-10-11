@@ -12,7 +12,7 @@
 
 use crate::document::{CLEAR, Change, Document, Layer, Tile};
 use crate::mesh::{Channel, Encoding, Image, ImageRegion, Mesh};
-use crate::painting::brush::Brush;
+use crate::painting::brush::{Brush, FillMode, Tool};
 use crate::painting::history;
 use crate::renderer::camera::OrbitCamera;
 use egui::{Pos2, Rect};
@@ -57,6 +57,8 @@ impl Triangle {
 
 /// A shared edge, identified by the exact bits of its two end positions.
 type EdgeKey = ([u32; 3], [u32; 3]);
+/// A UV edge within one material slot, by the exact bits of its two end UVs.
+type UvEdgeKey = (usize, [u32; 2], [u32; 2]);
 
 fn position_key(position: Vec3) -> [u32; 3] {
     // `+ 0.0` turns -0.0 into 0.0 so both get the same bits.
@@ -198,6 +200,9 @@ pub struct StrokePainter {
     forward: Vec3,
     /// World units per screen point at a view depth of 1.
     world_per_point: f32,
+    /// View depth of the orbit centre, where a brush that keeps its size on
+    /// the model is measured.
+    focus_depth: f32,
     triangles: Vec<Triangle>,
     tiles_x: usize,
     tiles_y: usize,
@@ -220,6 +225,7 @@ impl StrokePainter {
             eye,
             forward: (camera.target - eye).normalize_or_zero(),
             world_per_point: 2.0 * (camera.fov_y * 0.5).tan() / viewport.height().max(1.0),
+            focus_depth: camera.distance.max(1e-6),
             triangles: Vec::new(),
             tiles_x,
             tiles_y,
@@ -301,37 +307,104 @@ impl StrokePainter {
             stroke.face = Some(self.connected_face(start.triangle));
         }
         let radius = (brush.size * 0.5).max(0.5);
-        let mut target = LayerTarget {
-            layer,
-            stroke,
-            slot_sizes,
-            values: brush_values(brush),
-            opacity: brush.opacity.clamp(0.0, 1.0),
-            erase: brush.erase,
-            regions: vec![Default::default(); slot_sizes.len()],
-        };
-
+        let mut target = LayerTarget::new(layer, stroke, slot_sizes, brush);
         if brush.screen_space {
             self.paint_screen_segment(&mut target, from, to, radius, brush.hardness);
         } else {
-            self.paint_surface_segment(&mut target, from, to, radius, brush.hardness);
+            self.paint_surface_segment(&mut target, from, to, radius, brush);
         }
-        let mut changed = Vec::new();
-        for (material, regions) in target.regions.into_iter().enumerate() {
-            for (channel, region) in Channel::ALL.into_iter().zip(regions) {
-                if let Some(region) = region {
-                    changed.push((material, channel, region));
+        target.changed()
+    }
+
+    /// Fills part of `layer` with the brush's values, as chosen by the
+    /// brush's fill mode; `at` (screen points) picks the material or UV
+    /// island. Returns the texel region that changed in each slot and channel.
+    pub fn fill(
+        &self,
+        stroke: &mut Stroke,
+        layer: &mut Layer,
+        slot_sizes: &[(u32, u32)],
+        at: Pos2,
+        brush: &Brush,
+    ) -> Vec<(usize, Channel, ImageRegion)> {
+        if layer.id != stroke.layer {
+            return Vec::new();
+        }
+        let hit = self.surface_hit(self.to_local(at));
+        let mut target = LayerTarget::new(layer, stroke, slot_sizes, brush);
+        match brush.fill_mode {
+            FillMode::Layer => {
+                for material in 0..slot_sizes.len() {
+                    if let Some(mut slot) = target.slot(material) {
+                        slot.fill_all();
+                    }
+                }
+            }
+            FillMode::Material => {
+                if let Some(hit) = hit
+                    && let Some(mut slot) =
+                        target.slot(self.triangles[hit.triangle as usize].material)
+                {
+                    slot.fill_all();
+                }
+            }
+            FillMode::UvIsland => {
+                let Some(hit) = hit else {
+                    return Vec::new();
+                };
+                let material = self.triangles[hit.triangle as usize].material;
+                let Some(mut slot) = target.slot(material) else {
+                    return Vec::new();
+                };
+                for index in self.uv_island(hit.triangle) {
+                    slot.paint_triangle(&self.triangles[index as usize], None, |_, _| 1.0);
                 }
             }
         }
-        changed
+        target.changed()
+    }
+
+    /// The triangles in the same UV island as `start`: same material slot,
+    /// joined through edges that share both UV coordinates.
+    fn uv_island(&self, start: u32) -> Vec<u32> {
+        let key = |uv: Vec2| [uv.x.to_bits(), uv.y.to_bits()];
+        let mut edges: Vec<(UvEdgeKey, u32)> = Vec::new();
+        for (index, triangle) in self.triangles.iter().enumerate() {
+            for corner in 0..3 {
+                let a = key(triangle.uv[corner]);
+                let b = key(triangle.uv[(corner + 1) % 3]);
+                edges.push(((triangle.material, a.min(b), a.max(b)), index as u32));
+            }
+        }
+        edges.sort_unstable();
+
+        // Union-find over triangles that share an edge.
+        let mut parent: Vec<u32> = (0..self.triangles.len() as u32).collect();
+        fn root(parent: &mut [u32], mut i: u32) -> u32 {
+            while parent[i as usize] != i {
+                parent[i as usize] = parent[parent[i as usize] as usize];
+                i = parent[i as usize];
+            }
+            i
+        }
+        for group in edges.chunk_by(|a, b| a.0 == b.0) {
+            for pair in group.windows(2) {
+                let (a, b) = (root(&mut parent, pair[0].1), root(&mut parent, pair[1].1));
+                parent[a as usize] = b;
+            }
+        }
+        let island = root(&mut parent, start);
+        (0..self.triangles.len() as u32)
+            .filter(|&index| root(&mut parent, index) == island)
+            .collect()
     }
 
     /// Outline of the surface brush under the cursor: a disc lying on the
     /// surface, in screen points. `None` when the cursor isn't over the model.
     pub fn brush_outline(&self, cursor: Pos2, brush: &Brush) -> Option<Vec<Pos2>> {
         let hit = self.surface_hit(self.to_local(cursor))?;
-        let world_radius = self.world_radius(hit.position, (brush.size * 0.5).max(0.5));
+        let world_radius =
+            self.brush_world_radius(hit.position, (brush.size * 0.5).max(0.5), brush);
         let (axis_a, axis_b) = hit.normal.any_orthonormal_pair();
         (0..OUTLINE_POINTS)
             .map(|i| {
@@ -415,14 +488,15 @@ impl StrokePainter {
         from: Vec2,
         to: Vec2,
         radius: f32,
-        hardness: f32,
+        brush: &Brush,
     ) {
+        let hardness = brush.hardness;
         let start_hit = self.surface_hit(from);
         let Some(end_hit) = self.surface_hit(to).or_else(|| self.surface_hit(from)) else {
             return;
         };
         let (end, normal) = (end_hit.position, end_hit.normal);
-        let world_radius = self.world_radius(end, radius);
+        let world_radius = self.brush_world_radius(end, radius, brush);
         let mut start = start_hit.as_ref().map_or(end, |hit| hit.position);
         // Sweeping across a silhouette can make the two ends far apart in 3D;
         // a capsule between them would cut through empty space. Use a dab.
@@ -652,6 +726,17 @@ impl StrokePainter {
         Vec2::new(point.x - self.viewport.min.x, point.y - self.viewport.min.y)
     }
 
+    /// World radius of the surface brush at `position` for a screen radius
+    /// of `points`: measured there, or at the orbit centre when the brush
+    /// keeps its size on the model.
+    fn brush_world_radius(&self, position: Vec3, points: f32, brush: &Brush) -> f32 {
+        if brush.keep_size_on_model {
+            points * self.world_per_point * self.focus_depth
+        } else {
+            self.world_radius(position, points)
+        }
+    }
+
     /// World size of `points` screen points at the depth of `position`.
     fn world_radius(&self, position: Vec3, points: f32) -> f32 {
         let depth = (position - self.eye).dot(self.forward).max(1e-6);
@@ -754,7 +839,37 @@ struct LayerTarget<'a> {
     regions: Vec<[Option<ImageRegion>; Channel::COUNT]>,
 }
 
-impl LayerTarget<'_> {
+impl<'a> LayerTarget<'a> {
+    fn new(
+        layer: &'a mut Layer,
+        stroke: &'a mut Stroke,
+        slot_sizes: &'a [(u32, u32)],
+        brush: &Brush,
+    ) -> Self {
+        Self {
+            layer,
+            stroke,
+            slot_sizes,
+            values: brush_values(brush),
+            opacity: brush.opacity.clamp(0.0, 1.0),
+            erase: brush.tool == Tool::Erase,
+            regions: vec![Default::default(); slot_sizes.len()],
+        }
+    }
+
+    /// The texel region that changed, per slot and channel.
+    fn changed(self) -> Vec<(usize, Channel, ImageRegion)> {
+        let mut changed = Vec::new();
+        for (material, regions) in self.regions.into_iter().enumerate() {
+            for (channel, region) in Channel::ALL.into_iter().zip(regions) {
+                if let Some(region) = region {
+                    changed.push((material, channel, region));
+                }
+            }
+        }
+        changed
+    }
+
     /// The textures of `material` to paint into (one per painted channel),
     /// created on first use. `None` if the layer doesn't paint on that slot.
     fn slot(&mut self, material: usize) -> Option<SlotTarget<'_>> {
@@ -867,6 +982,15 @@ impl SlotTarget<'_> {
                     let y = raw_y.rem_euclid(self.height as i64) as u32;
                     self.apply(x, y, amount);
                 }
+            }
+        }
+    }
+
+    /// Covers every texel of the slot's textures.
+    fn fill_all(&mut self) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                self.apply(x, y, 1.0);
             }
         }
     }
@@ -1068,7 +1192,7 @@ mod tests {
     use crate::document::Document;
     use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
-    use crate::painting::brush::Brush;
+    use crate::painting::brush::{Brush, FillMode, Tool};
     use crate::renderer::camera::OrbitCamera;
     use egui::{Pos2, Rect};
     use glam::Vec3;
@@ -1164,7 +1288,6 @@ mod tests {
             color: [1.0, 0.0, 0.0],
             screen_space,
             paint_over_edges: true,
-            erase: false,
             ..Brush::default()
         }
     }
@@ -1546,7 +1669,7 @@ mod tests {
         let point = Pos2::new(91.0, 128.0);
         let mut paint_brush = brush(20.0, false);
         for erase in [false, true] {
-            paint_brush.erase = erase;
+            paint_brush.tool = if erase { Tool::Erase } else { Tool::Paint };
             let mut stroke = Stroke::begin(&document, 1).unwrap();
             painter.paint_segment(
                 &mut stroke,
@@ -1668,5 +1791,134 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// Fills through a `Document` like `paint`, clicking at `at`. Only slot 0
+    /// is targeted. Returns how many slot/channel regions changed.
+    fn fill(mesh: &mut Mesh, at: Pos2, mode: FillMode) -> usize {
+        let painter = StrokePainter::new(mesh, &test_camera(), viewport());
+        let empty = Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            submeshes: Vec::new(),
+            materials: Vec::new(),
+        };
+        let mut document = Document::new(std::mem::replace(mesh, empty));
+        for (slot, target) in document.layers[1].targets.iter_mut().enumerate() {
+            *target = slot == 0;
+        }
+        let sizes = document.slot_sizes();
+        let mut stroke = Stroke::begin(&document, 1).unwrap();
+        let brush = Brush {
+            tool: Tool::Fill,
+            fill_mode: mode,
+            ..brush(1.0, false)
+        };
+        let changed = painter.fill(&mut stroke, &mut document.layers[1], &sizes, at, &brush);
+        let composite = document.composite(0, Channel::BaseColor).unwrap();
+        *mesh = document.mesh;
+        mesh.materials[0].base_color = composite;
+        changed.len()
+    }
+
+    #[test]
+    fn fill_covers_the_whole_layer() {
+        let mut mesh = test_mesh();
+        // Clicking empty space is fine for a whole-layer fill.
+        assert_eq!(fill(&mut mesh, Pos2::new(5.0, 5.0), FillMode::Layer), 1);
+        assert_eq!(painted(&mesh).len(), (TEXTURE_SIZE * TEXTURE_SIZE) as usize);
+    }
+
+    #[test]
+    fn fill_covers_only_the_clicked_uv_island() {
+        // test_mesh: two triangles in separate islands, left one at u < 0.5.
+        let mut mesh = test_mesh();
+        assert_eq!(
+            fill(&mut mesh, Pos2::new(76.0, 145.0), FillMode::UvIsland),
+            1
+        );
+        let texels = painted(&mesh);
+        assert!(texels.len() > 1000);
+        // (The seam margin left of u = 0 wraps round to the last column.)
+        assert!(
+            texels
+                .iter()
+                .all(|(x, _, _)| *x < TEXTURE_SIZE / 2 || *x == TEXTURE_SIZE - 1)
+        );
+
+        // A quad whose two triangles share a UV edge: one island, all of it.
+        let mut quad = mesh_from_triangles(&[
+            (
+                [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+                [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            ),
+            (
+                [[-1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]],
+                [[0.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            ),
+        ]);
+        assert_eq!(
+            fill(&mut quad, Pos2::new(160.0, 150.0), FillMode::UvIsland),
+            1
+        );
+        assert_eq!(painted(&quad).len(), (TEXTURE_SIZE * TEXTURE_SIZE) as usize);
+    }
+
+    #[test]
+    fn fill_material_needs_a_material_the_layer_paints_on() {
+        // Right triangle uses slot 1, which the layer doesn't paint on.
+        let two_materials = || {
+            let mut mesh = test_mesh();
+            mesh.materials.push(blank_material("Other"));
+            mesh.submeshes = vec![
+                SubMesh {
+                    indices: 0..3,
+                    material: 0,
+                },
+                SubMesh {
+                    indices: 3..6,
+                    material: 1,
+                },
+            ];
+            mesh
+        };
+        let mut other = two_materials();
+        assert_eq!(
+            fill(&mut other, Pos2::new(180.0, 145.0), FillMode::Material),
+            0
+        );
+        assert!(painted(&other).is_empty());
+        let mut mesh = two_materials();
+        assert_eq!(
+            fill(&mut mesh, Pos2::new(76.0, 145.0), FillMode::Material),
+            1
+        );
+        assert_eq!(painted(&mesh).len(), (TEXTURE_SIZE * TEXTURE_SIZE) as usize);
+    }
+
+    #[test]
+    fn brush_can_keep_one_size_on_near_and_far_parts() {
+        // Looking down at a floor at an angle: the far dab is deeper in view.
+        let camera = OrbitCamera {
+            pitch: 30.0_f32.to_radians(),
+            ..test_camera()
+        };
+        let dab = |at: Pos2, keep_size_on_model: bool| {
+            let mut floor = floor_mesh(3.0);
+            let brush = Brush {
+                keep_size_on_model,
+                ..brush(60.0, false)
+            };
+            paint(&mut floor, &camera, &[at], &brush).expect("dab should paint");
+            painted(&floor).len() as f32
+        };
+        let (near, far) = (Pos2::new(128.0, 220.0), Pos2::new(128.0, 60.0));
+        let ratio = dab(far, true) / dab(near, true);
+        assert!(
+            (0.8..1.25).contains(&ratio),
+            "kept size: far/near = {ratio}"
+        );
+        let ratio = dab(far, false) / dab(near, false);
+        assert!(ratio > 3.0, "screen size: far/near = {ratio}");
     }
 }
