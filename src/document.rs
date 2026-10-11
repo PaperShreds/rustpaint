@@ -8,11 +8,19 @@
 //! shows (white) the layer's paint, in all channels. The images live next to
 //! the channels as the layer's `Plane::Mask`.
 //!
+//! A layer can also be procedural. A fill layer's images are one value per
+//! channel, everywhere; a mask can come from a `Generator`. Their pixels are
+//! made from the settings (`refresh_layer`), so undo only stores the settings.
+//!
 //! The viewport blends the visible layers on the GPU. `composite` does the same
 //! on the CPU, for export.
 
+use crate::generator::Generator;
+use crate::generator::bake::Bake;
 pub use crate::mesh::{Channel, Encoding};
 use crate::mesh::{Image, ImageRegion, Mesh};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// A transparent pixel, the starting content of a paint layer.
 pub const CLEAR: [u8; 4] = [0, 0, 0, 0];
@@ -117,6 +125,44 @@ impl BlendMode {
     }
 }
 
+/// What a fill layer puts on the model: one value per channel, everywhere.
+/// Where it shows is up to the layer's mask.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FillValues {
+    /// Base colour, sRGB-encoded.
+    pub color: [u8; 3],
+    pub roughness: f32,
+    pub metallic: f32,
+    /// Which channels the layer fills (the others are left to the layers below).
+    pub channels: [bool; Channel::COUNT],
+}
+
+impl Default for FillValues {
+    fn default() -> Self {
+        Self {
+            color: [200, 200, 200],
+            roughness: 0.5,
+            metallic: 0.0,
+            channels: [true, false, false],
+        }
+    }
+}
+
+impl FillValues {
+    /// The pixel a fill layer has everywhere on `channel`.
+    pub fn pixel(&self, channel: Channel) -> [u8; 4] {
+        let data = |value: f32| {
+            let byte = Encoding::Linear.encode(value);
+            [byte, byte, byte, 255]
+        };
+        match channel {
+            Channel::BaseColor => [self.color[0], self.color[1], self.color[2], 255],
+            Channel::Roughness => data(self.roughness),
+            Channel::Metallic => data(self.metallic),
+        }
+    }
+}
+
 pub struct Layer {
     /// Stable identity, so undo steps and UI state survive reordering.
     pub id: u64,
@@ -134,11 +180,21 @@ pub struct Layer {
     /// shows the layer there, 0 hides it). Painted masks are `Plane::Mask`
     /// images: opaque, the value in every colour channel.
     pub mask: Option<u8>,
+    /// A fill layer: its channel images are made from these values, not painted.
+    pub fill: Option<FillValues>,
+    /// If set, the mask's images are made by this generator, not painted.
+    /// Needs a mask.
+    pub mask_generator: Option<Generator>,
 }
 
 impl Layer {
     pub fn is_base(&self) -> bool {
         self.id == BASE_LAYER_ID
+    }
+
+    /// Whether some of the layer's images are made from settings.
+    pub fn is_procedural(&self) -> bool {
+        self.fill.is_some() || self.mask_generator.is_some()
     }
 
     pub fn props(&self) -> LayerProps {
@@ -148,6 +204,8 @@ impl Layer {
             opacity: self.opacity,
             blend: self.blend,
             targets: self.targets.clone(),
+            fill: self.fill,
+            generator: self.mask_generator,
         }
     }
 
@@ -157,6 +215,8 @@ impl Layer {
         self.opacity = props.opacity;
         self.blend = props.blend;
         self.targets = props.targets;
+        self.fill = props.fill;
+        self.mask_generator = props.generator;
     }
 
     fn bytes(&self) -> usize {
@@ -210,6 +270,31 @@ pub struct LayerProps {
     pub opacity: f32,
     pub blend: BlendMode,
     pub targets: Vec<bool>,
+    /// Changing these remakes the layer's procedural images.
+    pub fill: Option<FillValues>,
+    pub generator: Option<Generator>,
+}
+
+/// Which procedural images to make again.
+#[derive(Clone, Copy)]
+pub struct Remake {
+    pub fill: bool,
+    pub mask: bool,
+    /// Only the images a targeted slot doesn't have yet.
+    pub only_missing: bool,
+}
+
+impl Remake {
+    pub const ALL: Remake = Remake {
+        fill: true,
+        mask: true,
+        only_missing: false,
+    };
+    pub const FILL: Remake = Remake {
+        fill: true,
+        mask: false,
+        only_missing: false,
+    };
 }
 
 /// Pixels of one square tile of a layer texture, tightly packed RGBA.
@@ -271,6 +356,8 @@ pub enum Dirty {
     Layers,
     /// A layer's mask was added, removed or replaced as a whole.
     Mask { layer: u64 },
+    /// The images of a procedural layer were remade, all of its planes.
+    Generated { layer: u64 },
 }
 
 pub struct Document {
@@ -278,7 +365,12 @@ pub struct Document {
     /// Bottom to top; `layers[0]` is the base layer.
     pub layers: Vec<Layer>,
     next_layer_id: u64,
+    /// Texel positions per (material slot, width, height), made when a
+    /// generator first needs them.
+    bakes: BakeCache,
 }
+
+type BakeCache = Mutex<HashMap<(usize, u32, u32), Arc<Bake>>>;
 
 impl Document {
     /// A document for a freshly imported model: its textures as the base
@@ -305,13 +397,23 @@ impl Document {
             targets: vec![true; slots],
             textures: Vec::new(),
             mask: None,
+            fill: None,
+            mask_generator: None,
         };
         let next_layer_id = layers.iter().map(|layer| layer.id).max().unwrap_or(0) + 1;
-        Self {
+        let mut document = Self {
             mesh,
             layers: std::iter::once(base).chain(layers).collect(),
             next_layer_id,
+            bakes: BakeCache::default(),
+        };
+        // Procedural layers are stored as settings only.
+        for index in 1..document.layers.len() {
+            if document.layers[index].is_procedural() {
+                document.regenerate(index, Remake::ALL);
+            }
         }
+        document
     }
 
     pub fn set_base_props(&mut self, props: LayerProps) {
@@ -414,6 +516,25 @@ impl Document {
             targets: vec![true; slots],
             textures: (0..slots).map(|_| Default::default()).collect(),
             mask: None,
+            fill: None,
+            mask_generator: None,
+        }
+    }
+
+    /// A new fill layer on every slot, made from `fill`. Not yet in the stack.
+    pub fn new_fill_layer(&mut self, fill: FillValues) -> Layer {
+        let mut layer = self.new_layer();
+        layer.name = format!("Fill {}", layer.id);
+        layer.fill = Some(fill);
+        refresh_layer(&mut layer, &self.mesh, &self.bakes, Remake::ALL);
+        layer
+    }
+
+    /// Remakes the procedural images of the layer at `index` from its
+    /// settings. A mask that lost its generator keeps its pixels.
+    pub fn regenerate(&mut self, index: usize, remake: Remake) {
+        if let Some(layer) = self.layers.get_mut(index).filter(|l| !l.is_base()) {
+            refresh_layer(layer, &self.mesh, &self.bakes, remake);
         }
     }
 
@@ -492,13 +613,35 @@ impl Document {
                 std::mem::swap(from, to);
                 Some(Dirty::Layers)
             }
-            Change::Props { layer, props } => {
-                let index = self.layer_index(*layer)?;
+            Change::Props {
+                layer: layer_id,
+                props,
+            } => {
+                let index = self.layer_index(*layer_id)?;
                 if props.targets.len() != self.mesh.materials.len() {
                     return None;
                 }
-                let previous = self.layers[index].props();
-                self.layers[index].set_props(std::mem::replace(props, previous));
+                let before = self.layers[index].props();
+                self.layers[index].set_props(std::mem::replace(props, before.clone()));
+                let layer = &self.layers[index];
+                let remake = Remake {
+                    fill: before.fill != layer.fill,
+                    mask: before.generator != layer.mask_generator,
+                    only_missing: false,
+                };
+                let retargeted = before.targets != layer.targets && layer.is_procedural();
+                if remake.fill || remake.mask || retargeted {
+                    let scope = if retargeted && !(remake.fill || remake.mask) {
+                        Remake {
+                            only_missing: true,
+                            ..Remake::ALL
+                        }
+                    } else {
+                        remake
+                    };
+                    self.regenerate(index, scope);
+                    return Some(Dirty::Generated { layer: *layer_id });
+                }
                 Some(Dirty::Layers)
             }
             Change::Mask {
@@ -597,6 +740,60 @@ fn composite_pixel(sources: &[VisibleLayer], offset: usize, encoding: Encoding) 
     ]
 }
 
+/// Makes the images of `layer`'s fill and generated mask that `remake` asks
+/// for. Images on slots the layer doesn't target are dropped, so they can't
+/// go stale.
+fn refresh_layer(layer: &mut Layer, mesh: &Mesh, bakes: &BakeCache, remake: Remake) {
+    let only_missing = remake.only_missing;
+    let generator = layer.mask_generator.filter(|_| layer.mask.is_some());
+    for (slot, material) in mesh.materials.iter().enumerate() {
+        let (width, height) = (material.base_color.width, material.base_color.height);
+        let targeted = layer.targets.get(slot) == Some(&true);
+        let Some(planes) = layer.textures.get_mut(slot) else {
+            continue;
+        };
+        let current = |image: &Option<Image>| {
+            image
+                .as_ref()
+                .is_some_and(|image| (image.width, image.height) == (width, height))
+        };
+        if let Some(fill) = layer.fill.filter(|_| remake.fill) {
+            for channel in Channel::ALL {
+                let plane = &mut planes[channel.index()];
+                let wanted = targeted && fill.channels[channel.index()];
+                if !wanted {
+                    *plane = None;
+                } else if !(only_missing && current(plane)) {
+                    *plane = Some(Image::filled(width, height, fill.pixel(channel)));
+                }
+            }
+        }
+        if let Some(generator) = generator.filter(|_| remake.mask) {
+            let plane = &mut planes[Plane::Mask.index()];
+            if !targeted {
+                *plane = None;
+            } else if !(only_missing && current(plane)) {
+                let bake = bakes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry((slot, width, height))
+                    .or_insert_with(|| Arc::new(Bake::new(mesh, slot, width, height)))
+                    .clone();
+                let rgba = bake
+                    .generate(&generator)
+                    .into_iter()
+                    .flat_map(|value| [value, value, value, 255])
+                    .collect();
+                *plane = Some(Image {
+                    width,
+                    height,
+                    rgba,
+                });
+            }
+        }
+    }
+}
+
 fn swap_tile(image: &mut Image, tile: &mut Tile) {
     let region = tile.region;
     let row_bytes = (region.width * 4) as usize;
@@ -610,7 +807,8 @@ fn swap_tile(image: &mut Image, tile: &mut Tile) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlendMode, CLEAR, Change, Document, Plane};
+    use super::{BlendMode, CLEAR, Change, Document, FillValues, LayerProps, Plane};
+    use crate::generator::Generator;
     use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, Material, primitives};
 
@@ -883,5 +1081,177 @@ mod tests {
         );
         assert!(document.set_mask(0, Some(255)).is_none());
         assert!(document.set_mask(1, None).is_none(), "nothing to remove");
+    }
+
+    /// The checkered cube, whose atlas is big enough for generators.
+    fn cube_document() -> Document {
+        Document::new(primitives::cube())
+    }
+
+    fn with_props(document: &mut Document, index: usize, edit: impl Fn(&mut LayerProps)) -> Change {
+        let mut props = document.layers[index].props();
+        edit(&mut props);
+        let mut change = Change::Props {
+            layer: document.layers[index].id,
+            props,
+        };
+        document.apply(&mut change).unwrap();
+        change
+    }
+
+    fn mask_pixels(document: &Document, layer: usize) -> Option<Vec<u8>> {
+        document.layers[layer].textures[0][Plane::Mask.index()]
+            .as_ref()
+            .map(|image| image.rgba.clone())
+    }
+
+    #[test]
+    fn a_fill_layer_covers_the_layers_below_with_its_values() {
+        let mut document = document();
+        let fill = FillValues {
+            color: [0, 255, 0],
+            roughness: 1.0,
+            channels: [true, true, false],
+            ..FillValues::default()
+        };
+        let layer = document.new_fill_layer(fill);
+        let mut add = Change::Layer {
+            index: 2,
+            stored: Some(layer),
+        };
+        document.apply(&mut add).unwrap();
+
+        let color = document.composite(0, Channel::BaseColor).unwrap();
+        assert_eq!(&color.rgba[0..4], &[0, 255, 0, 255]);
+        assert_eq!(&color.rgba[60..64], &[0, 255, 0, 255], "everywhere");
+        let roughness = document.composite(1, Channel::Roughness).unwrap();
+        assert_eq!(&roughness.rgba[0..3], &[255, 255, 255]);
+        // Metallic isn't filled: the model's own value shows.
+        let metallic = document.composite(0, Channel::Metallic).unwrap();
+        assert_eq!(&metallic.rgba[0..3], &[0, 0, 0]);
+        assert!(document.layers[2].textures[0][Channel::Metallic.index()].is_none());
+
+        // Changing the values remakes the images; undoing restores the old ones.
+        let mut change = with_props(&mut document, 2, |p| {
+            p.fill = Some(FillValues {
+                color: [0, 0, 255],
+                ..fill
+            })
+        });
+        assert_eq!(
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
+            &[0, 0, 255, 255]
+        );
+        document.apply(&mut change).unwrap();
+        assert_eq!(
+            &document.composite(0, Channel::BaseColor).unwrap().rgba[0..4],
+            &[0, 255, 0, 255]
+        );
+    }
+
+    #[test]
+    fn a_fill_layer_is_only_painted_through_its_mask() {
+        use crate::painting::stroke::Stroke;
+        let mut document = document();
+        let layer = document.new_fill_layer(FillValues::default());
+        document
+            .apply(&mut Change::Layer {
+                index: 2,
+                stored: Some(layer),
+            })
+            .unwrap();
+        assert!(Stroke::begin(&document, 2).is_none());
+        assert!(Stroke::begin_on_mask(&document, 2).is_none(), "no mask yet");
+        document.set_mask(2, Some(0)).unwrap();
+        assert!(Stroke::begin_on_mask(&document, 2).is_some());
+        // Paint layers are unaffected.
+        assert!(Stroke::begin(&document, 1).is_some());
+    }
+
+    #[test]
+    fn a_generated_mask_follows_its_settings_through_undo_and_redo() {
+        let mut document = cube_document();
+        document.layers[1].textures[0][0] = Some(Image::filled(768, 512, [0, 255, 0, 255]));
+        document.set_mask(1, Some(255)).unwrap();
+        assert!(
+            mask_pixels(&document, 1).is_none(),
+            "no image until generated"
+        );
+
+        let generator = Generator::default();
+        with_props(&mut document, 1, |p| p.generator = Some(generator));
+        let first = mask_pixels(&document, 1).expect("generated");
+        assert!(
+            first.chunks_exact(4).any(|p| p[0] != first[0]),
+            "the noise varies"
+        );
+
+        let other = Generator {
+            seed: 5,
+            ..generator
+        };
+        let mut change = with_props(&mut document, 1, |p| p.generator = Some(other));
+        let second = mask_pixels(&document, 1).unwrap();
+        assert_ne!(first, second);
+        document.apply(&mut change).unwrap();
+        assert_eq!(mask_pixels(&document, 1).unwrap(), first, "undone");
+        document.apply(&mut change).unwrap();
+        assert_eq!(mask_pixels(&document, 1).unwrap(), second, "redone");
+
+        // Dropping the generator keeps the pixels, as a painted mask...
+        let mut convert = with_props(&mut document, 1, |p| p.generator = None);
+        assert_eq!(mask_pixels(&document, 1).unwrap(), second);
+        // ...and undoing that makes it procedural again.
+        document.apply(&mut convert).unwrap();
+        assert_eq!(document.layers[1].mask_generator, Some(other));
+        assert_eq!(mask_pixels(&document, 1).unwrap(), second);
+    }
+
+    #[test]
+    fn a_generated_mask_only_shows_the_layer_where_the_pattern_is_bright() {
+        let mut document = cube_document();
+        document.layers[1].textures[0][0] = Some(Image::filled(768, 512, [0, 255, 0, 255]));
+        document.set_mask(1, Some(255)).unwrap();
+        with_props(&mut document, 1, |p| {
+            p.generator = Some(Generator {
+                low: 0.45,
+                high: 0.55,
+                ..Generator::default()
+            })
+        });
+        let mask = mask_pixels(&document, 1).unwrap();
+        let composite = document.composite(0, Channel::BaseColor).unwrap();
+        let (mut green, mut base) = (0, 0);
+        for (index, pixel) in composite.rgba.chunks_exact(4).enumerate() {
+            if mask[index * 4] == 255 && pixel == [0, 255, 0, 255] {
+                green += 1;
+            }
+            if mask[index * 4] == 0 && pixel != [0, 255, 0, 255] {
+                base += 1;
+            }
+        }
+        assert!(
+            green > 10_000 && base > 10_000,
+            "{green} shown, {base} hidden"
+        );
+    }
+
+    #[test]
+    fn moving_a_generated_mask_to_another_slot_makes_its_pixels_there() {
+        let mut document = Document::new({
+            let mut mesh = primitives::cube();
+            mesh.materials
+                .push(Material::new("Second", Image::filled(8, 8, [9; 4])));
+            mesh
+        });
+        document.layers[1].targets[1] = false;
+        document.set_mask(1, Some(255)).unwrap();
+        with_props(&mut document, 1, |p| {
+            p.generator = Some(Generator::default())
+        });
+        assert!(document.layers[1].textures[0][Plane::Mask.index()].is_some());
+        assert!(document.layers[1].textures[1][Plane::Mask.index()].is_none());
+        with_props(&mut document, 1, |p| p.targets[1] = true);
+        assert!(document.layers[1].textures[1][Plane::Mask.index()].is_some());
     }
 }

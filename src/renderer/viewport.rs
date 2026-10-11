@@ -157,6 +157,7 @@ fn create_gpu_materials(
                     document,
                     material,
                     channel,
+                    &[],
                 );
                 composite_slot(
                     render_state,
@@ -196,7 +197,8 @@ fn create_gpu_materials(
 }
 
 /// Makes the slot hold exactly the layers that have pixels on `material`
-/// (hidden ones too, so showing them again needs no upload).
+/// (hidden ones too, so showing them again needs no upload). Layers in
+/// `replaced` have new pixels, which are uploaded again in full.
 fn sync_slot(
     render_state: &egui_wgpu::RenderState,
     compositor: &Compositor,
@@ -204,12 +206,13 @@ fn sync_slot(
     document: &Document,
     material: usize,
     channel: Channel,
+    replaced: &[u64],
 ) {
     let mut keep = HashSet::new();
     for layer in &document.layers {
         if let Some(image) = document.layer_image(layer, material, channel) {
             keep.insert(layer.id);
-            if !compositor.has_layer(slot, layer.id) {
+            if replaced.contains(&layer.id) || !compositor.has_layer(slot, layer.id) {
                 let (device, queue) = (&render_state.device, &render_state.queue);
                 compositor.upload_layer(device, queue, slot, layer.id, image, None);
             }
@@ -304,7 +307,7 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
     let replaced: Vec<u64> = dirty
         .iter()
         .filter_map(|change| match change {
-            Dirty::Mask { layer } => Some(*layer),
+            Dirty::Mask { layer } | Dirty::Generated { layer } => Some(*layer),
             _ => None,
         })
         .collect();
@@ -312,7 +315,15 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
     if layers_changed || !replaced.is_empty() {
         for (material, gpu) in viewport.materials.iter_mut().enumerate() {
             for (slot, channel) in gpu.slots.iter_mut().zip(Channel::ALL) {
-                sync_slot(render_state, compositor, slot, document, material, channel);
+                sync_slot(
+                    render_state,
+                    compositor,
+                    slot,
+                    document,
+                    material,
+                    channel,
+                    &replaced,
+                );
             }
             sync_masks(
                 render_state,
@@ -386,7 +397,7 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
                     touched.insert((*material, *channel));
                 }
             }
-            Dirty::Layers | Dirty::Mask { .. } => {
+            Dirty::Layers | Dirty::Mask { .. } | Dirty::Generated { .. } => {
                 for material in 0..viewport.materials.len() {
                     touched.extend(Channel::ALL.map(|channel| (material, channel)));
                 }

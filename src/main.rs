@@ -2,6 +2,7 @@ mod app;
 mod document;
 mod export;
 mod files;
+mod generator;
 mod mesh;
 mod painting;
 mod project;

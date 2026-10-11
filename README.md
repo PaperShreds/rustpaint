@@ -45,6 +45,26 @@ UV island, and Blur and Smear soften or push the mask's edges. Click the
 layer's own thumbnail to paint its colours again. A mask applies to all
 channels, and is saved with the project and used for exports.
 
+**+ Fill** adds a fill layer: one value per channel everywhere on the model
+(it starts with the brush's colour, roughness and metallic; tick which channels
+it fills and change the values under the layer list). A fill layer isn't
+painted on directly, as in Substance Painter. Add a mask and paint that to say
+where the fill shows.
+
+A mask can also be made by a **generator**: **Mask > Add generator mask**. It
+fills the mask with Perlin or value noise, cells, a gradient along the X, Y
+or Z axis of the model, or **edge wear**: light along the model's convex edges,
+broken up by noise, for chipped paint. Edge wear needs sharp edges in the
+mesh (folds of 10 degrees or more, and the sharper the stronger); smooth
+surfaces and concave creases get none. Its width and how much the noise breaks
+it up are set under the layer list. Scale, detail, seed, and the levels (where the pattern
+turns black and white) are set there too; the pattern is made when
+you let go of a control. The pattern is worked out from each point's position
+on the model, not from the UV layout, so it has no seams and doesn't stretch.
+Generated masks can't be painted on; **Mask > Convert to painted mask** keeps
+the pixels as they are and lets you paint. Fill layers and generated masks are
+saved as their settings, and made again when the project opens.
+
 The brush size is in screen pixels, so zooming in paints a smaller part of the
 model, and parts further away get a bigger share of it. Tick **Keep size on
 model** to give the brush one size on the model instead: it scales with zooming
@@ -111,7 +131,9 @@ channel with its visible layers combined: `<model>_<material>_BaseColor.png`,
 existing files.
 
 Normal and height maps are not implemented yet, and the project file format may
-still change (projects with masks don't open in older versions of RustPaint).
+still change (a project doesn't open in older versions of RustPaint than the
+one that saved it). Textures that are one colour everywhere, such as the canvas
+of an untextured material, take almost no space in the file.
 Avoid using it as the only copy of important work.
 
 ## Run

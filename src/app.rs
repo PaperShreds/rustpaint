@@ -1,5 +1,6 @@
-use crate::document::{Change, Dirty, Document, LayerProps};
+use crate::document::{Change, Dirty, Document, FillValues, LayerProps, Remake};
 use crate::export;
+use crate::generator::Generator;
 use crate::mesh::{self, Image, Mesh};
 use crate::painting::brush::{self, Brush, FillMode, Tool};
 use crate::painting::history::History;
@@ -59,6 +60,8 @@ pub struct RustPaintApp {
     thumbnails_revision: Option<u64>,
     /// Settings of a layer before an opacity drag started, for its undo step.
     opacity_drag: Option<(u64, LayerProps)>,
+    /// Same for fill values being edited: the layer, and its settings before.
+    fill_edit: Option<(u64, LayerProps)>,
     /// Screen-space acceleration structure for painting; rebuilt when the view changes.
     painter: Option<StrokePainter>,
     /// The stroke in progress while the mouse button is held.
@@ -134,6 +137,7 @@ impl RustPaintApp {
             revision: 0,
             thumbnails_revision: None,
             opacity_drag: None,
+            fill_edit: None,
             painter: None,
             stroke: None,
             history: History::default(),
@@ -165,6 +169,7 @@ impl RustPaintApp {
         self.editing_mask = false;
         self.revision += 1;
         self.opacity_drag = None;
+        self.fill_edit = None;
         self.painter = None;
         self.stroke = None;
         self.history.clear();
@@ -384,13 +389,23 @@ impl RustPaintApp {
         };
         let index = self.selected_index();
         if self.stroke.is_none() {
-            self.stroke = if self.painting_mask() {
+            let on_mask = self.painting_mask();
+            self.stroke = if on_mask {
                 Stroke::begin_on_mask(&self.document, index)
             } else {
                 Stroke::begin(&self.document, index)
             };
             if self.stroke.is_none() {
-                self.status = "The base layer can't be painted on. Select or add a layer.".into();
+                let layer = &self.document.layers[index];
+                self.status = if layer.is_base() {
+                    "The base layer can't be painted on. Select or add a layer."
+                } else if layer.fill.is_some() && layer.mask.is_none() {
+                    "Fill layers are painted through their mask: add one in the Mask menu."
+                } else {
+                    "This mask is made by a generator. Mask > Convert to painted mask \
+                     lets you paint on it."
+                }
+                .into();
                 return;
             }
         } else if self.brush.tool == Tool::Fill {
@@ -437,7 +452,29 @@ impl RustPaintApp {
 
     /// Whether the brush paints the selected layer's mask.
     fn painting_mask(&self) -> bool {
-        self.editing_mask && self.document.layers[self.selected_index()].mask.is_some()
+        let layer = &self.document.layers[self.selected_index()];
+        layer.mask.is_some() && (self.editing_mask || layer.fill.is_some())
+    }
+
+    /// Records fill values edited live as one undo step.
+    fn flush_fill_edit(&mut self) {
+        let Some((id, before)) = self.fill_edit.take() else {
+            return;
+        };
+        if self
+            .document
+            .layer_index(id)
+            .is_some_and(|index| self.document.layers[index].props() != before)
+        {
+            let label = format!("Fill values of {}", self.layer_name(id));
+            self.history.push(
+                label,
+                vec![Change::Props {
+                    layer: id,
+                    props: before,
+                }],
+            );
+        }
     }
 
     /// The history panel's name for a stroke on layer `id` (on its mask, if
@@ -495,6 +532,7 @@ impl RustPaintApp {
     /// Jumps to a step picked in the history panel.
     fn go_to_history(&mut self, position: usize, frame: &eframe::Frame) {
         self.finish_stroke();
+        self.flush_fill_edit();
         self.opacity_drag = None;
         let dirty = self.history.go_to(&mut self.document, position);
         self.show_changes(&dirty, frame);
@@ -502,6 +540,7 @@ impl RustPaintApp {
 
     fn step_history(&mut self, frame: &eframe::Frame, redo: bool) {
         self.finish_stroke();
+        self.flush_fill_edit();
         self.opacity_drag = None;
         let dirty = if redo {
             self.history.redo(&mut self.document)
@@ -545,7 +584,8 @@ impl RustPaintApp {
             LayerAction::Select(index) => {
                 if let Some(layer) = self.document.layers.get(index) {
                     self.selected_layer = layer.id;
-                    self.editing_mask = false;
+                    // A fill layer is only painted through its mask.
+                    self.editing_mask = layer.fill.is_some() && layer.mask.is_some();
                 }
             }
             LayerAction::EditMask(index, on_mask) => {
@@ -567,13 +607,107 @@ impl RustPaintApp {
                 }
             }
             LayerAction::DeleteMask(layer) => {
+                // A generator goes with its mask.
+                let mut changes = Vec::new();
+                if let Some(mut change) =
+                    props_change(layer, &self.document, &|p| p.generator = None)
+                {
+                    self.document.apply(&mut change);
+                    changes.push(change);
+                }
                 if let Some(change) = self.document.set_mask(layer, None) {
+                    changes.push(change);
                     let id = self.document.layers[layer].id;
                     let label = format!("Delete mask of {}", self.name_at(layer));
-                    self.history.push(label, vec![change]);
+                    self.history.push(label, changes);
                     self.editing_mask = false;
                     self.show_changes(&[Dirty::Mask { layer: id }], frame);
                 }
+            }
+            LayerAction::AddFill => {
+                let brush = &self.brush;
+                let channels = [
+                    brush.paint_color,
+                    brush.paint_roughness,
+                    brush.paint_metallic,
+                ];
+                let fill = FillValues {
+                    color: brush
+                        .color
+                        .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
+                    roughness: brush.roughness.clamp(0.0, 1.0),
+                    metallic: brush.metallic.clamp(0.0, 1.0),
+                    channels: if channels.contains(&true) {
+                        channels
+                    } else {
+                        FillValues::default().channels
+                    },
+                };
+                let index = self.selected_index() + 1;
+                let layer = self.document.new_fill_layer(fill);
+                let (id, label) = (layer.id, format!("Add {}", layer.name));
+                let stored = Some(layer);
+                self.commit(label, Change::Layer { index, stored }, frame);
+                self.selected_layer = id;
+                self.editing_mask = false;
+            }
+            LayerAction::AddGeneratorMask(layer) => {
+                let Some(target) = self.document.layers.get(layer) else {
+                    return;
+                };
+                if target.mask.is_some() {
+                    return;
+                }
+                let label = format!("Add generator mask to {}", target.name);
+                let Some(mask_change) = self.document.set_mask(layer, Some(255)) else {
+                    return;
+                };
+                let Some(mut generate) = props_change(layer, &self.document, &|p| {
+                    p.generator = Some(Generator::default())
+                }) else {
+                    return;
+                };
+                let id = self.document.layers[layer].id;
+                let dirty = self.document.apply(&mut generate);
+                self.history.push(label, vec![mask_change, generate]);
+                self.selected_layer = id;
+                self.editing_mask = true;
+                self.show_changes(&dirty.into_iter().collect::<Vec<_>>(), frame);
+            }
+            LayerAction::ConvertGeneratorMask(layer) => {
+                if let Some(change) = props_change(layer, &self.document, &|p| p.generator = None) {
+                    let label = format!("Convert mask of {} to paint", self.name_at(layer));
+                    self.commit(label, change, frame);
+                }
+            }
+            LayerAction::Generator { layer, generator } => {
+                if let Some(change) =
+                    props_change(layer, &self.document, &|p| p.generator = Some(generator))
+                {
+                    let label = format!("Change generator of {}", self.name_at(layer));
+                    self.commit(label, change, frame);
+                }
+            }
+            LayerAction::Fill { layer, fill } => {
+                let Some(target) = self.document.layers.get(layer) else {
+                    return;
+                };
+                let id = target.id;
+                if self
+                    .fill_edit
+                    .as_ref()
+                    .is_some_and(|(edited, _)| *edited != id)
+                {
+                    self.flush_fill_edit();
+                }
+                let before = match self.fill_edit.take() {
+                    Some((_, props)) => props,
+                    None => self.document.layers[layer].props(),
+                };
+                self.document.layers[layer].fill = Some(fill);
+                self.document.regenerate(layer, Remake::FILL);
+                self.fill_edit = Some((id, before));
+                self.show_changes(&[Dirty::Generated { layer: id }], frame);
             }
             LayerAction::Add => {
                 let index = self.selected_index() + 1;
@@ -1018,6 +1152,9 @@ impl eframe::App for RustPaintApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if !ui.input(|input| input.pointer.any_down()) {
+            self.flush_fill_edit();
+        }
         let menu_state = MenuState {
             can_undo: self.history.can_undo() || self.stroke.is_some(),
             can_redo: self.history.can_redo(),

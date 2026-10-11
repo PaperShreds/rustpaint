@@ -14,17 +14,18 @@ use crate::document::{CLEAR, Change, Document, Layer, Plane, Tile};
 use crate::mesh::{Channel, Encoding, Image, ImageRegion, Mesh};
 use crate::painting::brush::{Brush, FillMode, Tool};
 use crate::painting::history;
+use crate::painting::raster::{
+    SEAM_MARGIN_TEXELS, barycentric_2d, barycentric_3d, cross, edge_margins, interpolate,
+    texel_range, uv_bounds,
+};
 use crate::renderer::camera::OrbitCamera;
 use egui::{Pos2, Rect};
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const TILE_SIZE: f32 = 32.0;
-/// Texels whose centre lies this many texels outside a triangle's UV footprint
-/// are still painted, so UV seams don't show a hairline gap.
-const SEAM_MARGIN_TEXELS: f32 = 1.0;
 /// The surface brush skips triangles facing more than ~100 degrees away from
 /// the surface under the cursor: it wraps around edges but not through walls.
 const SURFACE_MIN_FACING: f32 = -0.2;
@@ -68,7 +69,7 @@ impl Triangle {
 /// A shared edge, identified by the exact bits of its two end positions.
 type EdgeKey = ([u32; 3], [u32; 3]);
 /// Which texels of a texture the model's UVs use, row by row.
-type UvMask = Rc<Vec<bool>>;
+type UvMask = Arc<Vec<bool>>;
 /// A UV edge within one material slot, by the exact bits of its two end UVs.
 type UvEdgeKey = (usize, [u32; 2], [u32; 2]);
 
@@ -154,14 +155,25 @@ pub struct Stroke {
 
 impl Stroke {
     /// Starts a stroke on the layer at `layer_index`. The base layer can't be painted.
+    /// `None` for the base layer, and for fill layers, which are painted
+    /// through their mask.
     pub fn begin(document: &Document, layer_index: usize) -> Option<Self> {
+        Self::start(document, layer_index, false).filter(|_| {
+            document
+                .layers
+                .get(layer_index)
+                .is_some_and(|layer| layer.fill.is_none())
+        })
+    }
+
+    fn start(document: &Document, layer_index: usize, on_mask: bool) -> Option<Self> {
         let layer = document.layers.get(layer_index)?;
         if layer.is_base() {
             return None;
         }
         Some(Self {
             layer: layer.id,
-            on_mask: false,
+            on_mask,
             slots: (0..document.mesh.materials.len())
                 .map(|_| Default::default())
                 .collect(),
@@ -170,13 +182,15 @@ impl Stroke {
     }
 
     /// Starts a stroke on the mask of the layer at `layer_index`: painting
-    /// shows the layer there, erasing hides it. `None` if it has no mask.
+    /// shows the layer there, erasing hides it. `None` if it has no mask, or
+    /// its mask is made by a generator.
     pub fn begin_on_mask(document: &Document, layer_index: usize) -> Option<Self> {
-        document.layers.get(layer_index)?.mask?;
-        Some(Self {
-            on_mask: true,
-            ..Self::begin(document, layer_index)?
-        })
+        let layer = document.layers.get(layer_index)?;
+        layer.mask?;
+        if layer.mask_generator.is_some() {
+            return None;
+        }
+        Self::start(document, layer_index, true)
     }
 
     /// Whether the stroke paints the layer's mask.
@@ -244,10 +258,14 @@ pub struct StrokePainter {
     /// Indices of front-facing triangles overlapping each screen tile.
     tiles: Vec<Vec<u32>>,
     /// Every triangle edge, sorted by key, to find neighbours. Built on first use.
-    edges: OnceCell<Vec<(EdgeKey, u32)>>,
+    edges: OnceLock<Vec<(EdgeKey, u32)>>,
     /// Per (material, width, height): which texels the model's UVs use.
     /// Built when the blur brush first needs it.
-    uv_masks: RefCell<HashMap<(usize, u32, u32), UvMask>>,
+    uv_masks: Mutex<HashMap<(usize, u32, u32), UvMask>>,
+    /// What `hit` finds at the centre of each viewport pixel, once asked
+    /// (see `pixel_hit`). Texels on the same pixel share one lookup, also
+    /// across the threads that paint a segment together.
+    pixel_hits: OnceLock<Vec<AtomicU64>>,
 }
 
 impl StrokePainter {
@@ -268,8 +286,9 @@ impl StrokePainter {
             tiles_x,
             tiles_y,
             tiles: vec![Vec::new(); tiles_x * tiles_y],
-            edges: OnceCell::new(),
-            uv_masks: RefCell::default(),
+            edges: OnceLock::new(),
+            uv_masks: Mutex::default(),
+            pixel_hits: OnceLock::new(),
         };
 
         for submesh in &mesh.submeshes {
@@ -437,10 +456,11 @@ impl StrokePainter {
 
     /// Which texels of a `width` x `height` texture the triangles of
     /// `material` cover (with the seam margin), as row-major flags.
-    fn uv_mask(&self, material: usize, width: u32, height: u32) -> Rc<Vec<bool>> {
+    fn uv_mask(&self, material: usize, width: u32, height: u32) -> UvMask {
         let key = (material, width, height);
-        if let Some(mask) = self.uv_masks.borrow().get(&key) {
-            return Rc::clone(mask);
+        let masks = || self.uv_masks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mask) = masks().get(&key) {
+            return Arc::clone(mask);
         }
         let size = Vec2::new(width as f32, height as f32);
         let mut mask = vec![false; width as usize * height as usize];
@@ -468,8 +488,8 @@ impl StrokePainter {
                 }
             }
         }
-        let mask = Rc::new(mask);
-        self.uv_masks.borrow_mut().insert(key, Rc::clone(&mask));
+        let mask = Arc::new(mask);
+        masks().insert(key, Arc::clone(&mask));
         mask
     }
 
@@ -559,48 +579,163 @@ impl StrokePainter {
         radius: f32,
         hardness: f32,
     ) {
+        let brush = ScreenBrush {
+            from,
+            to,
+            radius,
+            hardness,
+        };
         let min = from.min(to) - Vec2::splat(radius);
         let max = from.max(to) + Vec2::splat(radius);
-        let corners = [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)];
-        let corner_rays = corners.map(|corner| self.ray(corner));
-
+        // Painting and erasing need no neighbouring texels, so their coverage
+        // is worked out on all CPU cores; blur and smear go one by one.
+        let in_parallel = matches!(target.effect, Effect::Paint | Effect::Erase);
+        let mut jobs = Vec::new();
         for index in self.triangles_in_screen_rect(min, max) {
             let triangle = &self.triangles[index as usize];
             if !target.stroke.allows(index) {
                 continue;
             }
-            let Some(mut slot) = target.slot(triangle.material) else {
+            // Only the part of the triangle under the brush rectangle matters.
+            // Triangles can cover far more of the texture than the brush does.
+            let Some(bounds) = self.uv_bounds_in_screen_rect(triangle, min, max) else {
                 continue;
             };
-            // Where the brush rectangle lands on this triangle's plane, in UV.
-            let bounds = corner_rays
-                .iter()
-                .map(|ray| {
-                    let point =
-                        ray_plane(self.eye, (*ray)?, triangle.position[0], triangle.normal)?;
-                    Some(interpolate(
-                        triangle.uv,
-                        barycentric_3d(point, triangle.position)?,
-                    ))
-                })
-                .collect::<Option<Vec<_>>>()
-                .map(|uvs| uv_bounds(&uvs));
+            if in_parallel {
+                // Textures are only made for slots that get painted, later.
+                let Some((width, height)) = target.slot_size(triangle.material) else {
+                    continue;
+                };
+                let (lo, hi) = bounds;
+                let area = (hi - lo) * Vec2::new(width as f32, height as f32);
+                jobs.push(ScreenJob {
+                    index,
+                    bounds,
+                    texels: (area.x.max(1.0) * area.y.max(1.0)).min(1e9) as usize,
+                });
+            } else if let Some(mut slot) = target.slot(triangle.material) {
+                slot.paint_triangle(triangle, Some(bounds), |position, texel_reach| {
+                    self.screen_coverage(&brush, position, texel_reach, index)
+                });
+            }
+        }
+        if in_parallel {
+            self.paint_screen_jobs(target, jobs, &brush);
+        }
+    }
 
-            slot.paint_triangle(triangle, bounds, |position, texel_reach| {
-                let clip = self.view_proj * position.extend(1.0);
-                if clip.w <= 0.0 || clip.z < 0.0 {
-                    return 0.0;
+    /// How much of the screen brush covers `position` on triangle `index`.
+    fn screen_coverage(
+        &self,
+        brush: &ScreenBrush,
+        position: Vec3,
+        texel_reach: f32,
+        index: u32,
+    ) -> f32 {
+        let clip = self.view_proj * position.extend(1.0);
+        if clip.w <= 0.0 || clip.z < 0.0 {
+            return 0.0;
+        }
+        let screen = self.clip_to_screen(clip);
+        let depth = (position - self.eye).dot(self.forward).max(1e-6);
+        let reach = texel_reach / (self.world_per_point * depth);
+        let distance = distance_to_segment(screen, brush.from, brush.to) - reach;
+        let coverage = falloff(distance.max(0.0), brush.radius, brush.hardness);
+        if coverage <= 0.0 || !self.is_visible(position, screen, index) {
+            return 0.0;
+        }
+        coverage
+    }
+
+    /// Paints the screen brush onto the triangles of `jobs`. Triangles that
+    /// cover much of the texture are cut into pieces, so that the cores share
+    /// them; the pieces are done in batches to keep the memory they need small.
+    fn paint_screen_jobs(
+        &self,
+        target: &mut LayerTarget,
+        jobs: Vec<ScreenJob>,
+        brush: &ScreenBrush,
+    ) {
+        /// Texels worth one unit of work, and the most a batch holds.
+        const PIECE_TEXELS: usize = 1 << 16;
+        const BATCH_TEXELS: usize = 1 << 22;
+        let mut pieces = Vec::new();
+        for job in jobs {
+            let count = job.texels.div_ceil(PIECE_TEXELS).clamp(1, 64);
+            let (lo, hi) = job.bounds;
+            for part in 0..count {
+                let v = |k: usize| lo.y + (hi.y - lo.y) * k as f32 / count as f32;
+                pieces.push(ScreenJob {
+                    bounds: (Vec2::new(lo.x, v(part)), Vec2::new(hi.x, v(part + 1))),
+                    texels: job.texels.div_ceil(count),
+                    ..job
+                });
+            }
+        }
+        let mut start = 0;
+        while start < pieces.len() {
+            let mut end = start + 1;
+            let mut total = pieces[start].texels;
+            while end < pieces.len() && total + pieces[end].texels <= BATCH_TEXELS {
+                total += pieces[end].texels;
+                end += 1;
+            }
+            self.paint_screen_batch(target, &pieces[start..end], brush);
+            start = end;
+        }
+    }
+
+    fn paint_screen_batch(
+        &self,
+        target: &mut LayerTarget,
+        batch: &[ScreenJob],
+        brush: &ScreenBrush,
+    ) {
+        let sizes = target.slot_sizes;
+        let planes: Vec<Plane> = target.values.iter().map(|(plane, _)| *plane).collect();
+        // What the stroke already covered, per slot and painted plane. A slot
+        // whose stroke buffers don't exist yet has nothing to skip.
+        let covered: Vec<Vec<&[f32]>> = target
+            .stroke
+            .slots
+            .iter()
+            .map(|slot| {
+                planes
+                    .iter()
+                    .map(|plane| slot[plane.index()].as_ref().map(|s| s.coverage.as_slice()))
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let results = parallel_filter_map_dynamic(batch, 4, |piece| {
+            let triangle = &self.triangles[piece.index as usize];
+            let (width, height) = *sizes.get(triangle.material)?;
+            let scan = TriangleScan::new(width, height, triangle, Some(piece.bounds))?;
+            let covered = &covered[triangle.material];
+            let mut texels = Vec::new();
+            for texel in scan.texels() {
+                let x = texel.raw_x.rem_euclid(width as i64) as u32;
+                let y = texel.raw_y.rem_euclid(height as i64) as u32;
+                let offset = (y * width + x) as usize;
+                if !covered.is_empty() && covered.iter().all(|plane| plane[offset] >= 1.0) {
+                    continue;
                 }
-                let screen = self.clip_to_screen(clip);
-                let depth = (position - self.eye).dot(self.forward).max(1e-6);
-                let reach = texel_reach / (self.world_per_point * depth);
-                let distance = distance_to_segment(screen, from, to) - reach;
-                let coverage = falloff(distance.max(0.0), radius, hardness);
-                if coverage <= 0.0 || !self.is_visible(position, screen, index) {
-                    return 0.0;
+                let position = interpolate(triangle.position, texel.weights);
+                let amount = self.screen_coverage(brush, position, scan.reach, piece.index);
+                if amount > 0.0 {
+                    texels.push((x, y, amount));
                 }
-                coverage
-            });
+            }
+            (!texels.is_empty()).then_some((piece.index, texels))
+        });
+        // Apply them in the order the triangles come, as one by one would.
+        for (index, texels) in results {
+            let material = self.triangles[index as usize].material;
+            if let Some(mut slot) = target.slot(material) {
+                for (x, y, amount) in texels {
+                    slot.apply(x, y, amount);
+                }
+            }
         }
     }
 
@@ -847,6 +982,62 @@ impl StrokePainter {
         found
     }
 
+    /// The UV rectangle holding the part of `triangle` that is on screen
+    /// inside `min..max` (points), or `None` if none of it is. The triangle is
+    /// clipped in clip space, so this also holds for triangles seen edge-on
+    /// or reaching behind the camera.
+    fn uv_bounds_in_screen_rect(
+        &self,
+        triangle: &Triangle,
+        min: Vec2,
+        max: Vec2,
+    ) -> Option<(Vec2, Vec2)> {
+        let (width, height) = (self.viewport.width(), self.viewport.height());
+        let low = Vec2::new(min.x / width * 2.0 - 1.0, 1.0 - max.y / height * 2.0);
+        let high = Vec2::new(max.x / width * 2.0 - 1.0, 1.0 - min.y / height * 2.0);
+        // A point of the clipped polygon: clip position and barycentric weights.
+        let mut polygon: Vec<(Vec4, [f32; 3])> = (0..3)
+            .map(|i| {
+                let mut weights = [0.0; 3];
+                weights[i] = 1.0;
+                (self.view_proj * triangle.position[i].extend(1.0), weights)
+            })
+            .collect();
+        // Keep what is on the positive side of each plane (dot with clip position).
+        let planes = [
+            Vec4::new(0.0, 0.0, 1.0, 0.0),
+            Vec4::new(1.0, 0.0, 0.0, -low.x),
+            Vec4::new(-1.0, 0.0, 0.0, high.x),
+            Vec4::new(0.0, 1.0, 0.0, -low.y),
+            Vec4::new(0.0, -1.0, 0.0, high.y),
+        ];
+        for plane in planes {
+            let mut kept = Vec::with_capacity(polygon.len() + 1);
+            for (i, &(a, weights_a)) in polygon.iter().enumerate() {
+                let (b, weights_b) = polygon[(i + 1) % polygon.len()];
+                let (side_a, side_b) = (plane.dot(a), plane.dot(b));
+                if side_a >= 0.0 {
+                    kept.push((a, weights_a));
+                }
+                if (side_a >= 0.0) != (side_b >= 0.0) {
+                    let t = side_a / (side_a - side_b);
+                    let weights =
+                        [0, 1, 2].map(|k| weights_a[k] + (weights_b[k] - weights_a[k]) * t);
+                    kept.push((a + (b - a) * t, weights));
+                }
+            }
+            polygon = kept;
+            if polygon.is_empty() {
+                return None;
+            }
+        }
+        let uvs: Vec<Vec2> = polygon
+            .iter()
+            .map(|(_, weights)| interpolate(triangle.uv, *weights))
+            .collect();
+        Some(uv_bounds(&uvs))
+    }
+
     fn to_local(&self, point: Pos2) -> Vec2 {
         Vec2::new(point.x - self.viewport.min.x, point.y - self.viewport.min.y)
     }
@@ -922,9 +1113,41 @@ impl StrokePainter {
         })
     }
 
+    /// `hit` for the pixel `screen` lies in, measured at its centre and
+    /// remembered. A texel only needs to know what is in front of its pixel,
+    /// and with stretched UVs thousands of texels share one.
+    fn pixel_hit(&self, screen: Vec2) -> Option<(u32, f32)> {
+        // A slot holds the triangle in the high half and the distance in the
+        // low half. These two triangle numbers mean "not asked yet" and
+        // "nothing there" (no model has that many triangles).
+        const UNKNOWN: u64 = u64::MAX;
+        const NOTHING: u64 = (u32::MAX as u64) << 32;
+        let (width, height) = (self.viewport.width().ceil(), self.viewport.height().ceil());
+        if screen.x < 0.0 || screen.y < 0.0 || screen.x >= width || screen.y >= height {
+            return None;
+        }
+        let (x, y) = (screen.x.floor(), screen.y.floor());
+        let hits = self.pixel_hits.get_or_init(|| {
+            (0..width as usize * height as usize)
+                .map(|_| AtomicU64::new(UNKNOWN))
+                .collect()
+        });
+        let slot = &hits[y as usize * width as usize + x as usize];
+        let mut value = slot.load(Ordering::Relaxed);
+        if value == UNKNOWN {
+            // Two threads may both work this out; they get the same answer.
+            value = match self.hit(Vec2::new(x + 0.5, y + 0.5)) {
+                Some((triangle, distance)) => (triangle as u64) << 32 | distance.to_bits() as u64,
+                None => NOTHING,
+            };
+            slot.store(value, Ordering::Relaxed);
+        }
+        (value != NOTHING).then(|| ((value >> 32) as u32, f32::from_bits(value as u32)))
+    }
+
     /// Whether `position` (on triangle `index`, seen at `screen`) is unoccluded.
     fn is_visible(&self, position: Vec3, screen: Vec2, index: u32) -> bool {
-        match self.hit(screen) {
+        match self.pixel_hit(screen) {
             Some((hit, _)) if hit == index => true,
             Some((_, distance)) => {
                 let own = position.distance(self.eye);
@@ -958,6 +1181,24 @@ fn brush_values(brush: &Brush, on_mask: bool) -> Vec<(Plane, [f32; 3])> {
         values.push((Plane::Channel(Channel::Metallic), metallic));
     }
     values
+}
+
+/// The screen-space brush: a circle dragged along a segment, in viewport points.
+struct ScreenBrush {
+    from: Vec2,
+    to: Vec2,
+    radius: f32,
+    hardness: f32,
+}
+
+/// A triangle (or a strip of it) the screen brush paints.
+#[derive(Clone, Copy)]
+struct ScreenJob {
+    index: u32,
+    /// The part of the triangle to paint, as UV bounds.
+    bounds: (Vec2, Vec2),
+    /// Rough number of texels it holds.
+    texels: usize,
 }
 
 /// The layer being painted plus the stroke's bookkeeping.
@@ -1042,6 +1283,14 @@ impl<'a> LayerTarget<'a> {
         changed
     }
 
+    /// The size of `material`'s textures if the layer paints on that slot.
+    /// Unlike `slot`, this creates nothing.
+    fn slot_size(&self, material: usize) -> Option<(u32, u32)> {
+        (self.layer.targets.get(material) == Some(&true))
+            .then(|| self.slot_sizes.get(material).copied())
+            .flatten()
+    }
+
     /// The textures of `material` to paint into (one per painted channel),
     /// created on first use. `None` if the layer doesn't paint on that slot.
     fn slot(&mut self, material: usize) -> Option<SlotTarget<'_>> {
@@ -1077,12 +1326,14 @@ impl<'a> LayerTarget<'a> {
                 continue;
             }
             let stroke = stroke.get_or_insert_with(|| SlotStroke::new(image));
+            let encoding = plane.encoding();
             channels.push(ChannelTarget {
                 image,
                 stroke,
                 region,
                 value,
-                encoding: plane.encoding(),
+                encoded_value: value.map(|v| encoding.encode(v)),
+                encoding,
             });
         }
         (!channels.is_empty()).then_some(SlotTarget {
@@ -1103,6 +1354,8 @@ struct ChannelTarget<'a> {
     stroke: &'a mut SlotStroke,
     region: &'a mut Option<ImageRegion>,
     value: [f32; 3],
+    /// `value` as stored bytes, for texels where the brush replaces what's there.
+    encoded_value: [u8; 3],
     encoding: Encoding,
 }
 
@@ -1264,6 +1517,85 @@ struct Covered {
     spread: f32,
 }
 
+/// The texels of one triangle in a `width` x `height` texture: the ones on
+/// it plus a seam margin, limited to the part inside some UV bounds.
+struct TriangleScan {
+    /// Corners in texel units, so the seam margin is the same on both axes.
+    corners: [Vec2; 3],
+    margins: [f32; 3],
+    /// World distance from a texel centre to its corners.
+    reach: f32,
+    /// Ranges of texel columns and rows to look at (not yet wrapped).
+    x: (i64, i64),
+    y: (i64, i64),
+}
+
+/// A texel found by `TriangleScan::texels`.
+struct ScannedTexel {
+    /// Texel coordinates; outside the texture when the margin wraps around.
+    raw_x: i64,
+    raw_y: i64,
+    center: Vec2,
+    weights: [f32; 3],
+}
+
+impl TriangleScan {
+    /// `None` if the triangle is degenerate in UV or `bounds` miss it.
+    fn new(
+        width: u32,
+        height: u32,
+        triangle: &Triangle,
+        bounds: Option<(Vec2, Vec2)>,
+    ) -> Option<Self> {
+        let size = Vec2::new(width as f32, height as f32);
+        let corners = triangle.uv.map(|uv| uv * size);
+        let margins = edge_margins(corners, SEAM_MARGIN_TEXELS)?;
+        let world_area = (triangle.position[1] - triangle.position[0])
+            .cross(triangle.position[2] - triangle.position[0])
+            .length();
+        let texel_area = cross(corners[1] - corners[0], corners[2] - corners[0]).abs();
+        let reach = (world_area / texel_area).sqrt() * std::f32::consts::FRAC_1_SQRT_2;
+        let (mut lo, mut hi) = uv_bounds(&corners);
+        lo -= Vec2::splat(SEAM_MARGIN_TEXELS);
+        hi += Vec2::splat(SEAM_MARGIN_TEXELS);
+        if let Some((brush_lo, brush_hi)) = bounds {
+            // Grow by a texel so texels larger than the brush are still found.
+            lo = lo.max(brush_lo * size - Vec2::ONE);
+            hi = hi.min(brush_hi * size + Vec2::ONE);
+        }
+        if lo.x > hi.x || lo.y > hi.y {
+            return None;
+        }
+        Some(Self {
+            corners,
+            margins,
+            reach,
+            x: texel_range(lo.x, hi.x, width),
+            y: texel_range(lo.y, hi.y, height),
+        })
+    }
+
+    /// The texels that lie on the triangle or in its seam margin.
+    fn texels(&self) -> impl Iterator<Item = ScannedTexel> + '_ {
+        (self.y.0..=self.y.1).flat_map(move |raw_y| {
+            (self.x.0..=self.x.1).filter_map(move |raw_x| {
+                let center = Vec2::new(raw_x as f32 + 0.5, raw_y as f32 + 0.5);
+                let weights = barycentric_2d(center, self.corners)?;
+                weights
+                    .iter()
+                    .zip(self.margins)
+                    .all(|(w, margin)| *w >= -margin)
+                    .then_some(ScannedTexel {
+                        raw_x,
+                        raw_y,
+                        center,
+                        weights,
+                    })
+            })
+        })
+    }
+}
+
 impl SlotTarget<'_> {
     /// Applies `coverage(world position, texel reach)` to every texel of
     /// `triangle` inside `bounds` (UV), or the whole triangle when bounds
@@ -1275,72 +1607,60 @@ impl SlotTarget<'_> {
         bounds: Option<(Vec2, Vec2)>,
         coverage: impl Fn(Vec3, f32) -> f32,
     ) {
-        let size = Vec2::new(self.width as f32, self.height as f32);
-        // Work in texel units so the seam margin is the same on both axes.
-        let corners = triangle.uv.map(|uv| uv * size);
-        let Some(margins) = edge_margins(corners, SEAM_MARGIN_TEXELS) else {
+        let Some(scan) = TriangleScan::new(self.width, self.height, triangle, bounds) else {
             return;
         };
-        let world_area = (triangle.position[1] - triangle.position[0])
-            .cross(triangle.position[2] - triangle.position[0])
-            .length();
-        let texel_area = cross(corners[1] - corners[0], corners[2] - corners[0]).abs();
-        let texel_reach = (world_area / texel_area).sqrt() * std::f32::consts::FRAC_1_SQRT_2;
-        let (mut lo, mut hi) = uv_bounds(&corners);
-        lo -= Vec2::splat(SEAM_MARGIN_TEXELS);
-        hi += Vec2::splat(SEAM_MARGIN_TEXELS);
-        if let Some((brush_lo, brush_hi)) = bounds {
-            // Grow by a texel so texels larger than the brush are still found.
-            lo = lo.max(brush_lo * size - Vec2::ONE);
-            hi = hi.min(brush_hi * size + Vec2::ONE);
-        }
-        if lo.x > hi.x || lo.y > hi.y {
-            return;
-        }
-
-        let (min_x, max_x) = texel_range(lo.x, hi.x, self.width);
-        let (min_y, max_y) = texel_range(lo.y, hi.y, self.height);
-        let texel_size = texel_reach * std::f32::consts::SQRT_2;
-        for raw_y in min_y..=max_y {
-            for raw_x in min_x..=max_x {
-                let center = Vec2::new(raw_x as f32 + 0.5, raw_y as f32 + 0.5);
-                let Some(weights) = barycentric_2d(center, corners) else {
-                    return;
-                };
-                if weights.iter().zip(margins).any(|(w, margin)| *w < -margin) {
-                    continue;
-                }
-                let position = interpolate(triangle.position, weights);
-                let amount = coverage(position, texel_reach);
-                if amount > 0.0 {
-                    let x = raw_x.rem_euclid(self.width as i64) as u32;
-                    let y = raw_y.rem_euclid(self.height as i64) as u32;
-                    // Blur and smear read neighbouring texels: they're done for the
-                    // whole segment at once, after every triangle (see `filter`).
-                    let (shift, spread) = match self.effect {
-                        Effect::Paint | Effect::Erase => {
-                            self.apply(x, y, amount);
+        let texel_size = scan.reach * std::f32::consts::SQRT_2;
+        for texel in scan.texels() {
+            // Painting can't add to a texel this stroke already fully covered.
+            if self.saturated(texel.raw_x, texel.raw_y) {
+                continue;
+            }
+            let position = interpolate(triangle.position, texel.weights);
+            let amount = coverage(position, scan.reach);
+            if amount > 0.0 {
+                let x = texel.raw_x.rem_euclid(self.width as i64) as u32;
+                let y = texel.raw_y.rem_euclid(self.height as i64) as u32;
+                // Blur and smear read neighbouring texels: they're done for the
+                // whole segment at once, after every triangle (see `filter`).
+                let (shift, spread) = match self.effect {
+                    Effect::Paint | Effect::Erase => {
+                        self.apply(x, y, amount);
+                        continue;
+                    }
+                    Effect::Blur(reach) => (Vec2::ZERO, reach / texel_size),
+                    Effect::Smear(motion) => {
+                        let Some(source) = barycentric_3d(position - motion, triangle.position)
+                        else {
                             continue;
-                        }
-                        Effect::Blur(reach) => (Vec2::ZERO, reach / texel_size),
-                        Effect::Smear(motion) => {
-                            let Some(source) = barycentric_3d(position - motion, triangle.position)
-                            else {
-                                continue;
-                            };
-                            (interpolate(corners, source) - center, 0.0)
-                        }
-                    };
-                    self.covered.push(Covered {
-                        x,
-                        y,
-                        amount,
-                        shift,
-                        spread,
-                    });
-                }
+                        };
+                        (interpolate(scan.corners, source) - texel.center, 0.0)
+                    }
+                };
+                self.covered.push(Covered {
+                    x,
+                    y,
+                    amount,
+                    shift,
+                    spread,
+                });
             }
         }
+    }
+
+    /// Whether painting or erasing already gave the texel full coverage in
+    /// this stroke, so more of it changes nothing. Blur and smear read the
+    /// texels around, so they always run.
+    fn saturated(&self, raw_x: i64, raw_y: i64) -> bool {
+        if !matches!(self.effect, Effect::Paint | Effect::Erase) || self.channels.is_empty() {
+            return false;
+        }
+        let x = raw_x.rem_euclid(self.width as i64) as usize;
+        let y = raw_y.rem_euclid(self.height as i64) as usize;
+        let texel = y * self.width as usize + x;
+        self.channels
+            .iter()
+            .all(|target| target.stroke.coverage[texel] >= 1.0)
     }
 
     /// Blurs or smears this segment's covered texels.
@@ -1460,10 +1780,16 @@ impl SlotTarget<'_> {
                 out[3] = (original_alpha * (1.0 - alpha) * 255.0).round() as u8;
             } else {
                 let out_alpha = alpha + original_alpha * (1.0 - alpha);
-                for (channel, value) in target.value.iter().enumerate() {
-                    let below =
-                        target.encoding.decode(original[channel]) * original_alpha * (1.0 - alpha);
-                    out[channel] = target.encoding.encode((value * alpha + below) / out_alpha);
+                if original_alpha == 0.0 || alpha >= 1.0 {
+                    // Nothing below shows through: the brush's own value.
+                    out[..3].copy_from_slice(&target.encoded_value);
+                } else {
+                    for (channel, value) in target.value.iter().enumerate() {
+                        let below = target.encoding.decode(original[channel])
+                            * original_alpha
+                            * (1.0 - alpha);
+                        out[channel] = target.encoding.encode((value * alpha + below) / out_alpha);
+                    }
                 }
                 out[3] = (out_alpha * 255.0).round() as u8;
             }
@@ -1498,6 +1824,43 @@ fn parallel_filter_map<T: Sync, R: Send>(
     })
 }
 
+/// Like `parallel_filter_map`, but threads take one item at a time as they
+/// finish, so items of very different cost still keep every core busy.
+fn parallel_filter_map_dynamic<T: Sync, R: Send>(
+    items: &[T],
+    min_items: usize,
+    f: impl Fn(&T) -> Option<R> + Sync,
+) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads < 2 || items.len() < min_items {
+        return items.iter().filter_map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut found: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = (0..threads.min(items.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            break found;
+                        };
+                        if let Some(result) = f(item) {
+                            found.push((index, result));
+                        }
+                    }
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .flat_map(|job| job.join().expect("brush worker thread panicked"))
+            .collect()
+    });
+    found.sort_unstable_by_key(|(index, _)| *index);
+    found.into_iter().map(|(_, result)| result).collect()
+}
+
 fn tiles_x(width: u32) -> u32 {
     width.div_ceil(history::TILE_SIZE)
 }
@@ -1521,84 +1884,6 @@ fn falloff(distance: f32, radius: f32, hardness: f32) -> f32 {
     }
     let t = 1.0 - (distance - inner) / (radius - inner);
     t * t * (3.0 - 2.0 * t)
-}
-
-/// How far below zero each barycentric weight may go for a point to stay
-/// within `margin` (same units as `corners`) of the triangle.
-fn edge_margins(corners: [Vec2; 3], margin: f32) -> Option<[f32; 3]> {
-    let doubled_area = cross(corners[1] - corners[0], corners[2] - corners[0]).abs();
-    if doubled_area < 1e-12 {
-        return None;
-    }
-    // Weight i is the distance to the opposite edge divided by that edge's height.
-    Some([0, 1, 2].map(|i| {
-        let edge = corners[(i + 2) % 3] - corners[(i + 1) % 3];
-        margin * edge.length() / doubled_area
-    }))
-}
-
-fn uv_bounds(points: &[Vec2]) -> (Vec2, Vec2) {
-    points.iter().fold(
-        (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
-        |(lo, hi), point| (lo.min(*point), hi.max(*point)),
-    )
-}
-
-fn texel_range(min: f32, max: f32, size: u32) -> (i64, i64) {
-    let min = min.floor() as i64;
-    let max = max.ceil() as i64;
-    if max - min + 1 > size as i64 {
-        let center = (min + max) / 2;
-        (center - size as i64 / 2, center + size as i64 / 2)
-    } else {
-        (min, max)
-    }
-}
-
-fn barycentric_2d(point: Vec2, triangle: [Vec2; 3]) -> Option<[f32; 3]> {
-    let denominator = cross(triangle[1] - triangle[0], triangle[2] - triangle[0]);
-    if denominator.abs() < 1e-12 {
-        return None;
-    }
-    let b = cross(point - triangle[0], triangle[2] - triangle[0]) / denominator;
-    let c = cross(triangle[1] - triangle[0], point - triangle[0]) / denominator;
-    Some([1.0 - b - c, b, c])
-}
-
-/// Barycentric weights of `point` projected onto the triangle's plane.
-fn barycentric_3d(point: Vec3, triangle: [Vec3; 3]) -> Option<[f32; 3]> {
-    let v0 = triangle[1] - triangle[0];
-    let v1 = triangle[2] - triangle[0];
-    let v2 = point - triangle[0];
-    let (d00, d01, d11) = (v0.dot(v0), v0.dot(v1), v1.dot(v1));
-    let (d20, d21) = (v2.dot(v0), v2.dot(v1));
-    let denominator = d00 * d11 - d01 * d01;
-    if denominator.abs() < 1e-20 {
-        return None;
-    }
-    let b = (d11 * d20 - d01 * d21) / denominator;
-    let c = (d00 * d21 - d01 * d20) / denominator;
-    Some([1.0 - b - c, b, c])
-}
-
-fn interpolate<T>(values: [T; 3], weights: [f32; 3]) -> T
-where
-    T: std::ops::Mul<f32, Output = T> + std::ops::Add<Output = T> + Copy,
-{
-    values[0] * weights[0] + values[1] * weights[1] + values[2] * weights[2]
-}
-
-fn ray_plane(origin: Vec3, direction: Vec3, plane_point: Vec3, normal: Vec3) -> Option<Vec3> {
-    let denominator = direction.dot(normal);
-    if denominator.abs() < 1e-6 {
-        return None;
-    }
-    let distance = (plane_point - origin).dot(normal) / denominator;
-    (distance > 0.0).then_some(origin + direction * distance)
-}
-
-fn cross(a: Vec2, b: Vec2) -> f32 {
-    a.x * b.y - a.y * b.x
 }
 
 fn distance_to_segment(point: Vec2, from: Vec2, to: Vec2) -> f32 {
@@ -2577,5 +2862,217 @@ mod tests {
         assert_eq!(value(20, 64), 255);
         assert_eq!(value(100, 64), 0);
         assert_eq!(value(64, 120), 0);
+    }
+
+    #[test]
+    fn brush_rect_clips_a_triangle_to_the_part_it_covers() {
+        use crate::painting::raster::uv_bounds;
+        use glam::Vec2;
+        let mesh = crate::mesh::primitives::cube();
+        let painter = StrokePainter::new(&mesh, &test_camera(), viewport());
+        // The front face's first triangle: seen head-on, it fills the middle.
+        let triangle = painter
+            .triangles
+            .iter()
+            .find(|t| t.normal.z > 0.9)
+            .expect("front face");
+        let (full_lo, full_hi) = uv_bounds(&triangle.uv);
+
+        let everything = (Vec2::splat(-10.0), Vec2::splat(300.0));
+        let (lo, hi) = painter
+            .uv_bounds_in_screen_rect(triangle, everything.0, everything.1)
+            .unwrap();
+        assert!((lo - full_lo).length() < 1e-4 && (hi - full_hi).length() < 1e-4);
+
+        // A small rectangle at the middle of the screen: a smaller part of the UVs.
+        let (lo, hi) = painter
+            .uv_bounds_in_screen_rect(triangle, Vec2::new(120.0, 120.0), Vec2::new(136.0, 136.0))
+            .unwrap();
+        assert!((hi - lo).max_element() < (full_hi - full_lo).max_element() * 0.5);
+        assert!(lo.x >= full_lo.x - 1e-4 && hi.x <= full_hi.x + 1e-4);
+
+        // Rectangles that miss the cube altogether, or are behind the screen edge.
+        for (min, max) in [
+            (Vec2::new(0.0, 0.0), Vec2::new(8.0, 8.0)),
+            (Vec2::new(300.0, 300.0), Vec2::new(400.0, 400.0)),
+        ] {
+            assert!(
+                painter
+                    .uv_bounds_in_screen_rect(triangle, min, max)
+                    .is_none()
+            );
+        }
+    }
+
+    /// Timings on a real model: `cargo test --release profile_car -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs car.glb in the project folder"]
+    fn profile_car() {
+        use glam::Vec2;
+        use std::time::Instant;
+        let mut mesh = crate::mesh::gltf_import::load(std::path::Path::new("car.glb")).unwrap();
+        println!(
+            "{} vertices, {} triangles, {} materials",
+            mesh.vertices.len(),
+            mesh.indices.len() / 3,
+            mesh.materials.len()
+        );
+        for material in &mut mesh.materials {
+            let image = &material.base_color;
+            println!("  {}: {}x{}", material.name, image.width, image.height);
+            if (image.width, image.height) == (1, 1) {
+                let pixel = [image.rgba[0], image.rgba[1], image.rgba[2], image.rgba[3]];
+                material.base_color = Image::filled(2048, 2048, pixel);
+            }
+        }
+        let mut areas: Vec<f32> = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let uv = [0, 1, 2].map(|i| Vec2::from(mesh.vertices[t[i] as usize].uv) * 2048.0);
+                crate::painting::raster::cross(uv[1] - uv[0], uv[2] - uv[0]).abs() * 0.5
+            })
+            .collect();
+        areas.sort_by(f32::total_cmp);
+        println!(
+            "UV area in texels of 2048x2048: median {:.0}, 99% {:.0}, max {:.0}; {} triangles over 100k",
+            areas[areas.len() / 2],
+            areas[areas.len() * 99 / 100],
+            areas[areas.len() - 1],
+            areas.iter().filter(|a| **a > 100_000.0).count()
+        );
+        let (center, radius) = mesh.bounds();
+        let mut camera = test_camera();
+        camera.frame(center, radius);
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1000.0, 700.0));
+
+        let start = Instant::now();
+        let painter = StrokePainter::new(&mesh, &camera, viewport);
+        println!("StrokePainter::new: {:?}", start.elapsed());
+
+        let start = Instant::now();
+        let mut document = Document::new(mesh);
+        println!("Document::new: {:?}", start.elapsed());
+        let start = Instant::now();
+        let bytes = crate::project::encode(&document).unwrap();
+        println!(
+            "project::encode: {:?} ({} MB)",
+            start.elapsed(),
+            bytes.len() >> 20
+        );
+        let sizes = document.slot_sizes();
+        {
+            use crate::generator::{Generator, Pattern, bake::Bake};
+            let start = Instant::now();
+            let bake = Bake::new(&document.mesh, 3, 2048, 2048);
+            println!(
+                "Bake::new (2048^2, incl. convex edges): {:?}",
+                start.elapsed()
+            );
+            let start = Instant::now();
+            let wear = Generator {
+                pattern: Pattern::EdgeWear,
+                ..Generator::default()
+            };
+            let values = bake.generate(&wear);
+            println!("first edge wear generate: {:?}", start.elapsed());
+            let start = Instant::now();
+            bake.generate(&wear);
+            println!("next edge wear generate: {:?}", start.elapsed());
+            println!(
+                "   lit texels: {}",
+                values.iter().filter(|v| **v > 128).count()
+            );
+        }
+        let start = Instant::now();
+        let hit = painter.surface_hit(Vec2::new(500.0, 350.0));
+        println!("one surface_hit: {:?}", start.elapsed());
+        if let Some(hit) = hit {
+            let start = Instant::now();
+            painter.connected_face(hit.triangle);
+            println!("connected_face: {:?}", start.elapsed());
+        }
+
+        for screen_space in [false, true] {
+            for textures in &mut document.layers[1].textures {
+                *textures = Default::default();
+            }
+            let brush = Brush {
+                size: 40.0,
+                screen_space,
+                color: [1.0, 0.0, 0.0],
+                ..Brush::default()
+            };
+            let mut stroke = Stroke::begin(&document, 1).unwrap();
+            let at = Pos2::new(500.0, 350.0);
+            let start = Instant::now();
+            painter.paint_segment(&mut stroke, &mut document.layers[1], &sizes, at, at, &brush);
+            let elapsed = start.elapsed();
+            let painted: usize = document.layers[1]
+                .textures
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|image| image.rgba.chunks_exact(4).filter(|p| p[3] > 0).count())
+                .sum();
+            println!("single dab screen_space={screen_space}: {painted} texels in {elapsed:?}");
+            for (slot, planes) in document.layers[1].textures.iter().enumerate() {
+                if let Some(image) = &planes[0] {
+                    let count = image.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+                    if count > 0 {
+                        println!("     slot {slot}: {count}");
+                    }
+                }
+            }
+        }
+        for (size, screen_space, over_edges) in [
+            (40.0, false, true),
+            (150.0, false, true),
+            (40.0, true, true),
+            (150.0, true, true),
+            (40.0, false, false),
+        ] {
+            let brush = Brush {
+                size,
+                screen_space,
+                paint_over_edges: over_edges,
+                color: [1.0, 0.0, 0.0],
+                ..Brush::default()
+            };
+            for textures in &mut document.layers[1].textures {
+                *textures = Default::default();
+            }
+            let mut stroke = Stroke::begin(&document, 1).unwrap();
+            let mut times = Vec::new();
+            for step in 0..6 {
+                let from = Pos2::new(400.0 + step as f32 * 12.0, 350.0);
+                let to = Pos2::new(from.x + 12.0, 350.0 + (step % 3) as f32);
+                let start = Instant::now();
+                painter.paint_segment(
+                    &mut stroke,
+                    &mut document.layers[1],
+                    &sizes,
+                    from,
+                    to,
+                    &brush,
+                );
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let painted: usize = document.layers[1]
+                .textures
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|image| image.rgba.chunks_exact(4).filter(|p| p[3] > 0).count())
+                .sum();
+            println!("   painted texels: {painted}");
+            times.sort_by(f64::total_cmp);
+            println!(
+                "size {size:>5} screen_space={screen_space:<5} over_edges={over_edges:<5}: \
+                 median {:.1} ms, worst {:.1} ms",
+                times[times.len() / 2],
+                times[times.len() - 1]
+            );
+        }
     }
 }

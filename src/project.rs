@@ -5,13 +5,23 @@
 //! textures are mostly transparent, so only their 64x64 tiles that contain
 //! paint are stored. Version 4 adds layer masks: the value where the mask
 //! is unpainted, then the tiles that differ from it, one byte per pixel.
+//! Version 5 adds fill layers and generated masks: their settings are stored
+//! and their pixels are made again on opening, so the layer's texture data
+//! is empty.
+//! Version 6 stores a texture that is one colour everywhere (such as a solid
+//! material's canvas) as a single pixel, which keeps projects and autosaves
+//! small.
+//! Version 7 adds the settings of the edge wear generator.
 //! Older versions still open: version 1 has no layers, version 2 has base
-//! colour layers only and no blend modes, version 3 has no masks.
+//! colour layers only and no blend modes, version 3 has no masks, version 4
+//! has no fill layers or generators, version 5 stores every texture in full.
 //! All counts are validated before allocating, so a damaged or hostile file
 //! produces an error instead of a crash.
 
-use crate::document::{BlendMode, CLEAR, Channel, Document, Layer, LayerProps, Plane};
+use crate::document::{BlendMode, CLEAR, Channel, Document, FillValues, Layer, LayerProps, Plane};
 use crate::files;
+use crate::generator::edges;
+use crate::generator::{Axis, Generator, Pattern};
 use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
 use crate::painting::history::TILE_SIZE;
 use std::io::Read;
@@ -21,11 +31,16 @@ const MAGIC_V1: &[u8; 8] = b"RPAINT01";
 const MAGIC_V2: &[u8; 8] = b"RPAINT02";
 const MAGIC_V3: &[u8; 8] = b"RPAINT03";
 const MAGIC_V4: &[u8; 8] = b"RPAINT04";
+const MAGIC_V5: &[u8; 8] = b"RPAINT05";
+const MAGIC_V6: &[u8; 8] = b"RPAINT06";
+const MAGIC_V7: &[u8; 8] = b"RPAINT07";
 /// Channels after base colour, stored one byte per pixel per material.
 const DATA_CHANNELS: [Channel; 2] = [Channel::Roughness, Channel::Metallic];
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SIZE_LIMIT_ERROR: &str = "project file exceeds the 4 GiB size limit";
 const MAX_LAYERS: usize = 4096;
+/// Memory the model's decoded textures may take together.
+const MAX_MATERIAL_TEXTURE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// Memory all decoded layer textures may take together.
 const MAX_LAYER_TEXTURE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_VERTICES: usize = 20_000_000;
@@ -60,8 +75,8 @@ pub fn save(path: &Path, document: &Document) -> Result<(), String> {
 
 /// The project file's contents for `document`.
 pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
-    let mut bytes = encode_mesh(&document.mesh)?;
-    bytes[..MAGIC_V4.len()].copy_from_slice(MAGIC_V4);
+    let mut bytes = encode_mesh(&document.mesh, true)?;
+    bytes[..MAGIC_V7.len()].copy_from_slice(MAGIC_V7);
     for material in &document.mesh.materials {
         for channel in DATA_CHANNELS {
             let image = material.channel(channel);
@@ -70,7 +85,12 @@ pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
             {
                 return Err("material channels differ in size".into());
             }
-            bytes.extend(image.rgba.chunks_exact(4).map(|pixel| pixel[0]));
+            if is_uniform(&image.rgba, 4) {
+                bytes.extend_from_slice(&[1, image.rgba[0]]);
+            } else {
+                let values: Vec<u8> = image.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect();
+                write_texture(&mut bytes, &values, 1);
+            }
         }
     }
     encode_layers(&mut bytes, document)?;
@@ -80,8 +100,9 @@ pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The mesh and its textures in the version 1 layout, magic included.
-fn encode_mesh(mesh: &Mesh) -> Result<Vec<u8>, String> {
+/// The mesh and its textures in the version 1 layout, magic included. With
+/// `compact`, textures are written the version 6 way (see `write_texture`).
+fn encode_mesh(mesh: &Mesh, compact: bool) -> Result<Vec<u8>, String> {
     validate_mesh(mesh)?;
     let mut encoded_size = 24_u64
         .checked_add((mesh.vertices.len() as u64) * 32)
@@ -134,7 +155,11 @@ fn encode_mesh(mesh: &Mesh) -> Result<Vec<u8>, String> {
         bytes.extend_from_slice(material.name.as_bytes());
         bytes.extend_from_slice(&material.base_color.width.to_le_bytes());
         bytes.extend_from_slice(&material.base_color.height.to_le_bytes());
-        bytes.extend_from_slice(&material.base_color.rgba);
+        if compact {
+            write_texture(&mut bytes, &material.base_color.rgba, 4);
+        } else {
+            bytes.extend_from_slice(&material.base_color.rgba);
+        }
     }
 
     if bytes.len() as u64 > MAX_PROJECT_BYTES {
@@ -146,19 +171,27 @@ fn encode_mesh(mesh: &Mesh) -> Result<Vec<u8>, String> {
 fn decode(bytes: &[u8]) -> Result<Document, String> {
     let mut reader = Reader { bytes, offset: 0 };
     let magic = reader.take(MAGIC_V1.len())?;
-    let version = [MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4]
-        .iter()
-        .position(|known| magic == *known)
-        .ok_or("not a supported RustPaint project file")?
+    let version = [
+        MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7,
+    ]
+    .iter()
+    .position(|known| magic == *known)
+    .ok_or("not a supported RustPaint project file")?
         + 1;
-    let mut mesh = decode_mesh(&mut reader)?;
+    let mut budget = MAX_MATERIAL_TEXTURE_BYTES;
+    let mut mesh = decode_mesh(&mut reader, version >= 6, &mut budget)?;
     if version >= 3 {
         for material in &mut mesh.materials {
             let (width, height) = (material.base_color.width, material.base_color.height);
             for channel in DATA_CHANNELS {
-                let values = reader.take(width as usize * height as usize)?;
+                let len = width as usize * height as usize;
+                let values = if version >= 6 {
+                    read_texture(&mut reader, len, 1, &mut budget)?
+                } else {
+                    reader.take(len)?.to_vec()
+                };
                 let image = material.channel_mut(channel);
-                for (pixel, &value) in image.rgba.chunks_exact_mut(4).zip(values) {
+                for (pixel, &value) in image.rgba.chunks_exact_mut(4).zip(&values) {
                     pixel[..3].fill(value);
                 }
             }
@@ -174,7 +207,7 @@ fn decode(bytes: &[u8]) -> Result<Document, String> {
     Ok(document)
 }
 
-fn decode_mesh(reader: &mut Reader) -> Result<Mesh, String> {
+fn decode_mesh(reader: &mut Reader, compact: bool, budget: &mut usize) -> Result<Mesh, String> {
     let vertex_count = reader.count(MAX_VERTICES, "vertex")?;
     let index_count = reader.count(MAX_INDICES, "index")?;
     let submesh_count = reader.count(MAX_SUBMESHES, "submesh")?;
@@ -241,7 +274,11 @@ fn decode_mesh(reader: &mut Reader) -> Result<Mesh, String> {
         let width = reader.u32()?;
         let height = reader.u32()?;
         let pixel_bytes = texture_byte_len(width, height)?;
-        let rgba = reader.take(pixel_bytes)?.to_vec();
+        let rgba = if compact {
+            read_texture(reader, pixel_bytes, 4, budget)?
+        } else {
+            reader.take(pixel_bytes)?.to_vec()
+        };
         // Data channels follow later in the file (version 3) or default.
         materials.push(Material::new(
             name,
@@ -281,13 +318,16 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
         }
         bytes.push(layer.mask.is_some() as u8);
         bytes.push(layer.mask.unwrap_or(0));
+        encode_fill(bytes, layer.fill.as_ref());
+        encode_generator(bytes, layer.mask_generator.as_ref());
         for (slot, channel) in
             (0..slots).flat_map(|slot| Channel::ALL.map(|channel| (slot, channel)))
         {
             let image = layer
                 .textures
                 .get(slot)
-                .and_then(|textures| textures[channel.index()].as_ref());
+                .and_then(|textures| textures[channel.index()].as_ref())
+                .filter(|_| layer.fill.is_none());
             let Some(image) = image else {
                 write_count(bytes, 0)?;
                 continue;
@@ -311,12 +351,97 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
                 let image = layer
                     .textures
                     .get(slot)
-                    .and_then(|planes| planes[Plane::Mask.index()].as_ref());
+                    .and_then(|planes| planes[Plane::Mask.index()].as_ref())
+                    .filter(|_| layer.mask_generator.is_none());
                 encode_mask(bytes, image, unpainted)?;
             }
         }
     }
     Ok(())
+}
+
+fn encode_fill(bytes: &mut Vec<u8>, fill: Option<&FillValues>) {
+    bytes.push(fill.is_some() as u8);
+    let fill = fill.copied().unwrap_or_default();
+    bytes.extend_from_slice(&fill.color);
+    bytes.extend_from_slice(&fill.roughness.to_le_bytes());
+    bytes.extend_from_slice(&fill.metallic.to_le_bytes());
+    bytes.extend(fill.channels.map(|on| on as u8));
+}
+
+fn decode_fill(reader: &mut Reader) -> Result<Option<FillValues>, String> {
+    let present = reader.flag("fill layer")?;
+    let color = reader.array::<3>()?;
+    let roughness = f32::from_le_bytes(reader.array()?);
+    let metallic = f32::from_le_bytes(reader.array()?);
+    let mut channels = [false; Channel::COUNT];
+    for on in &mut channels {
+        *on = reader.flag("fill channel")?;
+    }
+    if !roughness.is_finite() || !metallic.is_finite() {
+        return Err("project contains an invalid fill value".into());
+    }
+    Ok(present.then_some(FillValues {
+        color,
+        roughness: roughness.clamp(0.0, 1.0),
+        metallic: metallic.clamp(0.0, 1.0),
+        channels,
+    }))
+}
+
+fn encode_generator(bytes: &mut Vec<u8>, generator: Option<&Generator>) {
+    bytes.push(generator.is_some() as u8);
+    let generator = generator.copied().unwrap_or_default();
+    bytes.push(generator.pattern.index());
+    bytes.push(generator.axis.index());
+    bytes.extend_from_slice(&generator.scale.to_le_bytes());
+    bytes.extend_from_slice(&generator.octaves.to_le_bytes());
+    bytes.extend_from_slice(&generator.seed.to_le_bytes());
+    bytes.extend_from_slice(&generator.low.to_le_bytes());
+    bytes.extend_from_slice(&generator.high.to_le_bytes());
+    bytes.push(generator.invert as u8);
+    bytes.extend_from_slice(&generator.edge_width.to_le_bytes());
+    bytes.extend_from_slice(&generator.breakup.to_le_bytes());
+}
+
+fn decode_generator(reader: &mut Reader, version: usize) -> Result<Option<Generator>, String> {
+    let present = reader.flag("generator")?;
+    let pattern =
+        Pattern::from_index(reader.take(1)?[0]).ok_or("project has an unknown pattern")?;
+    let axis = Axis::from_index(reader.take(1)?[0]).ok_or("project has an unknown axis")?;
+    let scale = f32::from_le_bytes(reader.array()?);
+    let octaves = u32::from_le_bytes(reader.array()?);
+    let seed = u32::from_le_bytes(reader.array()?);
+    let low = f32::from_le_bytes(reader.array()?);
+    let high = f32::from_le_bytes(reader.array()?);
+    let invert = reader.flag("generator invert")?;
+    let defaults = Generator::default();
+    let (edge_width, breakup) = if version >= 7 {
+        (
+            f32::from_le_bytes(reader.array()?),
+            f32::from_le_bytes(reader.array()?),
+        )
+    } else {
+        (defaults.edge_width, defaults.breakup)
+    };
+    if ![scale, low, high, edge_width, breakup]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Err("project contains an invalid generator setting".into());
+    }
+    Ok(present.then_some(Generator {
+        pattern,
+        scale: scale.clamp(0.01, 1000.0),
+        octaves: octaves.clamp(1, 8),
+        seed,
+        axis,
+        low: low.clamp(0.0, 1.0),
+        high: high.clamp(0.0, 1.0),
+        invert,
+        edge_width: edge_width.clamp(0.001, edges::MAX_REACH),
+        breakup: breakup.clamp(0.0, 1.0),
+    }))
 }
 
 /// A mask image's tiles that differ from its unpainted value, one byte per pixel.
@@ -430,6 +555,8 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Docu
             opacity: opacity.clamp(0.0, 1.0),
             blend,
             targets,
+            fill: None,
+            generator: None,
         };
         if is_base {
             base = Some(props);
@@ -442,6 +569,11 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Docu
             has_mask.then_some(unpainted)
         } else {
             None
+        };
+        let (fill, generator) = if version >= 5 {
+            (decode_fill(reader)?, decode_generator(reader, version)?)
+        } else {
+            (None, None)
         };
         let mut textures: Vec<[Option<Image>; Plane::COUNT]> = Vec::with_capacity(sizes.len());
         for &(width, height) in &sizes {
@@ -467,6 +599,9 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Docu
             targets: props.targets,
             textures,
             mask,
+            fill,
+            // A generator without a mask to make would only confuse painting.
+            mask_generator: generator.filter(|_| mask.is_some()),
         });
     }
 
@@ -594,6 +729,51 @@ fn validate_mesh(mesh: &Mesh) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether every pixel of `data` equals the first. Every byte then equals the
+/// one a pixel before it, which is one fast comparison of two slices.
+fn is_uniform(data: &[u8], pixel: usize) -> bool {
+    data.len() > pixel && data[pixel..] == data[..data.len() - pixel]
+}
+
+/// Writes a texture's bytes (`pixel` bytes per pixel): a 0 and all of them,
+/// or a 1 and a single pixel when every pixel is the same.
+fn write_texture(bytes: &mut Vec<u8>, data: &[u8], pixel: usize) {
+    if is_uniform(data, pixel) {
+        bytes.push(1);
+        bytes.extend_from_slice(&data[..pixel]);
+    } else {
+        bytes.push(0);
+        bytes.extend_from_slice(data);
+    }
+}
+
+/// Reads what `write_texture` wrote: `len` bytes. `budget` is the memory
+/// still allowed for textures; a tiny file can claim a huge solid texture.
+fn read_texture(
+    reader: &mut Reader,
+    len: usize,
+    pixel: usize,
+    budget: &mut usize,
+) -> Result<Vec<u8>, String> {
+    *budget = budget
+        .checked_sub(len)
+        .ok_or("project textures need more memory than supported")?;
+    match reader.take(1)?[0] {
+        0 => Ok(reader.take(len)?.to_vec()),
+        1 => {
+            let one = reader.take(pixel)?.to_vec();
+            let mut data = Vec::new();
+            data.try_reserve_exact(len)
+                .map_err(|e| format!("could not allocate project texture: {e}"))?;
+            while data.len() < len {
+                data.extend_from_slice(&one);
+            }
+            Ok(data)
+        }
+        _ => Err("project contains an unknown texture encoding".into()),
+    }
+}
+
 fn texture_byte_len(width: u32, height: u32) -> Result<usize, String> {
     if width == 0 || height == 0 || width > MAX_TEXTURE_DIMENSION || height > MAX_TEXTURE_DIMENSION
     {
@@ -691,6 +871,69 @@ mod tests {
     }
 
     #[test]
+    fn solid_textures_are_stored_as_one_pixel() {
+        let mut mesh = primitives::cube();
+        // A solid material with a big canvas, next to the checkered one.
+        mesh.materials.push(crate::mesh::Material::with_values(
+            "Solid",
+            Image::filled(2048, 2048, [30, 60, 90, 255]),
+            0.25,
+            1.0,
+        ));
+        let document = Document::new(mesh);
+        let bytes = encode(&document).unwrap();
+        // The solid canvas alone would be 16 MB, plus 2 x 4 MB for its data channels.
+        let plain = encode(&Document::new(primitives::cube())).unwrap().len();
+        assert!(
+            bytes.len() < plain + 1_000,
+            "{} vs {plain} bytes",
+            bytes.len()
+        );
+
+        let decoded = decode(&bytes).unwrap();
+        for (a, b) in decoded.mesh.materials.iter().zip(&document.mesh.materials) {
+            assert_eq!(a.base_color.rgba, b.base_color.rgba, "{}", a.name);
+            assert_eq!(a.roughness.rgba, b.roughness.rgba, "{}", a.name);
+            assert_eq!(a.metallic.rgba, b.metallic.rgba, "{}", a.name);
+        }
+    }
+
+    #[test]
+    fn texture_encodings_are_checked_when_reading() {
+        use super::{Reader, read_texture, write_texture};
+        let mut bytes = Vec::new();
+        write_texture(&mut bytes, &[7, 7, 7, 7], 1);
+        write_texture(&mut bytes, &[1, 2, 3, 4], 1);
+        assert_eq!(bytes, [1, 7, 0, 1, 2, 3, 4]);
+        let mut reader = Reader {
+            bytes: &bytes,
+            offset: 0,
+        };
+        let mut budget = 100;
+        assert_eq!(
+            read_texture(&mut reader, 4, 1, &mut budget).unwrap(),
+            [7; 4]
+        );
+        assert_eq!(
+            read_texture(&mut reader, 4, 1, &mut budget).unwrap(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(budget, 92);
+
+        // A made-up encoding, and a solid texture that claims more memory than allowed.
+        let mut reader = Reader {
+            bytes: &[9, 0],
+            offset: 0,
+        };
+        assert!(read_texture(&mut reader, 1, 1, &mut 10).is_err());
+        let mut reader = Reader {
+            bytes: &[1, 0],
+            offset: 0,
+        };
+        assert!(read_texture(&mut reader, 1 << 30, 1, &mut 1000).is_err());
+    }
+
+    #[test]
     fn project_reader_rejects_truncated_data() {
         let mut bytes = encode(&Document::new(primitives::cube())).unwrap();
         bytes.pop();
@@ -751,6 +994,71 @@ mod tests {
     }
 
     #[test]
+    fn fill_layers_and_generated_masks_are_stored_as_settings() {
+        use crate::document::{Change, FillValues, Plane};
+        use crate::generator::{Generator, Pattern};
+        let mut document = Document::new(primitives::cube());
+        let fill = FillValues {
+            color: [10, 200, 30],
+            roughness: 0.8,
+            channels: [true, true, false],
+            ..FillValues::default()
+        };
+        let layer = document.new_fill_layer(fill);
+        document
+            .apply(&mut Change::Layer {
+                index: 2,
+                stored: Some(layer),
+            })
+            .unwrap();
+        document.set_mask(2, Some(255)).unwrap();
+        let generator = Generator {
+            pattern: Pattern::Cells,
+            seed: 12,
+            scale: 7.5,
+            octaves: 2,
+            invert: true,
+            edge_width: 0.07,
+            breakup: 0.25,
+            ..Generator::default()
+        };
+        let mut props = document.layers[2].props();
+        props.generator = Some(generator);
+        document
+            .apply(&mut Change::Props {
+                layer: document.layers[2].id,
+                props,
+            })
+            .unwrap();
+
+        let bytes = encode(&document).unwrap();
+        // The pixels aren't stored: a 768x512 mask alone would be 393 KB.
+        let plain = encode(&Document::new(primitives::cube())).unwrap().len();
+        assert!(
+            bytes.len() < plain + 1_000,
+            "{} vs {plain} bytes",
+            bytes.len()
+        );
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.layers[2].fill, Some(fill));
+        assert_eq!(decoded.layers[2].mask_generator, Some(generator));
+        let planes = |document: &Document| {
+            Plane::ALL.map(|plane| {
+                document.layers[2].textures[0][plane.index()]
+                    .as_ref()
+                    .map(|image| image.rgba.clone())
+            })
+        };
+        assert_eq!(planes(&decoded), planes(&document), "made again on opening");
+        assert!(planes(&decoded)[Plane::Mask.index()].is_some());
+        assert!(planes(&decoded)[Channel::Metallic.index()].is_none());
+        assert_eq!(
+            decoded.composite(0, Channel::BaseColor).unwrap().rgba,
+            document.composite(0, Channel::BaseColor).unwrap().rgba
+        );
+    }
+
+    #[test]
     fn layers_round_trip() {
         let document = layered_document();
         let bytes = encode(&document).unwrap();
@@ -802,13 +1110,13 @@ mod tests {
         // mask at a byte per pixel) are stored, plus one byte per pixel for
         // each data channel of the model.
         let (w, h) = document.slot_sizes()[0];
-        let base = encode_mesh(&document.mesh).unwrap().len() + 2 * (w * h) as usize;
+        let base = encode_mesh(&document.mesh, false).unwrap().len() + 2 * (w * h) as usize;
         assert!(bytes.len() < base + 2 * 64 * 64 * 4 + 64 * 64 + 1024);
     }
 
     #[test]
     fn version_1_files_open_with_the_texture_as_base_layer() {
-        let bytes = encode_mesh(&primitives::cube()).unwrap();
+        let bytes = encode_mesh(&primitives::cube(), false).unwrap();
         let document = decode(&bytes).unwrap();
         assert_eq!(document.layers.len(), 2);
         assert!(document.layers[0].is_base());
