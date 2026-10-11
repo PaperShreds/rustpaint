@@ -77,12 +77,22 @@ The **History** panel under the layers lists every step; click one to go back
 (or forward) to it.
 History isn't saved with the project.
 
+**File > Export model (.glb)...** writes the model with its painted textures
+in one file, for Blender, Godot, Unity, Unreal or a web viewer. Each material
+gets a base color texture and a metallic-roughness texture (roughness in green,
+metallic in blue, as glTF expects).
+
+While there are unsaved changes, a recovery copy is autosaved every two minutes
+(in a `recovery` folder next to the settings). If RustPaint crashes, it offers
+to restore that work on the next start. Saving or closing normally removes the
+copy.
+
 **File > Export textures...** writes, for each material slot, one PNG per
 channel with its visible layers combined: `<model>_<material>_BaseColor.png`,
 `_Roughness.png`, and `_Metallic.png` (greyscale). It asks before replacing
 existing files.
 
-Masks, normal and height maps, and autosave are not implemented yet, and the
+Layer masks, and normal and height maps, are not implemented yet, and the
 project file format may still change.
 Avoid using it as the only copy of important work.
 

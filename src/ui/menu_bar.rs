@@ -11,6 +11,7 @@ pub enum MenuAction {
     SaveProject,
     SaveProjectAs,
     ExportTextures,
+    ExportModel,
     Undo,
     Redo,
     SetView(ViewMode),
@@ -107,6 +108,13 @@ pub fn show(
                 ui.separator();
                 if ui.button("Export textures...").clicked() {
                     action = Some(MenuAction::ExportTextures);
+                }
+                if ui
+                    .button("Export model (.glb)...")
+                    .on_hover_text("The model with its painted textures, in one file")
+                    .clicked()
+                {
+                    action = Some(MenuAction::ExportModel);
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {

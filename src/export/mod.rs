@@ -1,6 +1,10 @@
-//! Exporting painted textures as image files.
+//! Exporting painted textures as image files, or the model with its
+//! textures as a `.glb` (see `glb`).
+
+pub mod glb;
 
 use crate::document::Document;
+use crate::files;
 use crate::mesh::{Channel, Encoding, Image};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -79,26 +83,11 @@ fn write_png(path: &Path, image: &Image, encoding: Encoding) -> Result<(), Strin
         }
     }
     .ok_or("texture data does not match its size")?;
-    let temporary = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        display_name(path),
-        std::process::id()
-    ));
-
-    let result = (|| {
-        let file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
-        let mut writer = std::io::BufWriter::new(file);
-        buffer
-            .write_to(&mut writer, image::ImageFormat::Png)
-            .map_err(|e| e.to_string())?;
-        let file = writer.into_inner().map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(&temporary, path).map_err(|e| e.to_string())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    let mut png = Vec::new();
+    buffer
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    files::write_atomically(path, &png)
 }
 
 fn display_name(path: &Path) -> String {

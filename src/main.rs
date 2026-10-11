@@ -1,9 +1,11 @@
 mod app;
 mod document;
 mod export;
+mod files;
 mod mesh;
 mod painting;
 mod project;
+mod recovery;
 mod renderer;
 mod settings;
 mod ui;

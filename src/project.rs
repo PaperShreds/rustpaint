@@ -9,9 +9,10 @@
 //! produces an error instead of a crash.
 
 use crate::document::{BlendMode, CLEAR, Channel, Document, Layer, LayerProps};
+use crate::files;
 use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
 use crate::painting::history::TILE_SIZE;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 const MAGIC_V1: &[u8; 8] = b"RPAINT01";
@@ -51,33 +52,11 @@ pub fn load(path: &Path) -> Result<Document, String> {
 }
 
 pub fn save(path: &Path, document: &Document) -> Result<(), String> {
-    let bytes = encode(document)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("project path has no valid file name")?;
-    let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-
-    let mut temporary_file_created = false;
-    let write_result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .map_err(|e| e.to_string())?;
-        temporary_file_created = true;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(&temporary_path, path).map_err(|e| e.to_string())
-    })();
-
-    if write_result.is_err() && temporary_file_created {
-        let _ = std::fs::remove_file(&temporary_path);
-    }
-    write_result
+    files::write_atomically(path, &encode(document)?)
 }
 
-fn encode(document: &Document) -> Result<Vec<u8>, String> {
+/// The project file's contents for `document`.
+pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
     let mut bytes = encode_mesh(&document.mesh)?;
     bytes[..MAGIC_V3.len()].copy_from_slice(MAGIC_V3);
     for material in &document.mesh.materials {

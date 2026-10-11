@@ -5,6 +5,7 @@ use crate::painting::brush::{self, Brush, FillMode, Tool};
 use crate::painting::history::History;
 use crate::painting::stroke::{Stroke, StrokePainter};
 use crate::project;
+use crate::recovery::{self, Recovered, Session};
 use crate::renderer;
 use crate::renderer::camera::OrbitCamera;
 use crate::renderer::environment::{EnvironmentSource, HdrImage};
@@ -17,6 +18,7 @@ use crate::ui::viewport::BrushCursor;
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 const PROJECT_EXTENSION: &str = "rustpaint";
 /// Untextured materials get a blank canvas of this size so they can be painted.
@@ -67,6 +69,13 @@ pub struct RustPaintApp {
     /// `history.state()` when the project was last saved or loaded.
     saved_state: u64,
     window_title: String,
+    /// This instance's autosave slot; `None` if autosave couldn't start.
+    session: Option<Session>,
+    /// Autosaves left behind by a crash, offered for restoring one at a time.
+    recovery_offers: Vec<Recovered>,
+    last_autosave: Instant,
+    /// `history.state()` of the current recovery copy, if there is one.
+    autosaved_state: Option<u64>,
 }
 
 impl RustPaintApp {
@@ -88,6 +97,16 @@ impl RustPaintApp {
                 rgba: vec![0.5, 0.5, 0.5, 1.0],
             }
         });
+        let (session, recovery_offers) = match eframe::storage_dir("RustPaint") {
+            Some(directory) => match Session::start(&directory.join("recovery")) {
+                Ok((session, offers)) => (Some(session), offers),
+                Err(error) => {
+                    status = format!("Autosave is off: {error}");
+                    (None, Vec::new())
+                }
+            },
+            None => (None, Vec::new()),
+        };
         let document = Document::new(mesh::primitives::cube());
         renderer::viewport::init(cc, &document, &environment);
         Self {
@@ -116,6 +135,10 @@ impl RustPaintApp {
             project_path: None,
             saved_state: 0,
             window_title: String::new(),
+            session,
+            recovery_offers,
+            last_autosave: Instant::now(),
+            autosaved_state: None,
         }
     }
 
@@ -253,6 +276,31 @@ impl RustPaintApp {
             Err(error) => {
                 self.status = format!("Export failed: {error}");
             }
+        }
+    }
+
+    fn export_model(&mut self) {
+        self.finish_stroke();
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export model")
+            .add_filter("glTF binary", &["glb"])
+            .set_file_name(format!("{}.glb", self.model_name));
+        if let Some(directory) = &self.export_directory {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("glb");
+        }
+        let name = file_name(&path);
+        match export::glb::write(&path, &self.document, &self.model_name) {
+            Ok(()) => {
+                self.status = format!("Exported {name}");
+                self.export_directory = path.parent().map(Path::to_path_buf);
+            }
+            Err(error) => self.status = format!("Failed to export {name}: {error}"),
         }
     }
 
@@ -735,6 +783,129 @@ impl RustPaintApp {
         }
     }
 
+    /// Writes a recovery copy every `AUTOSAVE_INTERVAL` while there are
+    /// unsaved changes (between strokes), and removes it once there are none.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        let unsaved = self.has_unsaved_changes();
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if !unsaved {
+            if self.autosaved_state.take().is_some() {
+                session.clear();
+            }
+            return;
+        }
+        let state = self.history.state();
+        if self.autosaved_state == Some(state) || self.stroke.is_some() {
+            return;
+        }
+        let remaining = recovery::AUTOSAVE_INTERVAL.saturating_sub(self.last_autosave.elapsed());
+        if !remaining.is_zero() {
+            ctx.request_repaint_after(remaining);
+            return;
+        }
+        let info = recovery::Info {
+            project_path: self.project_path.clone(),
+            model_name: self.model_name.clone(),
+        };
+        match session.autosave(&self.document, &info) {
+            Ok(true) => {
+                self.autosaved_state = Some(state);
+                self.last_autosave = Instant::now();
+            }
+            // The previous autosave is still being written; try again shortly.
+            Ok(false) => ctx.request_repaint_after(Duration::from_millis(250)),
+            Err(error) => {
+                self.status = format!("Autosave failed: {error}");
+                self.last_autosave = Instant::now();
+            }
+        }
+    }
+
+    /// After a crash: "Recover unsaved work?" with Restore / Discard / Not now.
+    fn recovery_dialog(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(offer) = self.recovery_offers.first() else {
+            return;
+        };
+        let name = offer.info.project_path.as_deref().map_or_else(
+            || format!("{} (never saved as a project)", offer.info.model_name),
+            file_name,
+        );
+        let age = describe_age(offer.saved_at);
+
+        #[derive(Clone, Copy)]
+        enum Choice {
+            Restore,
+            Discard,
+            Later,
+        }
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("recover_work")).show(ctx, |ui| {
+            ui.heading("Recover unsaved work?");
+            ui.label("RustPaint didn't close properly last time.");
+            ui.label(format!("An autosave of {name} from {age} was found."));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Restore").clicked() {
+                    choice = Some(Choice::Restore);
+                }
+                if ui.button("Discard").clicked() {
+                    choice = Some(Choice::Discard);
+                }
+                if ui
+                    .button("Not now")
+                    .on_hover_text("Keep the autosave and ask again next time")
+                    .clicked()
+                {
+                    choice = Some(Choice::Later);
+                }
+            });
+        });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(Choice::Later);
+        }
+        let Some(choice) = choice else {
+            return;
+        };
+        let offer = self.recovery_offers.remove(0);
+        match choice {
+            Choice::Restore => self.restore(offer, frame),
+            Choice::Discard => offer.discard(),
+            Choice::Later => {}
+        }
+    }
+
+    fn restore(&mut self, offer: Recovered, frame: &eframe::Frame) {
+        let document = match offer.load() {
+            Ok(document) => document,
+            Err(error) => {
+                self.status = format!("Could not restore the autosave: {error}");
+                return;
+            }
+        };
+        self.set_document(document, frame);
+        let info = offer.info.clone();
+        if let Some(path) = &info.project_path {
+            self.remember_source(path);
+        }
+        self.model_name = info.model_name;
+        self.project_path = info.project_path;
+        // Not saved anywhere yet: keep it marked as unsaved.
+        self.saved_state = u64::MAX;
+        if let Some(session) = self.session.as_mut() {
+            match session.adopt(offer) {
+                Ok(()) => self.autosaved_state = Some(self.history.state()),
+                Err(error) => self.status = format!("Autosave: {error}"),
+            }
+        }
+        self.last_autosave = Instant::now();
+        self.status = "Restored the autosave. Save it to keep it.".into();
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
         let document = self
             .project_path
@@ -753,6 +924,14 @@ impl eframe::App for RustPaintApp {
     /// Called by eframe every so often and on exit.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.settings().save(storage);
+    }
+
+    /// A clean exit: the work was saved or deliberately discarded, so the
+    /// recovery copy goes.
+    fn on_exit(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.close();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -797,6 +976,7 @@ impl eframe::App for RustPaintApp {
             Some(MenuAction::SaveProject) => self.save_project(false),
             Some(MenuAction::SaveProjectAs) => self.save_project(true),
             Some(MenuAction::ExportTextures) => self.export_textures(),
+            Some(MenuAction::ExportModel) => self.export_model(),
             Some(MenuAction::Undo) => self.step_history(frame, false),
             Some(MenuAction::Redo) => self.step_history(frame, true),
             Some(MenuAction::SetView(mode)) => self.view_mode = mode,
@@ -855,6 +1035,8 @@ impl eframe::App for RustPaintApp {
 
         let ctx = ui.ctx().clone();
         self.unsaved_changes_dialog(&ctx, frame);
+        self.recovery_dialog(&ctx, frame);
+        self.autosave(&ctx);
         self.update_window_title(&ctx);
     }
 }
@@ -876,4 +1058,16 @@ fn give_solid_materials_a_canvas(mesh: &mut Mesh) {
             material.base_color = Image::filled(DEFAULT_CANVAS_SIZE, DEFAULT_CANVAS_SIZE, pixel);
         }
     }
+}
+
+/// "just now", "5 minutes ago", "3 hours ago" or "2 days ago".
+fn describe_age(time: SystemTime) -> String {
+    let seconds = time.elapsed().unwrap_or_default().as_secs();
+    let (amount, unit) = match seconds {
+        0..60 => return "just now".to_string(),
+        60..3600 => (seconds / 60, "minute"),
+        3600..86400 => (seconds / 3600, "hour"),
+        _ => (seconds / 86400, "day"),
+    };
+    format!("{amount} {unit}{} ago", if amount == 1 { "" } else { "s" })
 }
