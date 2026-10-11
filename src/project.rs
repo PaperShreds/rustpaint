@@ -12,13 +12,16 @@
 //! material's canvas) as a single pixel, which keeps projects and autosaves
 //! small.
 //! Version 7 adds the settings of the edge wear generator.
+//! Version 8 adds the second colour (and its pattern) of a fill layer.
 //! Older versions still open: version 1 has no layers, version 2 has base
 //! colour layers only and no blend modes, version 3 has no masks, version 4
 //! has no fill layers or generators, version 5 stores every texture in full.
 //! All counts are validated before allocating, so a damaged or hostile file
 //! produces an error instead of a crash.
 
-use crate::document::{BlendMode, CLEAR, Channel, Document, FillValues, Layer, LayerProps, Plane};
+use crate::document::{
+    BlendMode, CLEAR, Channel, Document, FillMix, FillValues, Layer, LayerProps, Plane,
+};
 use crate::files;
 use crate::generator::edges;
 use crate::generator::{Axis, Generator, Pattern};
@@ -34,6 +37,7 @@ const MAGIC_V4: &[u8; 8] = b"RPAINT04";
 const MAGIC_V5: &[u8; 8] = b"RPAINT05";
 const MAGIC_V6: &[u8; 8] = b"RPAINT06";
 const MAGIC_V7: &[u8; 8] = b"RPAINT07";
+const MAGIC_V8: &[u8; 8] = b"RPAINT08";
 /// Channels after base colour, stored one byte per pixel per material.
 const DATA_CHANNELS: [Channel; 2] = [Channel::Roughness, Channel::Metallic];
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -76,7 +80,7 @@ pub fn save(path: &Path, document: &Document) -> Result<(), String> {
 /// The project file's contents for `document`.
 pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
     let mut bytes = encode_mesh(&document.mesh, true)?;
-    bytes[..MAGIC_V7.len()].copy_from_slice(MAGIC_V7);
+    bytes[..MAGIC_V8.len()].copy_from_slice(MAGIC_V8);
     for material in &document.mesh.materials {
         for channel in DATA_CHANNELS {
             let image = material.channel(channel);
@@ -172,7 +176,7 @@ fn decode(bytes: &[u8]) -> Result<Document, String> {
     let mut reader = Reader { bytes, offset: 0 };
     let magic = reader.take(MAGIC_V1.len())?;
     let version = [
-        MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7,
+        MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8,
     ]
     .iter()
     .position(|known| magic == *known)
@@ -367,9 +371,15 @@ fn encode_fill(bytes: &mut Vec<u8>, fill: Option<&FillValues>) {
     bytes.extend_from_slice(&fill.roughness.to_le_bytes());
     bytes.extend_from_slice(&fill.metallic.to_le_bytes());
     bytes.extend(fill.channels.map(|on| on as u8));
+    bytes.push(fill.mix.is_some() as u8);
+    let mix = fill.mix.unwrap_or_default();
+    bytes.extend_from_slice(&mix.color);
+    bytes.extend_from_slice(&mix.roughness.to_le_bytes());
+    bytes.extend_from_slice(&mix.metallic.to_le_bytes());
+    encode_generator(bytes, Some(&mix.generator));
 }
 
-fn decode_fill(reader: &mut Reader) -> Result<Option<FillValues>, String> {
+fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>, String> {
     let present = reader.flag("fill layer")?;
     let color = reader.array::<3>()?;
     let roughness = f32::from_le_bytes(reader.array()?);
@@ -378,6 +388,24 @@ fn decode_fill(reader: &mut Reader) -> Result<Option<FillValues>, String> {
     for on in &mut channels {
         *on = reader.flag("fill channel")?;
     }
+    let mix = if version >= 8 {
+        let mixed = reader.flag("fill mix")?;
+        let color = reader.array::<3>()?;
+        let roughness = f32::from_le_bytes(reader.array()?);
+        let metallic = f32::from_le_bytes(reader.array()?);
+        let generator = decode_generator(reader, version)?.unwrap_or_default();
+        if !roughness.is_finite() || !metallic.is_finite() {
+            return Err("project contains an invalid fill value".into());
+        }
+        mixed.then_some(FillMix {
+            color,
+            roughness: roughness.clamp(0.0, 1.0),
+            metallic: metallic.clamp(0.0, 1.0),
+            generator,
+        })
+    } else {
+        None
+    };
     if !roughness.is_finite() || !metallic.is_finite() {
         return Err("project contains an invalid fill value".into());
     }
@@ -386,6 +414,7 @@ fn decode_fill(reader: &mut Reader) -> Result<Option<FillValues>, String> {
         roughness: roughness.clamp(0.0, 1.0),
         metallic: metallic.clamp(0.0, 1.0),
         channels,
+        mix,
     }))
 }
 
@@ -571,7 +600,10 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Docu
             None
         };
         let (fill, generator) = if version >= 5 {
-            (decode_fill(reader)?, decode_generator(reader, version)?)
+            (
+                decode_fill(reader, version)?,
+                decode_generator(reader, version)?,
+            )
         } else {
             (None, None)
         };
@@ -1001,8 +1033,18 @@ mod tests {
         let fill = FillValues {
             color: [10, 200, 30],
             roughness: 0.8,
+            metallic: 0.0,
             channels: [true, true, false],
-            ..FillValues::default()
+            mix: Some(crate::document::FillMix {
+                color: [90, 40, 10],
+                roughness: 0.3,
+                metallic: 0.6,
+                generator: Generator {
+                    pattern: Pattern::EdgeWear,
+                    seed: 5,
+                    ..Generator::default()
+                },
+            }),
         };
         let layer = document.new_fill_layer(fill);
         document

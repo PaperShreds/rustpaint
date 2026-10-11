@@ -135,6 +135,30 @@ pub struct FillValues {
     pub metallic: f32,
     /// Which channels the layer fills (the others are left to the layers below).
     pub channels: [bool; Channel::COUNT],
+    /// A second set of values and the pattern that mixes them in.
+    pub mix: Option<FillMix>,
+}
+
+/// A fill layer's second look: where its pattern is 1 the layer has these
+/// values, where it is 0 the fill's own, and in between a blend.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FillMix {
+    /// Base colour, sRGB-encoded.
+    pub color: [u8; 3],
+    pub roughness: f32,
+    pub metallic: f32,
+    pub generator: Generator,
+}
+
+impl Default for FillMix {
+    fn default() -> Self {
+        Self {
+            color: [90, 90, 90],
+            roughness: 0.5,
+            metallic: 0.0,
+            generator: Generator::default(),
+        }
+    }
 }
 
 impl Default for FillValues {
@@ -144,6 +168,7 @@ impl Default for FillValues {
             roughness: 0.5,
             metallic: 0.0,
             channels: [true, false, false],
+            mix: None,
         }
     }
 }
@@ -160,6 +185,34 @@ impl FillValues {
             Channel::Roughness => data(self.roughness),
             Channel::Metallic => data(self.metallic),
         }
+    }
+
+    /// The pixel for every pattern value from 0 to 255: the fill's own
+    /// values at 0, the mix's at 255. Colours blend in linear light.
+    pub fn ramp(&self, channel: Channel) -> [[u8; 4]; 256] {
+        let from = self.pixel(channel);
+        let Some(mix) = self.mix else {
+            return [from; 256];
+        };
+        let to = FillValues {
+            color: mix.color,
+            roughness: mix.roughness,
+            metallic: mix.metallic,
+            ..*self
+        }
+        .pixel(channel);
+        let encoding = match channel {
+            Channel::BaseColor => Encoding::Srgb,
+            _ => Encoding::Linear,
+        };
+        std::array::from_fn(|step| {
+            let t = step as f32 / 255.0;
+            let blend = |c: usize| {
+                let (a, b) = (encoding.decode(from[c]), encoding.decode(to[c]));
+                encoding.encode(a + (b - a) * t)
+            };
+            [blend(0), blend(1), blend(2), 255]
+        })
     }
 }
 
@@ -757,14 +810,39 @@ fn refresh_layer(layer: &mut Layer, mesh: &Mesh, bakes: &BakeCache, remake: Rema
                 .as_ref()
                 .is_some_and(|image| (image.width, image.height) == (width, height))
         };
+        let bake = || {
+            bakes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry((slot, width, height))
+                .or_insert_with(|| Arc::new(Bake::new(mesh, slot, width, height)))
+                .clone()
+        };
         if let Some(fill) = layer.fill.filter(|_| remake.fill) {
+            // Only a mixed fill needs the pattern, and only on a slot it fills.
+            let mut mixed = None;
             for channel in Channel::ALL {
                 let plane = &mut planes[channel.index()];
                 let wanted = targeted && fill.channels[channel.index()];
                 if !wanted {
                     *plane = None;
                 } else if !(only_missing && current(plane)) {
-                    *plane = Some(Image::filled(width, height, fill.pixel(channel)));
+                    *plane = Some(match fill.mix {
+                        None => Image::filled(width, height, fill.pixel(channel)),
+                        Some(mix) => {
+                            let values =
+                                mixed.get_or_insert_with(|| bake().generate_cached(&mix.generator));
+                            let ramp = fill.ramp(channel);
+                            Image {
+                                width,
+                                height,
+                                rgba: values
+                                    .iter()
+                                    .flat_map(|&value| ramp[value as usize])
+                                    .collect(),
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -773,16 +851,10 @@ fn refresh_layer(layer: &mut Layer, mesh: &Mesh, bakes: &BakeCache, remake: Rema
             if !targeted {
                 *plane = None;
             } else if !(only_missing && current(plane)) {
-                let bake = bakes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .entry((slot, width, height))
-                    .or_insert_with(|| Arc::new(Bake::new(mesh, slot, width, height)))
-                    .clone();
-                let rgba = bake
-                    .generate(&generator)
-                    .into_iter()
-                    .flat_map(|value| [value, value, value, 255])
+                let rgba = bake()
+                    .generate_cached(&generator)
+                    .iter()
+                    .flat_map(|&value| [value, value, value, 255])
                     .collect();
                 *plane = Some(Image {
                     width,
@@ -807,7 +879,7 @@ fn swap_tile(image: &mut Image, tile: &mut Tile) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlendMode, CLEAR, Change, Document, FillValues, LayerProps, Plane};
+    use super::{BlendMode, CLEAR, Change, Document, FillMix, FillValues, LayerProps, Plane};
     use crate::generator::Generator;
     use crate::mesh::Channel;
     use crate::mesh::{Image, ImageRegion, Material, primitives};
@@ -1253,5 +1325,83 @@ mod tests {
         assert!(document.layers[1].textures[1][Plane::Mask.index()].is_none());
         with_props(&mut document, 1, |p| p.targets[1] = true);
         assert!(document.layers[1].textures[1][Plane::Mask.index()].is_some());
+    }
+
+    #[test]
+    fn a_fill_mix_blends_between_two_looks_in_linear_light() {
+        let plain = FillValues {
+            color: [255, 255, 255],
+            roughness: 0.2,
+            ..FillValues::default()
+        };
+        assert!(
+            plain
+                .ramp(Channel::BaseColor)
+                .iter()
+                .all(|p| *p == plain.pixel(Channel::BaseColor))
+        );
+        let mixed = FillValues {
+            mix: Some(FillMix {
+                color: [0, 0, 0],
+                roughness: 0.8,
+                ..FillMix::default()
+            }),
+            ..plain
+        };
+        let colors = mixed.ramp(Channel::BaseColor);
+        assert_eq!(colors[0], [255, 255, 255, 255], "pattern 0: the fill's own");
+        assert_eq!(colors[255], [0, 0, 0, 255], "pattern 1: the second look");
+        // Half of white's light is brighter than half of its sRGB number.
+        assert!(colors[128][0] > 170, "{:?}", colors[128]);
+        let roughness = mixed.ramp(Channel::Roughness);
+        assert_eq!(roughness[0][0], 51);
+        assert_eq!(roughness[255][0], 204);
+    }
+
+    #[test]
+    fn a_mixed_fill_layer_varies_over_the_model_and_follows_undo() {
+        let mut document = cube_document();
+        let fill = FillValues {
+            color: [255, 0, 0],
+            mix: Some(FillMix {
+                color: [0, 0, 255],
+                generator: Generator {
+                    low: 0.4,
+                    high: 0.6,
+                    ..Generator::default()
+                },
+                ..FillMix::default()
+            }),
+            ..FillValues::default()
+        };
+        let layer = document.new_fill_layer(fill);
+        document
+            .apply(&mut Change::Layer {
+                index: 2,
+                stored: Some(layer),
+            })
+            .unwrap();
+        let image = document.layers[2].textures[0][Channel::BaseColor.index()]
+            .as_ref()
+            .expect("filled");
+        let count = |color: [u8; 4]| image.rgba.chunks_exact(4).filter(|p| *p == color).count();
+        let (red, blue) = (count([255, 0, 0, 255]), count([0, 0, 255, 255]));
+        assert!(red > 10_000 && blue > 10_000, "{red} red, {blue} blue");
+
+        let mut change = with_props(&mut document, 2, |p| p.fill = Some(FillValues::default()));
+        let image = document.layers[2].textures[0][Channel::BaseColor.index()]
+            .as_ref()
+            .unwrap();
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .all(|p| p == [200, 200, 200, 255])
+        );
+        document.apply(&mut change).unwrap();
+        let image = document.layers[2].textures[0][Channel::BaseColor.index()]
+            .as_ref()
+            .unwrap();
+        assert!(image.rgba.chunks_exact(4).any(|p| p == [0, 0, 255, 255]));
     }
 }

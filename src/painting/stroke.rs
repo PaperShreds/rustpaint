@@ -2966,7 +2966,7 @@ mod tests {
             let start = Instant::now();
             let bake = Bake::new(&document.mesh, 3, 2048, 2048);
             println!(
-                "Bake::new (2048^2, incl. convex edges): {:?}",
+                "Bake::new (2048^2, incl. convex edges and creases): {:?}",
                 start.elapsed()
             );
             let start = Instant::now();
@@ -2982,6 +2982,16 @@ mod tests {
             println!(
                 "   lit texels: {}",
                 values.iter().filter(|v| **v > 128).count()
+            );
+            let start = Instant::now();
+            let cavity = bake.generate(&Generator {
+                pattern: Pattern::Cavity,
+                ..Generator::default()
+            });
+            println!("first cavity generate: {:?}", start.elapsed());
+            println!(
+                "   lit texels: {}",
+                cavity.iter().filter(|v| **v > 128).count()
             );
         }
         let start = Instant::now();

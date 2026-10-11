@@ -4,14 +4,14 @@
 //! colour gives a "position map". A pattern evaluated at those positions
 //! doesn't care where the UV islands lie, so it has no seams.
 
-use super::edges::ConvexEdges;
-use super::{Frame, Generator, Pattern};
+use super::edges::{Edges, Fold};
+use super::{Frame, Generator};
 use crate::mesh::Mesh;
 use crate::painting::raster::{
     SEAM_MARGIN_TEXELS, barycentric_2d, edge_margins, interpolate, texel_range, uv_bounds,
 };
 use glam::{Vec2, Vec3};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// How sure we are that a texel belongs to the model.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,11 +29,16 @@ pub struct Bake {
     pub frame: Frame,
     positions: Vec<Vec3>,
     cover: Vec<Cover>,
-    edges: ConvexEdges,
-    /// Distance from each texel to the nearest convex edge, found when edge
-    /// wear first needs it.
-    edge_distance: OnceLock<Vec<f32>>,
+    edges: Edges,
+    /// Distance from each texel to the nearest convex edge and the nearest
+    /// crease, each found when a pattern first needs it.
+    fold_distance: [OnceLock<Vec<f32>>; 2],
+    /// The latest results of `generate_cached`, newest last.
+    recent: Mutex<Vec<(Generator, Arc<Vec<u8>>)>>,
 }
+
+/// How many generated results a bake keeps for reuse.
+const RECENT_RESULTS: usize = 4;
 
 impl Bake {
     pub fn new(mesh: &Mesh, material: usize, width: u32, height: u32) -> Self {
@@ -42,8 +47,9 @@ impl Bake {
             width,
             height,
             frame: Frame::of(mesh),
-            edges: ConvexEdges::new(mesh, &Frame::of(mesh)),
-            edge_distance: OnceLock::new(),
+            edges: Edges::new(mesh, &Frame::of(mesh)),
+            fold_distance: [OnceLock::new(), OnceLock::new()],
+            recent: Mutex::new(Vec::new()),
             positions: vec![Vec3::ZERO; count],
             cover: vec![Cover::None; count],
         };
@@ -126,23 +132,38 @@ impl Bake {
     /// Runs `generator` on every covered texel: its value as a byte (0..255),
     /// row by row. Texels off the model are 0. Spread over the CPU cores.
     pub fn generate(&self, generator: &Generator) -> Vec<u8> {
-        let wear = (generator.pattern == Pattern::EdgeWear).then(|| {
-            self.edge_distance
-                .get_or_init(|| self.measure_edge_distance())
+        let folds = generator.pattern.fold().map(|fold| {
+            self.fold_distance[fold as usize].get_or_init(|| self.measure_fold_distance(fold))
         });
         let mut values = vec![0u8; self.cover.len()];
         self.for_each_texel(&mut values, |texel, value| {
-            let edge_distance = wear.map_or(f32::INFINITY, |wear| wear[texel]);
+            let edge_distance = folds.map_or(f32::INFINITY, |distances| distances[texel]);
             let v = generator.sample(self.positions[texel], &self.frame, edge_distance);
             *value = (v * 255.0).round() as u8;
         });
         values
     }
 
-    fn measure_edge_distance(&self) -> Vec<f32> {
+    /// `generate`, but remembers the last few results: changing only what
+    /// is made *from* a pattern (a colour, say) doesn't run it again.
+    pub fn generate_cached(&self, generator: &Generator) -> Arc<Vec<u8>> {
+        let lock = || self.recent.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, values)) = lock().iter().find(|(g, _)| g == generator) {
+            return values.clone();
+        }
+        let values = Arc::new(self.generate(generator));
+        let mut recent = lock();
+        if recent.len() >= RECENT_RESULTS {
+            recent.remove(0);
+        }
+        recent.push((*generator, values.clone()));
+        values
+    }
+
+    fn measure_fold_distance(&self, fold: Fold) -> Vec<f32> {
         let mut distances = vec![f32::INFINITY; self.cover.len()];
         self.for_each_texel(&mut distances, |texel, distance| {
-            *distance = self.edges.distance(self.positions[texel]);
+            *distance = self.edges.distance(self.positions[texel], fold);
         });
         distances
     }
@@ -245,6 +266,20 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_pattern_is_reused() {
+        let bake = Bake::new(&primitives::cube(), 0, 64, 64);
+        let generator = Generator::default();
+        let first = bake.generate_cached(&generator);
+        assert!(Arc::ptr_eq(&first, &bake.generate_cached(&generator)));
+        assert_eq!(*first, bake.generate(&generator));
+        let other = Generator {
+            seed: 9,
+            ..generator
+        };
+        assert_ne!(first, bake.generate_cached(&other));
+    }
+
+    #[test]
     fn edge_wear_hugs_the_edges_of_the_model() {
         let bake = bake();
         let wear = Generator {
@@ -286,6 +321,30 @@ mod tests {
         });
         let sum = |v: &[u8]| v.iter().map(|&b| b as u64).sum::<u64>();
         assert_ne!(sum(&broken), sum(&values));
+    }
+
+    #[test]
+    fn cavity_lights_the_creases_and_edge_wear_the_edges() {
+        let lit = |mesh: &Mesh, pattern| {
+            let bake = Bake::new(mesh, 0, 768, 512);
+            let values = bake.generate(&Generator {
+                pattern,
+                edge_width: 0.05,
+                breakup: 0.0,
+                ..Generator::default()
+            });
+            values.iter().filter(|&&value| value > 150).count()
+        };
+        let outside = primitives::cube();
+        let mut inside = primitives::cube();
+        for triangle in inside.indices.chunks_exact_mut(3) {
+            triangle.swap(1, 2);
+        }
+        // A box has edges and no creases; turned inside out, the other way round.
+        assert!(lit(&outside, Pattern::EdgeWear) > 1000);
+        assert_eq!(lit(&outside, Pattern::Cavity), 0);
+        assert_eq!(lit(&inside, Pattern::EdgeWear), 0);
+        assert!(lit(&inside, Pattern::Cavity) > 1000);
     }
 
     #[test]

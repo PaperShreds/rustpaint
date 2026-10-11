@@ -64,15 +64,18 @@ pub enum Pattern {
     Gradient,
     /// Light along the model's convex edges, broken up by noise: worn paint.
     EdgeWear,
+    /// Light in the model's concave creases, broken up by noise: dirt.
+    Cavity,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 5] = [
+    pub const ALL: [Pattern; 6] = [
         Pattern::Value,
         Pattern::Perlin,
         Pattern::Cells,
         Pattern::Gradient,
         Pattern::EdgeWear,
+        Pattern::Cavity,
     ];
 
     pub fn name(self) -> &'static str {
@@ -82,6 +85,7 @@ impl Pattern {
             Pattern::Cells => "Cells",
             Pattern::Gradient => "Gradient",
             Pattern::EdgeWear => "Edge wear",
+            Pattern::Cavity => "Cavity",
         }
     }
 
@@ -92,6 +96,15 @@ impl Pattern {
 
     pub fn from_index(index: u8) -> Option<Self> {
         Self::ALL.get(index as usize).copied()
+    }
+
+    /// The kind of fold the pattern follows, if it follows one.
+    pub fn fold(self) -> Option<edges::Fold> {
+        match self {
+            Pattern::EdgeWear => Some(edges::Fold::Convex),
+            Pattern::Cavity => Some(edges::Fold::Concave),
+            _ => None,
+        }
     }
 }
 
@@ -134,10 +147,11 @@ pub struct Generator {
     /// Gradient: the direction it runs in (from 0 at the model's lowest point
     /// on this axis to 1 at its highest).
     pub axis: Axis,
-    /// Edge wear: how far from an edge it reaches, in model radii.
+    /// Edge wear and cavity: how far from an edge or crease it reaches, in
+    /// model radii.
     pub edge_width: f32,
-    /// Edge wear: how much the noise (set by scale, detail and seed) eats
-    /// into the wear, 0 for none.
+    /// Edge wear and cavity: how much the noise (set by scale, detail and
+    /// seed) eats into the pattern, 0 for none.
     pub breakup: f32,
     /// The pattern values that become 0 and 1: raising `low` or lowering
     /// `high` adds contrast; moving them together shifts the threshold.
@@ -166,8 +180,8 @@ impl Default for Generator {
 impl Generator {
     /// The pattern's value (0..1) at `point`, a position in the model's own
     /// space that `frame` encloses. `edge_distance` is how far the point is
-    /// from the nearest convex edge (see `ConvexEdges::distance`); only edge
-    /// wear looks at it.
+    /// from the nearest fold of the kind `Pattern::fold` names (see
+    /// `Edges::distance`); only patterns with a fold look at it.
     pub fn sample(&self, point: Vec3, frame: &Frame, edge_distance: f32) -> f32 {
         let noise_at = |base: fn(Vec3, u32) -> f32| {
             // Measured in model-radius units, so scale 1 is about one
@@ -176,7 +190,7 @@ impl Generator {
             noise::fractal(base, local, self.octaves, self.seed)
         };
         let raw = match self.pattern {
-            Pattern::EdgeWear => {
+            Pattern::EdgeWear | Pattern::Cavity => {
                 let width = (self.edge_width * frame.radius()).max(1e-6);
                 // 1 on an edge, falling to 0 at `width`; the noise moves that line.
                 let near = 1.0 - edge_distance / width;

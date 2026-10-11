@@ -1,8 +1,10 @@
-//! Where the model's convex edges are, for the edge wear pattern.
+//! Where the model's edges and creases are, for the edge wear and cavity
+//! patterns.
 //!
 //! An edge is convex where the two faces that meet at it fold away from each
-//! other, like the corner of a box. Sharper edges count for more. Flat
-//! surfaces and concave creases have none.
+//! other, like the corner of a box, and concave (a crease) where they fold
+//! towards each other, like the inside of one. Sharper folds count for more.
+//! Flat surfaces have neither.
 
 use super::Frame;
 use crate::mesh::Mesh;
@@ -16,18 +18,31 @@ const FULL_ANGLE: f32 = 60.0;
 /// The most a pattern can reach from an edge, in model radii. Sets the grid.
 pub const MAX_REACH: f32 = 0.1;
 
+/// Which kind of fold to look for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fold {
+    Convex,
+    Concave,
+}
+
 struct Segment {
     a: Vec3,
     b: Vec3,
-    /// 0..1: how sharp the edge is.
+    /// 0..1: how sharp the fold is.
     weight: f32,
 }
 
-/// Convex edges in a grid, to find the ones near a point quickly.
-pub struct ConvexEdges {
+/// The model's folds, to find the ones near a point quickly: a grid for each
+/// kind.
+pub struct Edges {
+    convex: Grid,
+    concave: Grid,
+}
+
+struct Grid {
     segments: Vec<Segment>,
     cell: f32,
-    grid: HashMap<[i32; 3], Vec<u32>>,
+    cells: HashMap<[i32; 3], Vec<u32>>,
 }
 
 /// An edge by its end positions (so edges split by UV seams or normals meet).
@@ -43,10 +58,10 @@ fn key(position: Vec3) -> [u32; 3] {
     position.to_array().map(f32::to_bits)
 }
 
-impl ConvexEdges {
+impl Edges {
     pub fn new(mesh: &Mesh, frame: &Frame) -> Self {
         let mut open: HashMap<EdgeKey, (Vec3, Vec3, Side)> = HashMap::new();
-        let mut segments = Vec::new();
+        let (mut convex, mut concave) = (Vec::new(), Vec::new());
         for submesh in &mesh.submeshes {
             let range = submesh.indices.start as usize..submesh.indices.end as usize;
             let Some(indices) = mesh.indices.get(range) else {
@@ -85,18 +100,44 @@ impl ConvexEdges {
                         None => {
                             open.insert(edge, (a, b, this));
                         }
-                        Some((a, b, other)) => {
-                            if let Some(weight) = convex_weight(a, &other, &this) {
-                                segments.push(Segment { a, b, weight });
-                            }
-                        }
+                        Some((a, b, other)) => match fold_weight(a, &other, &this) {
+                            Some((Fold::Convex, weight)) => convex.push(Segment { a, b, weight }),
+                            Some((Fold::Concave, weight)) => concave.push(Segment { a, b, weight }),
+                            None => {}
+                        },
                     }
                 }
             }
         }
+        let cell = (MAX_REACH * frame.radius()).max(1e-6);
+        Self {
+            convex: Grid::new(convex, cell),
+            concave: Grid::new(concave, cell),
+        }
+    }
 
-        let cell = (MAX_REACH * frame_radius(frame)).max(1e-6);
-        let mut grid: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
+    /// Distance from `point` to the nearest fold of this kind, with weaker
+    /// folds counting as further away (a fold of weight 0.5 counts double).
+    /// `INFINITY` when none is within a reach (`MAX_REACH` model radii) of it.
+    pub fn distance(&self, point: Vec3, fold: Fold) -> f32 {
+        match fold {
+            Fold::Convex => self.convex.distance(point),
+            Fold::Concave => self.concave.distance(point),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self, fold: Fold) -> usize {
+        match fold {
+            Fold::Convex => self.convex.segments.len(),
+            Fold::Concave => self.concave.segments.len(),
+        }
+    }
+}
+
+impl Grid {
+    fn new(segments: Vec<Segment>, cell: f32) -> Self {
+        let mut cells: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
         for (index, segment) in segments.iter().enumerate() {
             let cell_of = |p: Vec3| (p / cell).floor().to_array().map(|c| c as i32);
             let (lo, hi) = (
@@ -106,7 +147,7 @@ impl ConvexEdges {
             for x in lo[0]..=hi[0] {
                 for y in lo[1]..=hi[1] {
                     for z in lo[2]..=hi[2] {
-                        grid.entry([x, y, z]).or_default().push(index as u32);
+                        cells.entry([x, y, z]).or_default().push(index as u32);
                     }
                 }
             }
@@ -114,20 +155,17 @@ impl ConvexEdges {
         Self {
             segments,
             cell,
-            grid,
+            cells,
         }
     }
 
-    /// Distance from `point` to the nearest convex edge, with weaker edges
-    /// counting as further away (an edge of weight 0.5 counts double). `INFINITY`
-    /// when no edge is within a reach (`MAX_REACH` model radii) of it.
-    pub fn distance(&self, point: Vec3) -> f32 {
+    fn distance(&self, point: Vec3) -> f32 {
         let [cx, cy, cz] = (point / self.cell).floor().to_array().map(|c| c as i32);
         let mut nearest = f32::INFINITY;
         for x in cx - 1..=cx + 1 {
             for y in cy - 1..=cy + 1 {
                 for z in cz - 1..=cz + 1 {
-                    let Some(found) = self.grid.get(&[x, y, z]) else {
+                    let Some(found) = self.cells.get(&[x, y, z]) else {
                         continue;
                     };
                     for &index in found {
@@ -140,30 +178,28 @@ impl ConvexEdges {
         }
         nearest
     }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.segments.len()
-    }
 }
 
-fn frame_radius(frame: &Frame) -> f32 {
-    ((frame.max - frame.min) * 0.5).length().max(1e-4)
-}
-
-/// How much the edge from `a` between two faces counts, if it is convex.
-fn convex_weight(a: Vec3, first: &Side, second: &Side) -> Option<f32> {
-    // Convex: the second face's far corner lies behind the first face's plane.
-    if (second.opposite - a).dot(first.normal) >= -1e-6 {
+/// How the edge from `a` between two faces folds, and how much it counts, if
+/// it folds enough to count.
+fn fold_weight(a: Vec3, first: &Side, second: &Side) -> Option<(Fold, f32)> {
+    // Convex: the second face's far corner lies behind the first face's
+    // plane. Concave: in front of it.
+    let side = (second.opposite - a).dot(first.normal);
+    let fold = if side < -1e-6 {
+        Fold::Convex
+    } else if side > 1e-6 {
+        Fold::Concave
+    } else {
         return None;
-    }
+    };
     let angle = first
         .normal
         .dot(second.normal)
         .clamp(-1.0, 1.0)
         .acos()
         .to_degrees();
-    (angle >= MIN_ANGLE).then(|| (angle / FULL_ANGLE).clamp(0.0, 1.0))
+    (angle >= MIN_ANGLE).then(|| (fold, (angle / FULL_ANGLE).clamp(0.0, 1.0)))
 }
 
 fn distance_to_segment(point: Vec3, a: Vec3, b: Vec3) -> f32 {
@@ -182,54 +218,77 @@ mod tests {
     use super::*;
     use crate::mesh::primitives;
 
-    fn edges(mesh: &Mesh) -> ConvexEdges {
-        ConvexEdges::new(mesh, &Frame::of(mesh))
+    fn edges(mesh: &Mesh) -> Edges {
+        Edges::new(mesh, &Frame::of(mesh))
+    }
+
+    fn inside_out(mut mesh: Mesh) -> Mesh {
+        for triangle in mesh.indices.chunks_exact_mut(3) {
+            triangle.swap(1, 2);
+        }
+        mesh
     }
 
     #[test]
-    fn a_cube_has_twelve_convex_edges() {
+    fn a_cube_has_twelve_convex_edges_and_no_creases() {
         let cube = primitives::cube();
         let edges = edges(&cube);
         // Each edge is two triangle sides, and the faces' own diagonals are flat.
-        assert_eq!(edges.len(), 12);
+        assert_eq!(edges.len(Fold::Convex), 12);
+        assert_eq!(edges.len(Fold::Concave), 0);
         // On an edge, and halfway to the middle of a face (the cube spans -0.5..0.5).
-        assert!(edges.distance(Vec3::new(0.5, 0.5, 0.1)) < 1e-5);
-        let near = edges.distance(Vec3::new(0.5, 0.45, 0.0));
+        assert!(edges.distance(Vec3::new(0.5, 0.5, 0.1), Fold::Convex) < 1e-5);
+        let near = edges.distance(Vec3::new(0.5, 0.45, 0.0), Fold::Convex);
         assert!((near - 0.05).abs() < 1e-4, "{near}");
         // A face's centre is 0.5 from its nearest edge, which is out of reach
         // for a model this size (reach is a tenth of its radius).
-        assert_eq!(edges.distance(Vec3::new(0.0, 0.0, 0.5)), f32::INFINITY);
+        assert_eq!(
+            edges.distance(Vec3::new(0.0, 0.0, 0.5), Fold::Convex),
+            f32::INFINITY
+        );
     }
 
     #[test]
     fn an_inside_out_box_has_only_concave_edges() {
-        let mut cube = primitives::cube();
-        for triangle in cube.indices.chunks_exact_mut(3) {
-            triangle.swap(1, 2);
-        }
-        let edges = edges(&cube);
-        assert_eq!(edges.len(), 0);
-        assert_eq!(edges.distance(Vec3::new(0.5, 0.5, 0.1)), f32::INFINITY);
+        let edges = edges(&inside_out(primitives::cube()));
+        assert_eq!(edges.len(Fold::Convex), 0);
+        assert_eq!(edges.len(Fold::Concave), 12);
+        let corner = Vec3::new(0.5, 0.5, 0.1);
+        assert_eq!(edges.distance(corner, Fold::Convex), f32::INFINITY);
+        assert!(edges.distance(corner, Fold::Concave) < 1e-5);
     }
 
     #[test]
-    fn weaker_edges_count_as_further_away() {
+    fn weaker_folds_count_as_further_away() {
         let first = Side {
             normal: Vec3::Z,
             opposite: Vec3::new(0.0, -1.0, 0.0),
         };
-        let fold = |degrees: f32| {
+        let fold = |degrees: f32, up: bool| {
             let angle = degrees.to_radians();
-            // The other face tilts down away from the first.
+            // The other face tilts away from the first, down (convex) or up.
+            let tilt = if up { -1.0 } else { 1.0 };
             Side {
-                normal: Vec3::new(0.0, angle.sin(), angle.cos()),
-                opposite: Vec3::new(0.0, angle.cos(), -angle.sin()),
+                normal: Vec3::new(0.0, angle.sin() * tilt, angle.cos()),
+                opposite: Vec3::new(0.0, angle.cos(), -angle.sin() * tilt),
             }
         };
         let a = Vec3::ZERO;
-        assert_eq!(convex_weight(a, &first, &fold(5.0)), None, "too shallow");
-        let half = convex_weight(a, &first, &fold(30.0)).unwrap();
+        assert_eq!(
+            fold_weight(a, &first, &fold(5.0, false)),
+            None,
+            "too shallow"
+        );
+        let (kind, half) = fold_weight(a, &first, &fold(30.0, false)).unwrap();
+        assert_eq!(kind, Fold::Convex);
         assert!((half - 0.5).abs() < 1e-4, "{half}");
-        assert_eq!(convex_weight(a, &first, &fold(90.0)), Some(1.0));
+        assert_eq!(
+            fold_weight(a, &first, &fold(90.0, false)),
+            Some((Fold::Convex, 1.0))
+        );
+        assert_eq!(
+            fold_weight(a, &first, &fold(90.0, true)),
+            Some((Fold::Concave, 1.0))
+        );
     }
 }

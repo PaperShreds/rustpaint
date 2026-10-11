@@ -1,4 +1,4 @@
-use crate::document::{BlendMode, Document, FillValues, Layer, LayerMask};
+use crate::document::{BlendMode, Document, FillMix, FillValues, Layer, LayerMask};
 use crate::generator::edges;
 use crate::generator::{Axis, Generator, Pattern};
 use crate::mesh::{Channel, Image};
@@ -68,6 +68,8 @@ pub struct LayersPanelState {
     /// Generator settings being dragged: they apply once the control is
     /// let go, because making the pattern takes a moment.
     draft: Option<(u64, Generator)>,
+    /// The same for the pattern of a fill layer's second colour.
+    mix_draft: Option<(u64, Generator)>,
 }
 
 /// Layer thumbnails by (layer id, whether it shows the mask).
@@ -264,11 +266,59 @@ fn settings(
                 }
             });
         }
+        let mut mixed = edited.mix.is_some();
+        if ui
+            .checkbox(&mut mixed, "Mix in a second look")
+            .on_hover_text("Blend to other values where a pattern is white")
+            .changed()
+        {
+            edited.mix = mixed.then(|| FillMix {
+                color: edited.color.map(|c| c / 2),
+                roughness: edited.roughness,
+                metallic: edited.metallic,
+                ..FillMix::default()
+            });
+            state.mix_draft = None;
+        }
+        // The pattern takes a moment to make, so its edits wait for a let-go;
+        // the colours blend live.
+        let mut released = false;
+        let applied = fill.mix.map(|mix| mix.generator);
+        if let Some(mix) = edited.mix.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label("Colour");
+                ui.color_edit_button_srgb(&mut mix.color);
+            });
+            ui.add(egui::Slider::new(&mut mix.roughness, 0.0..=1.0).text("Roughness"));
+            ui.add(egui::Slider::new(&mut mix.metallic, 0.0..=1.0).text("Metallic"));
+            ui.label("Where the pattern is white:");
+            if let Some((id, draft)) = state.mix_draft
+                && id == layer.id
+            {
+                mix.generator = draft;
+            }
+            generator_controls(ui, "mix", &mut mix.generator, &mut released);
+        }
+        let wanted = edited.mix.map(|mix| mix.generator);
+        if released || mixed != fill.mix.is_some() {
+            state.mix_draft = None;
+        } else if wanted != applied
+            && let Some(wanted) = wanted
+        {
+            state.mix_draft = Some((layer.id, wanted));
+            // Everything but the pattern still applies at once.
+            if let (Some(mix), Some(applied)) = (edited.mix.as_mut(), applied) {
+                mix.generator = applied;
+            }
+        }
         if edited != fill {
             actions.push(LayerAction::Fill {
                 layer: index,
                 fill: edited,
             });
+        }
+        if state.mix_draft.is_some() {
+            ui.weak("Applies when you let go.");
         }
         if layer.mask.is_none() {
             ui.weak("Add a mask to paint where this layer shows.");
@@ -284,57 +334,7 @@ fn settings(
         let mut edited = shown;
         // Whether the user let go of a control, and whether something changed.
         let mut released = false;
-        let mut watch = |response: egui::Response| {
-            released |= response.drag_stopped() || (response.changed() && !response.dragged());
-        };
-        egui::ComboBox::from_label("Pattern")
-            .selected_text(edited.pattern.name())
-            .show_ui(ui, |ui| {
-                for pattern in Pattern::ALL {
-                    ui.selectable_value(&mut edited.pattern, pattern, pattern.name());
-                }
-            });
-        if edited.pattern == Pattern::Gradient {
-            egui::ComboBox::from_label("Axis")
-                .selected_text(edited.axis.name())
-                .show_ui(ui, |ui| {
-                    for axis in Axis::ALL {
-                        ui.selectable_value(&mut edited.axis, axis, axis.name());
-                    }
-                });
-        } else {
-            if edited.pattern == Pattern::EdgeWear {
-                let response = ui.add(
-                    egui::Slider::new(&mut edited.edge_width, 0.002..=edges::MAX_REACH)
-                        .logarithmic(true)
-                        .text("Edge width"),
-                );
-                watch(response);
-                let response =
-                    ui.add(egui::Slider::new(&mut edited.breakup, 0.0..=1.0).text("Breakup"));
-                watch(response);
-            }
-            let response = ui.add(
-                egui::Slider::new(&mut edited.scale, 0.25..=64.0)
-                    .logarithmic(true)
-                    .text("Scale"),
-            );
-            watch(response);
-            let response = ui.add(egui::Slider::new(&mut edited.octaves, 1..=8).text("Detail"));
-            watch(response);
-            let response = ui.add(egui::DragValue::new(&mut edited.seed).prefix("Seed "));
-            watch(response);
-        }
-        let response = ui.add(egui::Slider::new(&mut edited.low, 0.0..=1.0).text("Black at"));
-        watch(response);
-        let response = ui.add(egui::Slider::new(&mut edited.high, 0.0..=1.0).text("White at"));
-        watch(response);
-        if ui.checkbox(&mut edited.invert, "Invert").changed() {
-            released = true;
-        }
-        if edited.pattern != shown.pattern || edited.axis != shown.axis {
-            released = true;
-        }
+        generator_controls(ui, "mask", &mut edited, &mut released);
         if released {
             state.draft = None;
             if edited != applied {
@@ -349,6 +349,72 @@ fn settings(
         if state.draft.is_some() {
             ui.weak("Applies when you let go.");
         }
+    }
+}
+
+/// The pattern's controls. Sets `released` once the user has let go of one
+/// (or picked something that isn't dragged), which is when to apply them.
+fn generator_controls(ui: &mut egui::Ui, id: &str, edited: &mut Generator, released: &mut bool) {
+    // A layer can show two sets of these, whose combo boxes share labels.
+    ui.push_id(id, |ui| generator_widgets(ui, edited, released));
+}
+
+fn generator_widgets(ui: &mut egui::Ui, edited: &mut Generator, released: &mut bool) {
+    let shown = *edited;
+    let let_go = |response: egui::Response| {
+        response.drag_stopped() || (response.changed() && !response.dragged())
+    };
+    egui::ComboBox::from_label("Pattern")
+        .selected_text(edited.pattern.name())
+        .show_ui(ui, |ui| {
+            for pattern in Pattern::ALL {
+                ui.selectable_value(&mut edited.pattern, pattern, pattern.name());
+            }
+        });
+    if edited.pattern == Pattern::Gradient {
+        egui::ComboBox::from_label("Axis")
+            .selected_text(edited.axis.name())
+            .show_ui(ui, |ui| {
+                for axis in Axis::ALL {
+                    ui.selectable_value(&mut edited.axis, axis, axis.name());
+                }
+            });
+    } else {
+        if edited.pattern.fold().is_some() {
+            let label = match edited.pattern {
+                Pattern::Cavity => "Crease width",
+                _ => "Edge width",
+            };
+            let response = ui.add(
+                egui::Slider::new(&mut edited.edge_width, 0.002..=edges::MAX_REACH)
+                    .logarithmic(true)
+                    .text(label),
+            );
+            *released |= let_go(response);
+            let response =
+                ui.add(egui::Slider::new(&mut edited.breakup, 0.0..=1.0).text("Breakup"));
+            *released |= let_go(response);
+        }
+        let response = ui.add(
+            egui::Slider::new(&mut edited.scale, 0.25..=64.0)
+                .logarithmic(true)
+                .text("Scale"),
+        );
+        *released |= let_go(response);
+        let response = ui.add(egui::Slider::new(&mut edited.octaves, 1..=8).text("Detail"));
+        *released |= let_go(response);
+        let response = ui.add(egui::DragValue::new(&mut edited.seed).prefix("Seed "));
+        *released |= let_go(response);
+    }
+    let response = ui.add(egui::Slider::new(&mut edited.low, 0.0..=1.0).text("Black at"));
+    *released |= let_go(response);
+    let response = ui.add(egui::Slider::new(&mut edited.high, 0.0..=1.0).text("White at"));
+    *released |= let_go(response);
+    if ui.checkbox(&mut edited.invert, "Invert").changed() {
+        *released = true;
+    }
+    if edited.pattern != shown.pattern || edited.axis != shown.axis {
+        *released = true;
     }
 }
 

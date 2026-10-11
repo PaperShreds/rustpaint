@@ -642,6 +642,7 @@ impl RustPaintApp {
                     } else {
                         FillValues::default().channels
                     },
+                    mix: None,
                 };
                 let index = self.selected_index() + 1;
                 let layer = self.document.new_fill_layer(fill);

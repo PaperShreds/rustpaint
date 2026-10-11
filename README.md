@@ -51,13 +51,23 @@ it fills and change the values under the layer list). A fill layer isn't
 painted on directly, as in Substance Painter. Add a mask and paint that to say
 where the fill shows.
 
+Tick **Mix in a second look** on a fill layer to give it two sets of values:
+the fill's own where a pattern is black and the second colour, roughness and
+metallic where it is white, with a blend in between (colours blend in linear
+light). The pattern has the same choices and controls as a generator mask, and
+is worked out the same way. For rust, make a fill layer in a light orange-brown,
+mix in a dark brown with Perlin noise, and add a mask (or another layer with
+edge wear) to say where the rust sits.
+
 A mask can also be made by a **generator**: **Mask > Add generator mask**. It
 fills the mask with Perlin or value noise, cells, a gradient along the X, Y
-or Z axis of the model, or **edge wear**: light along the model's convex edges,
-broken up by noise, for chipped paint. Edge wear needs sharp edges in the
-mesh (folds of 10 degrees or more, and the sharper the stronger); smooth
-surfaces and concave creases get none. Its width and how much the noise breaks
-it up are set under the layer list. Scale, detail, seed, and the levels (where the pattern
+or Z axis of the model, **edge wear**: light along the model's convex edges,
+broken up by noise, for chipped paint. **Cavity** is its
+counterpart: light in the concave creases, for dirt and rust that collects
+where parts meet. Both need sharp folds in the mesh (10 degrees or more, and
+the sharper the stronger); smooth surfaces get none, and edge wear skips
+creases while cavity skips edges. Their width and how much the noise breaks
+them up are set under the layer list. Scale, detail, seed, and the levels (where the pattern
 turns black and white) are set there too; the pattern is made when
 you let go of a control. The pattern is worked out from each point's position
 on the model, not from the UV layout, so it has no seams and doesn't stretch.
