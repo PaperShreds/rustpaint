@@ -1,4 +1,4 @@
-use crate::mesh::{primitives, Material, Mesh, SubMesh, Vertex};
+use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
 use crate::renderer::texture;
 use eframe::egui;
 use eframe::egui_wgpu::wgpu::util::DeviceExt as _;
@@ -15,6 +15,7 @@ struct CameraUniform {
 }
 
 struct GpuMaterial {
+    texture: texture::PaintableTexture,
     bind_group: wgpu::BindGroup,
 }
 
@@ -55,8 +56,8 @@ fn create_gpu_materials(
     materials
         .iter()
         .map(|material| {
-            let texture = texture::create_texture(device, queue, &material.base_color);
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let texture = texture::PaintableTexture::new(device, queue, &material.base_color);
+            let view = texture.create_view();
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("material_bind_group"),
                 layout,
@@ -71,7 +72,10 @@ fn create_gpu_materials(
                     },
                 ],
             });
-            GpuMaterial { bind_group }
+            GpuMaterial {
+                texture,
+                bind_group,
+            }
         })
         .collect()
 }
@@ -101,8 +105,28 @@ pub fn upload_mesh(render_state: &egui_wgpu::RenderState, mesh: &Mesh) {
     viewport.materials = materials;
 }
 
-/// Call once at startup, from the eframe creation closure.
-pub fn init(cc: &eframe::CreationContext<'_>) {
+/// Uploads a painted `region` of material `material`'s base colour to the GPU.
+pub fn update_material_texture(
+    render_state: &egui_wgpu::RenderState,
+    material: usize,
+    image: &Image,
+    region: ImageRegion,
+) {
+    let mut renderer = render_state.renderer.write();
+    let Some(gpu_material) = renderer
+        .callback_resources
+        .get_mut::<ViewportRenderer>()
+        .and_then(|viewport| viewport.materials.get_mut(material))
+    else {
+        return;
+    };
+    gpu_material
+        .texture
+        .update_region(&render_state.queue, image, region);
+}
+
+/// Call once at startup, from the eframe creation closure, with the initial mesh.
+pub fn init(cc: &eframe::CreationContext<'_>, mesh: &Mesh) {
     let Some(render_state) = cc.wgpu_render_state.as_ref() else {
         eprintln!("No wgpu render state available - is eframe's wgpu feature enabled?");
         return;
@@ -225,10 +249,10 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
         cache: None,
     });
 
-    // --- Initial mesh: the checkerboard cube ---
-    let mesh = primitives::cube();
-    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, &mesh);
-    let materials = create_gpu_materials(device, queue, &material_layout, &sampler, &mesh.materials);
+    // --- Initial mesh ---
+    let (vertex_buffer, index_buffer) = create_mesh_buffers(device, mesh);
+    let materials =
+        create_gpu_materials(device, queue, &material_layout, &sampler, &mesh.materials);
 
     render_state
         .renderer
@@ -242,7 +266,7 @@ pub fn init(cc: &eframe::CreationContext<'_>) {
             sampler,
             vertex_buffer,
             index_buffer,
-            submeshes: mesh.submeshes,
+            submeshes: mesh.submeshes.clone(),
             materials,
         });
 }

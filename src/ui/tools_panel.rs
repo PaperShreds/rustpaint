@@ -17,5 +17,14 @@ pub fn show(ui: &mut egui::Ui, brush: &mut Brush) {
                 ui.label("Color");
                 ui.color_edit_button_rgb(&mut brush.color);
             });
+            ui.checkbox(&mut brush.screen_space, "Screen-space brush")
+                .on_hover_text(
+                    "Project the brush flat from the screen instead of following the surface",
+                );
+            ui.checkbox(&mut brush.paint_over_edges, "Paint over edges")
+                .on_hover_text(
+                    "When off, a stroke stays on the face where it started. \
+                     Faces are bounded by the model's hard (flat-shaded) edges.",
+                );
         });
 }

@@ -6,14 +6,32 @@ on 3D models.
 
 ## Current status
 
-The app currently provides a 3D viewport and can load `.glb` and `.gltf` models,
-showing their meshes and base-color materials. You can orbit the camera by
-dragging in the viewport and zoom with the scroll wheel.
+The app provides a 3D viewport, loads `.glb` and `.gltf` models, and lets you
+paint the base color of the selected texture set. Projects can be saved to and
+reopened from `.rustpaint` files.
 
-The brush controls, material selector, and layer list are early UI scaffolding:
-painting and layer editing are not implemented yet. Saving, project files, and
-autosave are also not available yet. Avoid using it as the only copy of important
-work.
+Viewport controls:
+
+- **Left drag:** paint
+- **Right drag** or **Alt + left drag:** orbit
+- **Middle drag** or **Shift + right drag:** pan
+- **Scroll:** zoom
+
+By default the brush is a sphere on the model's surface: it keeps the same size
+on the model and wraps around edges. **Screen-space brush** instead projects a
+flat circle from the screen onto whatever is visible, so it stretches on surfaces
+seen at an angle.
+
+Turn off **Paint over edges** to keep a stroke on the face where it started.
+A face ends at the model's hard edges (where its shading normals split), so a
+cube has six faces while a smooth-shaded sphere is one.
+
+Paint only lands on the texture set selected in the right-hand panel. Materials
+without a texture get a blank 2048×2048 canvas in their base color.
+
+Layers, undo, texture export, and autosave are not implemented yet, and the
+project file format may still change. Avoid using it as the only copy of
+important work.
 
 ## Run
 

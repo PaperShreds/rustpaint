@@ -12,3 +12,11 @@ gltf = "1.4.1"
 image = "0.25.10"
 rfd = "0.17.2"
 wgpu = "30.0.1"
+
+# Painting runs on the CPU, so unoptimised builds are too slow to use.
+# Optimise our code a little and dependencies fully; debugging still works.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

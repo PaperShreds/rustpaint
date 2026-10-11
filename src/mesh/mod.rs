@@ -34,6 +34,48 @@ impl Image {
             ],
         }
     }
+
+    /// A `width` x `height` image where every pixel is `pixel` (already sRGB-encoded).
+    pub fn filled(width: u32, height: u32, pixel: [u8; 4]) -> Self {
+        Self {
+            width,
+            height,
+            rgba: pixel.repeat((width * height) as usize),
+        }
+    }
+}
+
+/// A rectangle of pixels inside an `Image`, used to upload only what changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ImageRegion {
+    pub fn pixel(x: u32, y: u32) -> Self {
+        Self {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
 }
 
 /// One material slot of the model. This will become a "texture set" you paint on.

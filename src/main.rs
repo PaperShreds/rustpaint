@@ -1,6 +1,7 @@
 mod app;
 mod mesh;
 mod painting;
+mod project;
 mod renderer;
 mod ui;
 
@@ -20,9 +21,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RustPaint",
         options,
-        Box::new(|cc| {
-            renderer::viewport::init(cc);
-            Ok(Box::new(RustPaintApp::default()))
-        }),
+        Box::new(|cc| Ok(Box::new(RustPaintApp::new(cc)))),
     )
 }

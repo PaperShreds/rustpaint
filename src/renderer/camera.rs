@@ -52,6 +52,16 @@ impl OrbitCamera {
         self.pitch = (self.pitch + dy * 0.01).clamp(-1.5, 1.5);
     }
 
+    /// Moves the target so the surface follows the mouse. `viewport_height` is in points.
+    pub fn pan(&mut self, dx: f32, dy: f32, viewport_height: f32) {
+        let forward = (self.target - self.eye()).normalize_or_zero();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward);
+        let world_per_point =
+            2.0 * self.distance * (self.fov_y * 0.5).tan() / viewport_height.max(1.0);
+        self.target += (up * dy - right * dx) * world_per_point;
+    }
+
     pub fn zoom(&mut self, scroll: f32) {
         self.distance =
             (self.distance * (-scroll * 0.002).exp()).clamp(self.radius * 0.2, self.radius * 20.0);
