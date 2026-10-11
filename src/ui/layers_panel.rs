@@ -41,6 +41,7 @@ pub struct LayersPanelState {
     renaming: Option<(u64, String)>,
 }
 
+/// Draws the layers panel's contents into `ui`.
 pub fn show(
     ui: &mut egui::Ui,
     document: &Document,
@@ -49,100 +50,95 @@ pub fn show(
     state: &mut LayersPanelState,
 ) -> Vec<LayerAction> {
     let mut actions = Vec::new();
-    egui::Panel::right("layers_panel")
-        .resizable(true)
-        .default_size(300.0)
-        .show(ui, |ui| {
-            ui.heading("Layers");
-            ui.separator();
+    ui.heading("Layers");
+    ui.separator();
 
-            let count = document.layers.len();
-            let current = &document.layers[selected];
-            let editable = !current.is_base();
-            ui.horizontal(|ui| {
-                if ui
-                    .button("+ Add")
-                    .on_hover_text("Add a layer above the selected one")
-                    .clicked()
-                {
-                    actions.push(LayerAction::Add);
-                }
-                if ui
-                    .add_enabled(editable, egui::Button::new("Delete"))
-                    .clicked()
-                {
-                    actions.push(LayerAction::Delete(selected));
-                }
-                let up = ui.add_enabled(editable && selected + 1 < count, egui::Button::new("⬆"));
-                if up.on_hover_text("Move up").clicked() {
-                    actions.push(LayerAction::Move {
-                        from: selected,
-                        to: selected + 1,
-                    });
-                }
-                let down = ui.add_enabled(editable && selected > 1, egui::Button::new("⬇"));
-                if down.on_hover_text("Move down").clicked() {
-                    actions.push(LayerAction::Move {
-                        from: selected,
-                        to: selected - 1,
-                    });
-                }
+    let count = document.layers.len();
+    let current = &document.layers[selected];
+    let editable = !current.is_base();
+    ui.horizontal(|ui| {
+        if ui
+            .button("+ Add")
+            .on_hover_text("Add a layer above the selected one")
+            .clicked()
+        {
+            actions.push(LayerAction::Add);
+        }
+        if ui
+            .add_enabled(editable, egui::Button::new("Delete"))
+            .clicked()
+        {
+            actions.push(LayerAction::Delete(selected));
+        }
+        let up = ui.add_enabled(editable && selected + 1 < count, egui::Button::new("⬆"));
+        if up.on_hover_text("Move up").clicked() {
+            actions.push(LayerAction::Move {
+                from: selected,
+                to: selected + 1,
             });
-
-            let mut blend = current.blend;
-            egui::ComboBox::from_label("Blend")
-                .selected_text(blend.name())
-                .show_ui(ui, |ui| {
-                    for mode in BlendMode::ALL {
-                        ui.selectable_value(&mut blend, mode, mode.name());
-                    }
-                });
-            if blend != current.blend {
-                actions.push(LayerAction::SetBlend(selected, blend));
-            }
-
-            let mut opacity = current.opacity;
-            let slider = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"));
-            if slider.changed() {
-                actions.push(LayerAction::Opacity {
-                    layer: selected,
-                    value: opacity,
-                    done: !slider.dragged(),
-                });
-            }
-            if slider.drag_stopped() {
-                actions.push(LayerAction::Opacity {
-                    layer: selected,
-                    value: opacity,
-                    done: true,
-                });
-            }
-            ui.separator();
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("layers_grid")
-                    .num_columns(4)
-                    .striped(true)
-                    .spacing([6.0, 4.0])
-                    .show(ui, |ui| {
-                        // Top layer first, like other paint programs.
-                        for index in (0..count).rev() {
-                            let layer = &document.layers[index];
-                            layer_row(
-                                ui,
-                                document,
-                                layer,
-                                index,
-                                selected,
-                                thumbnails,
-                                state,
-                                &mut actions,
-                            );
-                            ui.end_row();
-                        }
-                    });
+        }
+        let down = ui.add_enabled(editable && selected > 1, egui::Button::new("⬇"));
+        if down.on_hover_text("Move down").clicked() {
+            actions.push(LayerAction::Move {
+                from: selected,
+                to: selected - 1,
             });
+        }
+    });
+
+    let mut blend = current.blend;
+    egui::ComboBox::from_label("Blend")
+        .selected_text(blend.name())
+        .show_ui(ui, |ui| {
+            for mode in BlendMode::ALL {
+                ui.selectable_value(&mut blend, mode, mode.name());
+            }
         });
+    if blend != current.blend {
+        actions.push(LayerAction::SetBlend(selected, blend));
+    }
+
+    let mut opacity = current.opacity;
+    let slider = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"));
+    if slider.changed() {
+        actions.push(LayerAction::Opacity {
+            layer: selected,
+            value: opacity,
+            done: !slider.dragged(),
+        });
+    }
+    if slider.drag_stopped() {
+        actions.push(LayerAction::Opacity {
+            layer: selected,
+            value: opacity,
+            done: true,
+        });
+    }
+    ui.separator();
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("layers_grid")
+            .num_columns(4)
+            .striped(true)
+            .spacing([6.0, 4.0])
+            .show(ui, |ui| {
+                // Top layer first, like other paint programs.
+                for index in (0..count).rev() {
+                    let layer = &document.layers[index];
+                    layer_row(
+                        ui,
+                        document,
+                        layer,
+                        index,
+                        selected,
+                        thumbnails,
+                        state,
+                        &mut actions,
+                    );
+                    ui.end_row();
+                }
+            });
+    });
     actions
 }
 

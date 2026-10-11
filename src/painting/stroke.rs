@@ -154,6 +154,11 @@ impl Stroke {
         })
     }
 
+    /// Id of the layer being painted.
+    pub fn layer(&self) -> u64 {
+        self.layer
+    }
+
     /// Whether the stroke has changed any pixels yet.
     pub fn has_changes(&self) -> bool {
         self.slots
@@ -1648,7 +1653,7 @@ mod tests {
         assert_ne!(before, after);
 
         let mut history = crate::painting::history::History::default();
-        history.push(stroke.finish());
+        history.push("Test", stroke.finish());
         history.undo(&mut document);
         assert_eq!(
             document.composite(0, Channel::BaseColor).unwrap().rgba,

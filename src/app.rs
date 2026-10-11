@@ -1,7 +1,7 @@
 use crate::document::{Change, Dirty, Document, LayerProps};
 use crate::export;
 use crate::mesh::{self, Image, Mesh};
-use crate::painting::brush::{self, Brush, Tool};
+use crate::painting::brush::{self, Brush, FillMode, Tool};
 use crate::painting::history::History;
 use crate::painting::stroke::{Stroke, StrokePainter};
 use crate::project;
@@ -369,8 +369,47 @@ impl RustPaintApp {
     /// Ends the current stroke and records it for undo.
     fn finish_stroke(&mut self) {
         if let Some(stroke) = self.stroke.take() {
-            self.history.push(stroke.finish());
+            let label = self.stroke_label(stroke.layer());
+            self.history.push(label, stroke.finish());
         }
+    }
+
+    /// The history panel's name for a stroke on layer `id` with the current tool.
+    fn stroke_label(&self, id: u64) -> String {
+        let name = self.layer_name(id);
+        match self.brush.tool {
+            Tool::Paint => format!("Paint on {name}"),
+            Tool::Erase => format!("Erase on {name}"),
+            Tool::Fill => match self.brush.fill_mode {
+                FillMode::Layer => format!("Fill {name}"),
+                FillMode::Material => format!("Fill material on {name}"),
+                FillMode::UvIsland => format!("Fill UV island on {name}"),
+            },
+        }
+    }
+
+    /// A layer's name, quoted for messages ("?" if it no longer exists).
+    fn layer_name(&self, id: u64) -> String {
+        self.document.layer_index(id).map_or_else(
+            || "?".to_string(),
+            |index| self.document.layers[index].name.clone(),
+        )
+    }
+
+    /// Name of the layer at `index` (empty if there is none).
+    fn name_at(&self, index: usize) -> String {
+        self.document
+            .layers
+            .get(index)
+            .map_or_else(String::new, |layer| layer.name.clone())
+    }
+
+    /// Jumps to a step picked in the history panel.
+    fn go_to_history(&mut self, position: usize, frame: &eframe::Frame) {
+        self.finish_stroke();
+        self.opacity_drag = None;
+        let dirty = self.history.go_to(&mut self.document, position);
+        self.show_changes(&dirty, frame);
     }
 
     fn step_history(&mut self, frame: &eframe::Frame, redo: bool) {
@@ -384,10 +423,10 @@ impl RustPaintApp {
         self.show_changes(&dirty, frame);
     }
 
-    /// Applies `change`, shows it, and records it for undo.
-    fn commit(&mut self, mut change: Change, frame: &eframe::Frame) {
+    /// Applies `change`, shows it, and records it for undo as `label`.
+    fn commit(&mut self, label: String, mut change: Change, frame: &eframe::Frame) {
         if let Some(dirty) = self.document.apply(&mut change) {
-            self.history.push(vec![change]);
+            self.history.push(label, vec![change]);
             self.show_changes(&[dirty], frame);
         }
     }
@@ -423,7 +462,8 @@ impl RustPaintApp {
             LayerAction::Add => {
                 let index = self.selected_index() + 1;
                 let change = self.document.insert_new_layer(index);
-                self.history.push(vec![change]);
+                let added = self.name_at(index);
+                self.history.push(format!("Add {added}"), vec![change]);
                 self.selected_layer =
                     self.document.layers[index.min(self.document.layers.len() - 1)].id;
                 self.show_changes(&[Dirty::Layers], frame);
@@ -435,6 +475,7 @@ impl RustPaintApp {
                 };
                 let below = self.document.layers.get(below).map(|layer| layer.id);
                 self.commit(
+                    format!("Delete {}", self.name_at(index)),
                     Change::Layer {
                         index,
                         stored: None,
@@ -445,11 +486,16 @@ impl RustPaintApp {
                     self.selected_layer = id;
                 }
             }
-            LayerAction::Move { from, to } => self.commit(Change::Move { from, to }, frame),
+            LayerAction::Move { from, to } => {
+                let direction = if to > from { "up" } else { "down" };
+                let label = format!("Move {} {direction}", self.name_at(from));
+                self.commit(label, Change::Move { from, to }, frame)
+            }
             LayerAction::SetVisible(index, visible) => {
                 if let Some(change) = props_change(index, &self.document, &|p| p.visible = visible)
                 {
-                    self.commit(change, frame);
+                    let verb = if visible { "Show" } else { "Hide" };
+                    self.commit(format!("{verb} {}", self.name_at(index)), change, frame);
                 }
             }
             LayerAction::SetTarget { layer, slot, on } => {
@@ -459,19 +505,25 @@ impl RustPaintApp {
                     }
                 };
                 if let Some(change) = props_change(layer, &self.document, &edit) {
-                    self.commit(change, frame);
+                    self.commit(
+                        format!("Change materials of {}", self.name_at(layer)),
+                        change,
+                        frame,
+                    );
                 }
             }
             LayerAction::SetBlend(index, blend) => {
                 if let Some(change) = props_change(index, &self.document, &|p| p.blend = blend) {
-                    self.commit(change, frame);
+                    let label = format!("Blend {} as {}", self.name_at(index), blend.name());
+                    self.commit(label, change, frame);
                 }
             }
-            LayerAction::Rename(index, name) => {
+            LayerAction::Rename(index, new_name) => {
                 if let Some(change) =
-                    props_change(index, &self.document, &|p| p.name = name.clone())
+                    props_change(index, &self.document, &|p| p.name = new_name.clone())
                 {
-                    self.commit(change, frame);
+                    let label = format!("Rename {} to {new_name}", self.name_at(index));
+                    self.commit(label, change, frame);
                 }
             }
             LayerAction::Opacity { layer, value, done } => {
@@ -488,10 +540,18 @@ impl RustPaintApp {
                 self.show_changes(&[Dirty::Layers], frame);
                 if done {
                     if before.opacity != value {
-                        self.history.push(vec![Change::Props {
-                            layer: id,
-                            props: before,
-                        }]);
+                        let label = format!(
+                            "Opacity of {} to {:.0}%",
+                            self.layer_name(id),
+                            value * 100.0
+                        );
+                        self.history.push(
+                            label,
+                            vec![Change::Props {
+                                layer: id,
+                                props: before,
+                            }],
+                        );
                     }
                 } else {
                     self.opacity_drag = Some((id, before));
@@ -754,15 +814,27 @@ impl eframe::App for RustPaintApp {
         ui::tools_panel::show(ui, &mut self.brush);
         self.update_thumbnails(ui.ctx());
         let selected = self.selected_index();
-        let actions = ui::layers_panel::show(
-            ui,
-            &self.document,
-            selected,
-            &self.thumbnails,
-            &mut self.layers_panel,
-        );
+        // Right column: layers, with the undo history docked below them.
+        let (actions, history_pick) = egui::Panel::right("layers_panel")
+            .resizable(true)
+            .default_size(300.0)
+            .show(ui, |ui| {
+                let history_pick = ui::history_panel::show(ui, &self.history);
+                let actions = ui::layers_panel::show(
+                    ui,
+                    &self.document,
+                    selected,
+                    &self.thumbnails,
+                    &mut self.layers_panel,
+                );
+                (actions, history_pick)
+            })
+            .inner;
         for action in actions {
             self.handle_layer_action(action, frame);
+        }
+        if let Some(position) = history_pick {
+            self.go_to_history(position, frame);
         }
         let input = ui::viewport::show(ui, &mut self.camera, self.view_mode, self.environment);
         self.follow_zoom();

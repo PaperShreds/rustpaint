@@ -14,6 +14,8 @@ const DEFAULT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 struct Edit {
     id: u64,
+    /// Shown in the history panel, e.g. "Paint on Layer 2".
+    label: String,
     changes: Vec<Change>,
 }
 
@@ -29,6 +31,8 @@ pub struct History {
     next_id: u64,
     bytes: usize,
     budget_bytes: usize,
+    /// Oldest steps dropped to stay within the budget.
+    dropped: usize,
 }
 
 impl Default for History {
@@ -45,16 +49,19 @@ impl History {
             next_id: 1,
             bytes: 0,
             budget_bytes,
+            dropped: 0,
         }
     }
 
-    /// Records changes that were just made, as one step. Clears the redo steps.
-    pub fn push(&mut self, changes: Vec<Change>) {
+    /// Records changes that were just made, as one step called `label`.
+    /// Clears the redo steps.
+    pub fn push(&mut self, label: impl Into<String>, changes: Vec<Change>) {
         if changes.is_empty() {
             return;
         }
         let edit = Edit {
             id: self.next_id,
+            label: label.into(),
             changes,
         };
         self.next_id += 1;
@@ -64,6 +71,7 @@ impl History {
         // Drop the oldest steps once over budget, but always keep the newest.
         while self.bytes > self.budget_bytes && self.undo.len() > 1 {
             self.bytes -= self.undo.remove(0).bytes();
+            self.dropped += 1;
         }
     }
 
@@ -94,6 +102,43 @@ impl History {
             .collect();
         self.undo.push(edit);
         dirty
+    }
+
+    /// Undoes or redoes steps until `position` steps are applied (see
+    /// `labels`). Returns what needs recompositing.
+    pub fn go_to(&mut self, document: &mut Document, position: usize) -> Vec<Dirty> {
+        let mut dirty = Vec::new();
+        while self.undo.len() > position && self.can_undo() {
+            dirty.extend(self.undo(document));
+        }
+        while self.undo.len() < position && self.can_redo() {
+            dirty.extend(self.redo(document));
+        }
+        dirty
+    }
+
+    /// Every step's label, oldest first: the applied steps, then the undone
+    /// ones in the order redo would bring them back.
+    pub fn labels(&self) -> impl Iterator<Item = &str> {
+        self.undo
+            .iter()
+            .chain(self.redo.iter().rev())
+            .map(|edit| edit.label.as_str())
+    }
+
+    /// How many of `labels` are applied.
+    pub fn position(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// How many of the oldest steps were dropped to save memory.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Memory used by the stored steps, and the most it may use.
+    pub fn memory(&self) -> (usize, usize) {
+        (self.bytes, self.budget_bytes)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -174,9 +219,9 @@ mod tests {
             },
             100,
         );
-        history.push(vec![first]);
+        history.push("Test", vec![first]);
         let after_first = composite(&document);
-        history.push(vec![document.insert_new_layer(2)]);
+        history.push("Test", vec![document.insert_new_layer(2)]);
         let second = paint(
             &mut document,
             ImageRegion {
@@ -187,7 +232,7 @@ mod tests {
             },
             200,
         );
-        history.push(vec![second]);
+        history.push("Test", vec![second]);
         let after_second = composite(&document);
 
         assert!(!history.undo(&mut document).is_empty());
@@ -211,12 +256,12 @@ mod tests {
         let mut document = document();
         let mut history = History::default();
         let change = paint(&mut document, ImageRegion::pixel(1, 1), 50);
-        history.push(vec![change]);
+        history.push("Test", vec![change]);
         history.undo(&mut document);
         assert!(history.can_redo());
 
         let change = paint(&mut document, ImageRegion::pixel(2, 2), 60);
-        history.push(vec![change]);
+        history.push("Test", vec![change]);
         assert!(!history.can_redo());
     }
 
@@ -233,7 +278,7 @@ mod tests {
         };
         for value in 1..=3 {
             let change = paint(&mut document, region, value);
-            history.push(vec![change]);
+            history.push("Test", vec![change]);
         }
         assert!(!history.undo(&mut document).is_empty());
         assert!(!history.undo(&mut document).is_empty());
@@ -250,13 +295,47 @@ mod tests {
         let mut document = document();
         let mut history = History::default();
         let change = paint(&mut document, ImageRegion::pixel(0, 0), 1);
-        history.push(vec![change]);
+        history.push("Test", vec![change]);
         let saved = history.state();
 
         let change = paint(&mut document, ImageRegion::pixel(1, 0), 2);
-        history.push(vec![change]);
+        history.push("Test", vec![change]);
         assert_ne!(history.state(), saved);
         history.undo(&mut document);
         assert_eq!(history.state(), saved);
+    }
+
+    #[test]
+    fn go_to_jumps_several_steps_and_keeps_the_labels() {
+        let mut document = document();
+        let mut history = History::default();
+        let mut states = vec![composite(&document)];
+        for (step, value) in [(0, 50), (1, 100), (2, 150)] {
+            let region = ImageRegion {
+                x: step * 8,
+                y: 0,
+                width: 4,
+                height: 4,
+            };
+            let change = paint(&mut document, region, value);
+            history.push(format!("Step {step}"), vec![change]);
+            states.push(composite(&document));
+        }
+        let labels = |history: &History| history.labels().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(labels(&history), ["Step 0", "Step 1", "Step 2"]);
+
+        history.go_to(&mut document, 1);
+        assert_eq!(history.position(), 1);
+        assert!(composite(&document) == states[1]);
+        // Undone steps stay listed, in order, until something new is done.
+        assert_eq!(labels(&history), ["Step 0", "Step 1", "Step 2"]);
+
+        history.go_to(&mut document, 3);
+        assert!(composite(&document) == states[3]);
+        history.go_to(&mut document, 0);
+        assert!(composite(&document) == states[0]);
+        // Out-of-range positions stop at the ends.
+        history.go_to(&mut document, 99);
+        assert_eq!(history.position(), 3);
     }
 }

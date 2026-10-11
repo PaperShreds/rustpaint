@@ -73,6 +73,8 @@ user's app data folder on Windows and macOS).
 
 Undo and redo strokes and layer changes with **Ctrl+Z** and **Ctrl+Shift+Z**
 (or **Ctrl+Y**).
+The **History** panel under the layers lists every step; click one to go back
+(or forward) to it.
 History isn't saved with the project.
 
 **File > Export textures...** writes, for each material slot, one PNG per
