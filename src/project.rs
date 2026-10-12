@@ -27,6 +27,7 @@ use crate::generator::edges;
 use crate::generator::{Axis, Generator, Pattern};
 use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
 use crate::painting::history::TILE_SIZE;
+use crate::presets::{Preset, PresetLayer};
 use std::io::Read;
 use std::path::Path;
 
@@ -362,6 +363,78 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// Marks a preset file.
+const PRESET_MAGIC: &[u8; 8] = b"RPPRESET";
+/// The project version whose fill and generator layout a preset file uses.
+const PRESET_FORMAT: u8 = 8;
+const MAX_PRESET_LAYERS: usize = 64;
+
+/// A preset's file contents: magic, the format number, its name, then each
+/// layer's name, opacity, blend mode, fill and generator as in a project.
+pub fn encode_preset(preset: &Preset) -> Result<Vec<u8>, String> {
+    if preset.name.trim().is_empty() {
+        return Err("a preset needs a name".into());
+    }
+    if preset.layers.len() > MAX_PRESET_LAYERS {
+        return Err("too many layers for a preset".into());
+    }
+    let mut bytes = PRESET_MAGIC.to_vec();
+    bytes.push(PRESET_FORMAT);
+    write_count(&mut bytes, preset.name.len())?;
+    bytes.extend_from_slice(preset.name.as_bytes());
+    write_count(&mut bytes, preset.layers.len())?;
+    for layer in &preset.layers {
+        write_count(&mut bytes, layer.name.len())?;
+        bytes.extend_from_slice(layer.name.as_bytes());
+        bytes.extend_from_slice(&layer.opacity.to_le_bytes());
+        bytes.push(layer.blend.index());
+        encode_fill(&mut bytes, Some(&layer.fill));
+        encode_generator(&mut bytes, layer.generator.as_ref());
+    }
+    Ok(bytes)
+}
+
+pub fn decode_preset(bytes: &[u8]) -> Result<Preset, String> {
+    let mut reader = Reader { bytes, offset: 0 };
+    if reader.take(PRESET_MAGIC.len())? != PRESET_MAGIC {
+        return Err("not a RustPaint preset".into());
+    }
+    let format = reader.take(1)?[0];
+    if format == 0 || format > PRESET_FORMAT {
+        return Err("the preset is from a newer RustPaint".into());
+    }
+    let version = format as usize;
+    let text = |reader: &mut Reader| -> Result<String, String> {
+        let len = reader.count(MAX_NAME_BYTES, "name byte")?;
+        std::str::from_utf8(reader.take(len)?)
+            .map(str::to_owned)
+            .map_err(|e| format!("invalid name: {e}"))
+    };
+    let name = text(&mut reader)?;
+    if name.trim().is_empty() {
+        return Err("a preset needs a name".into());
+    }
+    let count = reader.count(MAX_PRESET_LAYERS, "preset layer")?;
+    let mut layers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let layer_name = text(&mut reader)?;
+        let opacity = f32::from_le_bytes(reader.array()?);
+        if !opacity.is_finite() {
+            return Err("preset contains an invalid opacity".into());
+        }
+        let blend = BlendMode::from_index(reader.take(1)?[0]).ok_or("unknown blend mode")?;
+        let fill = decode_fill(&mut reader, version)?.ok_or("preset layer has no fill")?;
+        layers.push(PresetLayer {
+            name: layer_name,
+            opacity: opacity.clamp(0.0, 1.0),
+            blend,
+            fill,
+            generator: decode_generator(&mut reader, version)?,
+        });
+    }
+    Ok(Preset { name, layers })
 }
 
 fn encode_fill(bytes: &mut Vec<u8>, fill: Option<&FillValues>) {

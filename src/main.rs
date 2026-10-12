@@ -5,6 +5,7 @@ mod files;
 mod generator;
 mod mesh;
 mod painting;
+mod presets;
 mod project;
 mod recovery;
 mod renderer;

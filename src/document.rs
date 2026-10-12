@@ -19,6 +19,7 @@ use crate::generator::Generator;
 use crate::generator::bake::Bake;
 pub use crate::mesh::{Channel, Encoding};
 use crate::mesh::{Image, ImageRegion, Mesh};
+use crate::presets::Preset;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -581,6 +582,26 @@ impl Document {
         layer.fill = Some(fill);
         refresh_layer(&mut layer, &self.mesh, &self.bakes, Remake::ALL);
         layer
+    }
+
+    /// New fill layers (on every slot, bottom first) made from `preset`. Not
+    /// yet in the stack.
+    pub fn new_preset_layers(&mut self, preset: &Preset) -> Vec<Layer> {
+        preset
+            .layers
+            .iter()
+            .map(|made| {
+                let mut layer = self.new_layer();
+                layer.name = made.name.clone();
+                layer.opacity = made.opacity;
+                layer.blend = made.blend;
+                layer.fill = Some(made.fill);
+                layer.mask = made.generator.map(|_| 255);
+                layer.mask_generator = made.generator;
+                refresh_layer(&mut layer, &self.mesh, &self.bakes, Remake::ALL);
+                layer
+            })
+            .collect()
     }
 
     /// Remakes the procedural images of the layer at `index` from its

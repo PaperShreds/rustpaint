@@ -59,6 +59,17 @@ is worked out the same way. For rust, make a fill layer in a light orange-brown,
 mix in a dark brown with Perlin noise, and add a mask (or another layer with
 edge wear) to say where the rust sits.
 
+**Presets** (the button under the layer list) add ready-made stacks of fill
+layers above the selected layer, in one undo step: **Rust** (patches plus rust
+in the creases), **Dirt in creases**, **Worn edges** (bare metal along the
+edges) and **Dust from below**. Their patterns are worked out from each model's
+own shape, so they fit any model; then change anything about the layers as
+usual. **Save layers as preset...** keeps fill layers you made as your own
+preset: pick a name and which fill layers go in. Painted layers and painted
+masks aren't kept, only settings. Your presets are small `.rustpreset` files in
+a `presets` folder next to the program's settings (see below), so you can copy
+them between computers or share them; **Delete preset** removes one.
+
 A mask can also be made by a **generator**: **Mask > Add generator mask**. It
 fills the mask with Perlin or value noise, cells, a gradient along the X, Y
 or Z axis of the model, **edge wear**: light along the model's convex edges,
@@ -158,6 +169,11 @@ git clone https://github.com/PaperShreds/rustpaint.git
 cd rustpaint
 cargo run
 ```
+
+On Linux, run `assets/linux/install.sh` once (after `cargo build --release`) so
+the desktop shows RustPaint's name and icon in the dock and top bar: Wayland
+desktops find them through a launcher file, not from the program itself.
+`assets/linux/install.sh --uninstall` removes it again.
 
 Use **File > Open model...** to open a `.glb` or `.gltf` file. On supported
 platforms, you can also drag a model file into the application window.

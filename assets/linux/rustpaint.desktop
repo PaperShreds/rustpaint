@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RustPaint
+Comment=Paint textures on 3D models
+Exec=rustpaint
+Icon=rustpaint
+Terminal=false
+Categories=Graphics;3DGraphics;
+StartupWMClass=rustpaint

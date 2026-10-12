@@ -5,6 +5,7 @@ use crate::mesh::{self, Image, Mesh};
 use crate::painting::brush::{self, Brush, FillMode, Tool};
 use crate::painting::history::History;
 use crate::painting::stroke::{Stroke, StrokePainter};
+use crate::presets;
 use crate::project;
 use crate::recovery::{self, Recovered, Session};
 use crate::renderer;
@@ -33,6 +34,13 @@ enum Pending {
     Open(PathBuf),
 }
 
+/// The "Save layers as preset" dialog: the name typed and the fill layers
+/// (by id) ticked to go into it.
+struct PresetDraft {
+    name: String,
+    ticked: Vec<u64>,
+}
+
 pub struct RustPaintApp {
     pub brush: Brush,
     pub camera: OrbitCamera,
@@ -46,6 +54,9 @@ pub struct RustPaintApp {
     pub status: String,
     /// Shown as the "Save changes?" dialog while set.
     pending: Option<Pending>,
+    presets: presets::Library,
+    /// Shown as the "Save layers as preset" dialog while set.
+    preset_draft: Option<PresetDraft>,
     /// Set once the user agreed to close, so the next close request goes through.
     allow_close: bool,
     /// The model and its layers; painting edits this, then uploads the composites.
@@ -129,6 +140,10 @@ impl RustPaintApp {
             environment_source,
             recent_files: settings.recent_files,
             pending: None,
+            presets: presets::Library::load(
+                eframe::storage_dir("RustPaint").map(|directory| directory.join("presets")),
+            ),
+            preset_draft: None,
             allow_close: false,
             status,
             selected_layer: document.layers[document.layers.len() - 1].id,
@@ -654,6 +669,59 @@ impl RustPaintApp {
                 self.selected_layer = id;
                 self.editing_mask = false;
             }
+            LayerAction::ApplyPreset(index) => {
+                let Some(preset) = self.presets.get(index).cloned() else {
+                    return;
+                };
+                let at = self.selected_index() + 1;
+                let layers = self.document.new_preset_layers(&preset);
+                let (mut changes, mut dirty) = (Vec::new(), Vec::new());
+                for (offset, layer) in layers.into_iter().enumerate() {
+                    self.selected_layer = layer.id;
+                    let mut change = Change::Layer {
+                        index: at + offset,
+                        stored: Some(layer),
+                    };
+                    if let Some(touched) = self.document.apply(&mut change) {
+                        dirty.push(touched);
+                        changes.push(change);
+                    }
+                }
+                self.editing_mask = false;
+                self.history
+                    .push(format!("Add preset {}", preset.name), changes);
+                self.show_changes(&dirty, frame);
+            }
+            LayerAction::SavePreset => {
+                let selected = &self.document.layers[self.selected_index()];
+                self.preset_draft = Some(PresetDraft {
+                    name: String::new(),
+                    ticked: if selected.fill.is_some() {
+                        vec![selected.id]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+            LayerAction::DeletePreset(index) => {
+                let Some(name) = self.presets.saved().get(index).map(|p| p.name.clone()) else {
+                    return;
+                };
+                let answer = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("Delete preset?")
+                    .set_description(format!(
+                        "Delete the preset \"{name}\"? This can't be undone."
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if answer == rfd::MessageDialogResult::Yes {
+                    self.status = match self.presets.delete(index) {
+                        Ok(()) => format!("Deleted preset {name}"),
+                        Err(error) => format!("Could not delete {name}: {error}"),
+                    };
+                }
+            }
             LayerAction::AddGeneratorMask(layer) => {
                 let Some(target) = self.document.layers.get(layer) else {
                     return;
@@ -1049,6 +1117,83 @@ impl RustPaintApp {
         }
     }
 
+    /// "Save layers as preset": a name, and which fill layers go in.
+    fn save_preset_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.preset_draft.take() else {
+            return;
+        };
+        let fills: Vec<(u64, &str)> = self
+            .document
+            .layers
+            .iter()
+            .filter(|layer| layer.fill.is_some())
+            .map(|layer| (layer.id, layer.name.as_str()))
+            .collect();
+        draft
+            .ticked
+            .retain(|id| fills.iter().any(|(fill, _)| fill == id));
+        let (mut save, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("save_preset")).show(ctx, |ui| {
+            ui.heading("Save layers as preset");
+            if fills.is_empty() {
+                ui.label("Presets are made of fill layers: add one with + Fill first.");
+            } else {
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut draft.name)
+                        .hint_text("Name, e.g. Rusty metal")
+                        .desired_width(260.0),
+                );
+                if !name.has_focus() && draft.name.is_empty() {
+                    name.request_focus();
+                }
+                ui.label("Layers to include:");
+                for (id, layer_name) in &fills {
+                    let mut on = draft.ticked.contains(id);
+                    if ui.checkbox(&mut on, *layer_name).changed() {
+                        draft.ticked.retain(|ticked| ticked != id);
+                        if on {
+                            draft.ticked.push(*id);
+                        }
+                    }
+                }
+                ui.weak("Settings only: painted masks are left out.");
+                if self.presets.has_saved(&draft.name) {
+                    ui.weak("This replaces the saved preset of the same name.");
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let ready = !draft.name.trim().is_empty() && !draft.ticked.is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Save")).clicked() {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if save {
+            let layers = self
+                .document
+                .layers
+                .iter()
+                .filter(|layer| draft.ticked.contains(&layer.id));
+            let Some(preset) = presets::Preset::from_layers(&draft.name, layers) else {
+                return;
+            };
+            let name = preset.name.clone();
+            self.status = match self.presets.save(preset) {
+                Ok(()) => format!("Saved preset {name}"),
+                Err(error) => format!("Could not save {name}: {error}"),
+            };
+        } else if !cancel {
+            self.preset_draft = Some(draft);
+        }
+    }
+
     fn load_environment(&mut self, frame: &eframe::Frame) {
         let picked = rfd::FileDialog::new()
             .add_filter("HDR image", &["hdr", "exr"])
@@ -1326,6 +1471,7 @@ impl eframe::App for RustPaintApp {
                     on_mask,
                     &self.thumbnails,
                     &mut self.layers_panel,
+                    &self.presets,
                 );
                 (actions, history_pick)
             })
@@ -1355,6 +1501,7 @@ impl eframe::App for RustPaintApp {
 
         let ctx = ui.ctx().clone();
         self.unsaved_changes_dialog(&ctx, frame);
+        self.save_preset_dialog(&ctx);
         self.recovery_dialog(&ctx, frame);
         self.autosave(&ctx);
         self.update_window_title(&ctx);

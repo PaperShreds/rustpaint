@@ -2,6 +2,7 @@ use crate::document::{BlendMode, Document, FillMix, FillValues, Layer, LayerMask
 use crate::generator::edges;
 use crate::generator::{Axis, Generator, Pattern};
 use crate::mesh::{Channel, Image};
+use crate::presets::Library;
 use eframe::egui;
 use egui::containers::menu::{MenuButton, MenuConfig};
 use std::collections::HashMap;
@@ -31,6 +32,13 @@ pub enum LayerAction {
         layer: usize,
         generator: Generator,
     },
+    /// Add the layers of preset `0` (counting the built-in ones first) above
+    /// the selected layer.
+    ApplyPreset(usize),
+    /// Ask which layers to keep as a new preset.
+    SavePreset,
+    /// Delete the saved preset at this index (of `Library::saved`).
+    DeletePreset(usize),
     Delete(usize),
     Move {
         from: usize,
@@ -84,6 +92,7 @@ pub fn show(
     on_mask: bool,
     thumbnails: &Thumbnails,
     state: &mut LayersPanelState,
+    presets: &Library,
 ) -> Vec<LayerAction> {
     let mut actions = Vec::new();
     ui.heading("Layers");
@@ -180,6 +189,8 @@ pub fn show(
         });
     });
 
+    presets_menu(ui, presets, &mut actions);
+
     let mut blend = current.blend;
     egui::ComboBox::from_label("Blend")
         .selected_text(blend.name())
@@ -235,6 +246,44 @@ pub fn show(
             });
     });
     actions
+}
+
+/// The button that adds, saves and deletes presets.
+fn presets_menu(ui: &mut egui::Ui, presets: &Library, actions: &mut Vec<LayerAction>) {
+    ui.menu_button("Presets ⏷", |ui| {
+        let built_in = presets.built_in().len();
+        let all = presets.built_in().iter().chain(presets.saved());
+        for (index, preset) in all.enumerate() {
+            if index == built_in {
+                ui.separator();
+            }
+            let layers = preset.layers.len();
+            let hint = format!(
+                "Add {layers} fill layer{} above the selected one",
+                if layers == 1 { "" } else { "s" }
+            );
+            if ui.button(&preset.name).on_hover_text(hint).clicked() {
+                actions.push(LayerAction::ApplyPreset(index));
+            }
+        }
+        ui.separator();
+        if ui
+            .button("Save layers as preset...")
+            .on_hover_text("Keep fill layers' settings to add to any model later")
+            .clicked()
+        {
+            actions.push(LayerAction::SavePreset);
+        }
+        ui.add_enabled_ui(!presets.saved().is_empty(), |ui| {
+            ui.menu_button("Delete preset ⏷", |ui| {
+                for (index, preset) in presets.saved().iter().enumerate() {
+                    if ui.button(&preset.name).clicked() {
+                        actions.push(LayerAction::DeletePreset(index));
+                    }
+                }
+            });
+        });
+    });
 }
 
 /// Controls for what makes the layer's pixels: a fill layer's values and a
