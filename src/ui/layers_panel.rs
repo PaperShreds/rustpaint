@@ -311,7 +311,7 @@ fn add_menu(
 
 /// Adds, saves and deletes presets.
 fn presets_menu(ui: &mut egui::Ui, presets: &Library, actions: &mut Vec<LayerAction>) {
-    ui.menu_button("Presets ⏷", |ui| {
+    ui.menu_button("Presets", |ui| {
         let built_in = presets.built_in().len();
         let all = presets.built_in().iter().chain(presets.saved());
         for (index, preset) in all.enumerate() {
@@ -336,7 +336,7 @@ fn presets_menu(ui: &mut egui::Ui, presets: &Library, actions: &mut Vec<LayerAct
             actions.push(LayerAction::SavePreset);
         }
         ui.add_enabled_ui(!presets.saved().is_empty(), |ui| {
-            ui.menu_button("Delete preset ⏷", |ui| {
+            ui.menu_button("Delete preset", |ui| {
                 for (index, preset) in presets.saved().iter().enumerate() {
                     if ui.button(&preset.name).clicked() {
                         actions.push(LayerAction::DeletePreset(index));

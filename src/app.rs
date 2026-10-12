@@ -430,9 +430,9 @@ impl RustPaintApp {
                 self.status = if layer.is_base() {
                     "The base layer can't be painted on. Select or add a layer."
                 } else if layer.fill.is_some() && layer.mask.is_none() {
-                    "Fill layers are painted through their mask: add one in the Mask menu."
+                    "Fill layers are painted through their mask: add one in the Add menu."
                 } else {
-                    "This mask is made by a generator. Mask > Convert to painted mask \
+                    "This mask is made by a generator. Add > Convert to painted mask \
                      lets you paint on it."
                 }
                 .into();

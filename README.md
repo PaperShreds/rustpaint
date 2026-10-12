@@ -14,11 +14,15 @@ meant to be a straightforward, crash-resistant alternative for texturing
 objects, with procedural tools (generators, edge wear, cavity, presets) for
 quick results such as rust and dirt.
 
+<p align="center">
+  <img src="assets/screenshots/layers-and-masks.png" alt="Blurring a generated mask on a cube" width="32%">
+  <img src="assets/screenshots/rust-preset.png" alt="A rusty pressure vessel built from fill layers and generators" width="32%">
+  <img src="assets/screenshots/painting.png" alt="Painting on a checkered cube" width="32%">
+</p>
+
 > **Early stage.** It works, but the project file format may still change and
 > normal and height maps aren't implemented yet. Don't use it as the only copy
 > of important work.
-
-<!-- Screenshots go here. -->
 
 ## Features
 
