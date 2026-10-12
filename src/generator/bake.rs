@@ -5,7 +5,7 @@
 //! doesn't care where the UV islands lie, so it has no seams.
 
 use super::edges::{Edges, Fold};
-use super::{Frame, Generator};
+use super::{Frame, Recipe};
 use crate::mesh::Mesh;
 use crate::painting::raster::{
     SEAM_MARGIN_TEXELS, barycentric_2d, edge_margins, interpolate, texel_range, uv_bounds,
@@ -34,7 +34,7 @@ pub struct Bake {
     /// crease, each found when a pattern first needs it.
     fold_distance: [OnceLock<Vec<f32>>; 2],
     /// The latest results of `generate_cached`, newest last.
-    recent: Mutex<Vec<(Generator, Arc<Vec<u8>>)>>,
+    recent: Mutex<Vec<(Recipe, Arc<Vec<u8>>)>>,
 }
 
 /// How many generated results a bake keeps for reuse.
@@ -129,34 +129,42 @@ impl Bake {
         self.positions[y as usize * self.width as usize + x as usize]
     }
 
-    /// Runs `generator` on every covered texel: its value as a byte (0..255),
+    #[cfg(test)]
+    /// `generate_recipe` for a single pattern.
+    pub fn generate(&self, generator: &super::Generator) -> Vec<u8> {
+        self.generate_recipe(&Recipe::from(*generator))
+    }
+
+    /// Runs `recipe` on every covered texel: its value as a byte (0..255),
     /// row by row. Texels off the model are 0. Spread over the CPU cores.
-    pub fn generate(&self, generator: &Generator) -> Vec<u8> {
-        let folds = generator.pattern.fold().map(|fold| {
-            self.fold_distance[fold as usize].get_or_init(|| self.measure_fold_distance(fold))
+    pub fn generate_recipe(&self, recipe: &Recipe) -> Vec<u8> {
+        let folds = [Fold::Convex, Fold::Concave].map(|fold| {
+            recipe.uses(fold).then(|| {
+                self.fold_distance[fold as usize].get_or_init(|| self.measure_fold_distance(fold))
+            })
         });
         let mut values = vec![0u8; self.cover.len()];
         self.for_each_texel(&mut values, |texel, value| {
-            let edge_distance = folds.map_or(f32::INFINITY, |distances| distances[texel]);
-            let v = generator.sample(self.positions[texel], &self.frame, edge_distance);
+            let near = folds.map(|distances| distances.map_or(f32::INFINITY, |d| d[texel]));
+            let v = recipe.sample(self.positions[texel], &self.frame, near);
             *value = (v * 255.0).round() as u8;
         });
         values
     }
 
-    /// `generate`, but remembers the last few results: changing only what
-    /// is made *from* a pattern (a colour, say) doesn't run it again.
-    pub fn generate_cached(&self, generator: &Generator) -> Arc<Vec<u8>> {
+    /// `generate_recipe`, but remembers the last few results: changing only
+    /// what is made *from* a pattern (a colour, say) doesn't run it again.
+    pub fn generate_cached(&self, recipe: &Recipe) -> Arc<Vec<u8>> {
         let lock = || self.recent.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, values)) = lock().iter().find(|(g, _)| g == generator) {
+        if let Some((_, values)) = lock().iter().find(|(r, _)| r == recipe) {
             return values.clone();
         }
-        let values = Arc::new(self.generate(generator));
+        let values = Arc::new(self.generate_recipe(recipe));
         let mut recent = lock();
         if recent.len() >= RECENT_RESULTS {
             recent.remove(0);
         }
-        recent.push((*generator, values.clone()));
+        recent.push((*recipe, values.clone()));
         values
     }
 
@@ -193,7 +201,7 @@ impl Bake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generator::{Axis, Pattern};
+    use crate::generator::{Axis, Generator, Pattern};
     use crate::mesh::primitives;
 
     fn bake() -> Bake {
@@ -269,14 +277,15 @@ mod tests {
     fn a_repeated_pattern_is_reused() {
         let bake = Bake::new(&primitives::cube(), 0, 64, 64);
         let generator = Generator::default();
-        let first = bake.generate_cached(&generator);
-        assert!(Arc::ptr_eq(&first, &bake.generate_cached(&generator)));
+        let recipe = Recipe::from(generator);
+        let first = bake.generate_cached(&recipe);
+        assert!(Arc::ptr_eq(&first, &bake.generate_cached(&recipe)));
         assert_eq!(*first, bake.generate(&generator));
         let other = Generator {
             seed: 9,
             ..generator
         };
-        assert_ne!(first, bake.generate_cached(&other));
+        assert_ne!(first, bake.generate_cached(&Recipe::from(other)));
     }
 
     #[test]

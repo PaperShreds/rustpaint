@@ -1,4 +1,5 @@
 mod app;
+mod autosaves;
 mod document;
 mod export;
 mod files;

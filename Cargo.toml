@@ -15,15 +15,19 @@ rfd = "0.17.2"
 serde_json = "1.0.152"
 wgpu = "30.0.1"
 egui_extras = { version = "0.36.2", default-features = false, features = ["svg"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 # Waits on GPU requests in tests that render headlessly.
 pollster = "1.0.1"
 
 # Painting runs on the CPU, so unoptimised builds are too slow to use.
-# Optimise our code a little and dependencies fully; debugging still works.
+# Optimise our code a little and dependencies fully; debugging our own code
+# still works. Debug info of the dependencies is most of what fills target/
+# (gigabytes), and is only needed to step through their code.
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = false

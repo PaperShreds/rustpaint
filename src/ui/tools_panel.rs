@@ -1,126 +1,142 @@
 use crate::painting::brush::{self, Brush, FillMode, Tool};
+use crate::painting::history::History;
 use eframe::egui;
 
 const BUTTON_HEIGHT: f32 = 28.0;
 const ICON_SIZE: f32 = 18.0;
 const ERASE_ICON: egui::ImageSource<'static> = egui::include_image!("../../assets/icons/erase.svg");
 
-/// `on_mask`: the brush paints the selected layer's mask.
-pub fn show(ui: &mut egui::Ui, brush: &mut Brush, on_mask: bool) {
+/// The brush settings, with the undo history docked below them. `on_mask`:
+/// the brush paints the selected layer's mask. Returns the history position
+/// picked, if any.
+pub fn show(
+    ui: &mut egui::Ui,
+    brush: &mut Brush,
+    on_mask: bool,
+    history: &History,
+) -> Option<usize> {
     egui::Panel::left("tools_panel")
         .resizable(true)
         .default_size(240.0)
         .show(ui, |ui| {
-            ui.heading("Brush");
-            ui.separator();
-            if on_mask {
-                let text = egui::RichText::new("Painting the layer's mask")
-                    .color(ui.visuals().selection.stroke.color);
-                ui.label(text).on_hover_text(
-                    "Paint shows the layer, Erase hides it. Click the layer's \
+            let picked = super::history_panel::show(ui, history);
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| brush_settings(ui, brush, on_mask));
+            picked
+        })
+        .inner
+}
+
+fn brush_settings(ui: &mut egui::Ui, brush: &mut Brush, on_mask: bool) {
+    super::fit_widths(ui);
+    ui.heading("Brush");
+    ui.separator();
+    if on_mask {
+        let text = egui::RichText::new("Painting the layer's mask")
+            .color(ui.visuals().selection.stroke.color);
+        ui.label(text).on_hover_text(
+            "Paint shows the layer, Erase hides it. Click the layer's \
                      paint thumbnail to paint on the layer again.",
-                );
+        );
+    }
+
+    // Tools in two columns of equal width.
+    let spacing = ui.spacing().item_spacing.x;
+    let half = egui::vec2((ui.available_width() - spacing) / 2.0, BUTTON_HEIGHT);
+    egui::Grid::new("tools").num_columns(2).show(ui, |ui| {
+        for (index, tool) in Tool::ALL.into_iter().enumerate() {
+            let selected = brush.tool == tool;
+            let button = icon_button(ui, tool_icon(tool), tool.name(), selected);
+            if ui
+                .add(button.min_size(half))
+                .on_hover_text(tool_hint(tool))
+                .clicked()
+            {
+                brush.tool = tool;
             }
-
-            // Tools in two columns of equal width.
-            let spacing = ui.spacing().item_spacing.x;
-            let half = egui::vec2((ui.available_width() - spacing) / 2.0, BUTTON_HEIGHT);
-            egui::Grid::new("tools").num_columns(2).show(ui, |ui| {
-                for (index, tool) in Tool::ALL.into_iter().enumerate() {
-                    let selected = brush.tool == tool;
-                    let button = icon_button(ui, tool_icon(tool), tool.name(), selected);
-                    if ui
-                        .add(button.min_size(half))
-                        .on_hover_text(tool_hint(tool))
-                        .clicked()
-                    {
-                        brush.tool = tool;
-                    }
-                    if index % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-                // Erase is a toggle on top of the tool, in its own row.
-                ui.add_enabled_ui(brush.tool.can_erase(), |ui| {
-                    let erase = icon_button(ui, ERASE_ICON, "Erase", brush.erases());
-                    if ui
-                        .add(erase.min_size(half))
-                        .on_hover_text("Paint and Fill remove paint from the layer instead")
-                        .on_disabled_hover_text("Smear and Blur only move paint around")
-                        .clicked()
-                    {
-                        brush.erase = !brush.erase;
-                    }
-                });
+            if index % 2 == 1 {
                 ui.end_row();
-            });
+            }
+        }
+        // Erase is a toggle on top of the tool, in its own row.
+        ui.add_enabled_ui(brush.tool.can_erase(), |ui| {
+            let erase = icon_button(ui, ERASE_ICON, "Erase", brush.erases());
+            if ui
+                .add(erase.min_size(half))
+                .on_hover_text("Paint and Fill remove paint from the layer instead")
+                .on_disabled_hover_text("Smear and Blur only move paint around")
+                .clicked()
+            {
+                brush.erase = !brush.erase;
+            }
+        });
+        ui.end_row();
+    });
 
-            if brush.tool == Tool::Fill {
-                egui::ComboBox::from_label("Fill")
-                    .selected_text(brush.fill_mode.name())
-                    .show_ui(ui, |ui| {
-                        for mode in FillMode::ALL {
-                            ui.selectable_value(&mut brush.fill_mode, mode, mode.name());
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "Whole layer: every material the layer paints on.\n\
+    if brush.tool == Tool::Fill {
+        egui::ComboBox::from_label("Fill")
+            .selected_text(brush.fill_mode.name())
+            .show_ui(ui, |ui| {
+                for mode in FillMode::ALL {
+                    ui.selectable_value(&mut brush.fill_mode, mode, mode.name());
+                }
+            })
+            .response
+            .on_hover_text(
+                "Whole layer: every material the layer paints on.\n\
                          Clicked material: the material under the cursor.\n\
                          Clicked UV island: the connected UV piece under the cursor.",
-                    );
-            } else {
-                // Zooming may take the size past the slider's end; keep it.
-                ui.add(
-                    egui::Slider::new(&mut brush.size, brush::MIN_SIZE..=brush::SLIDER_MAX_SIZE)
-                        .clamping(egui::SliderClamping::Edits)
-                        .text("Size"),
-                );
-                ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
-            }
-            let moves_paint = matches!(brush.tool, Tool::Smear | Tool::Blur);
-            let strength = if moves_paint { "Strength" } else { "Opacity" };
-            ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text(strength));
-
-            ui.add_space(8.0);
-            ui.label("Channels").on_hover_text(
-                "Tick the channels a stroke works on, and the value Paint and Fill put there",
             );
-            // Smear and blur rework what is there; the values don't apply.
-            // A mask covers all channels and has no values of its own.
-            let values = !moves_paint && !brush.erases() && !on_mask;
-            ui.add_enabled_ui(!on_mask, |ui| {
-                egui::Grid::new("brush_channels")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        ui.checkbox(&mut brush.paint_color, "Base color");
-                        ui.add_enabled_ui(values, |ui| ui.color_edit_button_rgb(&mut brush.color));
-                        ui.end_row();
-                        ui.checkbox(&mut brush.paint_roughness, "Roughness");
-                        ui.add_enabled(values, egui::Slider::new(&mut brush.roughness, 0.0..=1.0));
-                        ui.end_row();
-                        ui.checkbox(&mut brush.paint_metallic, "Metallic");
-                        ui.add_enabled(values, egui::Slider::new(&mut brush.metallic, 0.0..=1.0));
-                        ui.end_row();
-                    });
+    } else {
+        // Zooming may take the size past the slider's end; keep it.
+        ui.add(
+            egui::Slider::new(&mut brush.size, brush::MIN_SIZE..=brush::SLIDER_MAX_SIZE)
+                .clamping(egui::SliderClamping::Edits)
+                .text("Size"),
+        );
+        ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
+    }
+    let moves_paint = matches!(brush.tool, Tool::Smear | Tool::Blur);
+    let strength = if moves_paint { "Strength" } else { "Opacity" };
+    ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text(strength));
+
+    ui.add_space(8.0);
+    ui.label("Channels").on_hover_text(
+        "Tick the channels a stroke works on, and the value Paint and Fill put there",
+    );
+    // Smear and blur rework what is there; the values don't apply.
+    // A mask covers all channels and has no values of its own.
+    let values = !moves_paint && !brush.erases() && !on_mask;
+    ui.add_enabled_ui(!on_mask, |ui| {
+        egui::Grid::new("brush_channels")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.checkbox(&mut brush.paint_color, "Base color");
+                ui.add_enabled_ui(values, |ui| ui.color_edit_button_rgb(&mut brush.color));
+                ui.end_row();
+                ui.checkbox(&mut brush.paint_roughness, "Roughness");
+                ui.add_enabled(values, egui::Slider::new(&mut brush.roughness, 0.0..=1.0));
+                ui.end_row();
+                ui.checkbox(&mut brush.paint_metallic, "Metallic");
+                ui.add_enabled(values, egui::Slider::new(&mut brush.metallic, 0.0..=1.0));
+                ui.end_row();
             });
-            ui.add_space(8.0);
-            ui.checkbox(&mut brush.screen_space, "Screen-space brush")
-                .on_hover_text(
-                    "Project the brush flat from the screen instead of following the surface",
-                );
-            ui.checkbox(&mut brush.paint_over_edges, "Paint over edges")
-                .on_hover_text(
-                    "When off, a stroke stays on the face where it started. \
+    });
+    ui.add_space(8.0);
+    ui.checkbox(&mut brush.screen_space, "Screen-space brush")
+        .on_hover_text("Project the brush flat from the screen instead of following the surface");
+    ui.checkbox(&mut brush.paint_over_edges, "Paint over edges")
+        .on_hover_text(
+            "When off, a stroke stays on the face where it started. \
                      Faces are bounded by the model's hard (flat-shaded) edges.",
-                );
-            ui.checkbox(&mut brush.keep_size_on_model, "Keep size on model")
-                .on_hover_text(
-                    "The brush covers the same area of the model when you zoom, and on \
+        );
+    ui.checkbox(&mut brush.keep_size_on_model, "Keep size on model")
+        .on_hover_text(
+            "The brush covers the same area of the model when you zoom, and on \
                      near and far parts alike. When off, it keeps its size on screen, \
                      so it covers more of the model further away.",
-                );
-        });
+        );
 }
 
 fn tool_hint(tool: Tool) -> &'static str {

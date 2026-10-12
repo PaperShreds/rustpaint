@@ -1,203 +1,116 @@
-# RustPaint
+<p align="center">
+  <img src="assets/logo/logo.svg" alt="RustPaint logo" width="140">
+</p>
 
-RustPaint is an early-stage 3D texturing application written in Rust. Its goal is
-to grow into a straightforward, crash-resistant alternative for painting textures
-on 3D models.
+<h1 align="center">RustPaint</h1>
 
-## Current status
+<p align="center">
+  A lightweight 3D texturing app written in Rust: paint PBR textures straight onto your models.
+</p>
 
-The app provides a 3D viewport, loads `.glb` and `.gltf` models, and lets you
-paint their base color, roughness, and metallic in layers. Projects can be saved
-to and reopened from `.rustpaint` files.
+RustPaint loads a 3D model, lets you paint its base color, roughness and
+metallic in layers, and exports the finished textures or the whole model. It is
+meant to be a straightforward, crash-resistant alternative for texturing
+objects, with procedural tools (generators, edge wear, cavity, presets) for
+quick results such as rust and dirt.
 
-Viewport controls:
+> **Early stage.** It works, but the project file format may still change and
+> normal and height maps aren't implemented yet. Don't use it as the only copy
+> of important work.
 
-- **Left drag:** paint
-- **Right drag** or **Alt + left drag:** orbit
-- **Middle drag** or **Shift + right drag:** pan
-- **Scroll:** zoom
+<!-- Screenshots go here. -->
 
-By default the brush is a sphere on the model's surface: it keeps the same size
-on the model and wraps around edges. **Screen-space brush** instead projects a
-flat circle from the screen onto whatever is visible, so it stretches on surfaces
-seen at an angle.
+## Features
 
-Turn off **Paint over edges** to keep a stroke on the face where it started.
-A face ends at the model's hard edges (where its shading normals split), so a
-cube has six faces while a smooth-shaded sphere is one.
+- **Painting in 3D** with Paint, Smear, Blur and Fill tools. The brush is
+  either a sphere on the surface (same size on the model, wraps around edges)
+  or a flat screen-space projection. Soft or hard, with erase.
+- **PBR channels:** base color, roughness and metallic, painted together or
+  one at a time. Imported glTF materials are kept.
+- **Layers** with opacity, blend modes (Normal, Multiply, Screen, Overlay,
+  Darken, Lighten, Add) and per-material-slot targets, composited on the GPU.
+  The model's own textures stay untouched as the base layer.
+- **Masks** you paint on, as in Photoshop or Substance Painter. Every tool
+  works on a mask.
+- **Fill layers and generators:** a fill layer puts one set of values on the
+  whole model and shows through its mask. A mask can come from a generator
+  instead: noise, cells, gradients, **edge wear** (chipped paint along convex
+  edges) and **cavity** (dirt in creases). Patterns are worked out from the
+  model's shape, not its UVs, so they have no seams and don't stretch. Several
+  patterns can be combined, and a fill can mix between two colours.
+- **Presets:** one-click stacks such as Rust, Chipped paint, Grime and Moss,
+  and your own, saved as small files you can share.
+- **Undo history** you can jump around in, and **autosave with crash
+  recovery**. Work you choose not to save is kept under *File > Autosaves*.
+- **Export** the textures as PNGs, or the model with its painted textures as a
+  `.glb` for Blender, Godot, Unity, Unreal or a web viewer.
+- **HDR lighting** in the viewport, with built-in environments or your own
+  `.hdr` / `.exr`.
 
-Paint goes into the layer selected in the right-hand panel. Each layer has a
-visibility checkbox, a thumbnail, a name (double-click to rename), and a
-dropdown of the material slots it paints on; one stroke can cross several
-slots. The bottom **Base** layer holds the model's own textures: it can be
-hidden but not painted on, so the original stays intact. Materials without a
-texture get a blank 2048×2048 canvas in their base color.
+## Getting started
 
-Each layer has an opacity and a blend mode (Normal, Multiply, Screen, Overlay,
-Darken, Lighten, Add). Layers are combined on the GPU, in linear light.
-
-A layer can have a **mask** (the **Mask** menu above the layers): a greyscale
-image that hides parts of the layer without erasing its paint. Add one that
-shows the whole layer or one that hides it, then click the mask thumbnail next
-to the layer's to paint on it. On a mask, every tool works: Paint shows the
-layer, Paint with **Erase** hides it, Fill shows or hides a whole material or
-UV island, and Blur and Smear soften or push the mask's edges. Click the
-layer's own thumbnail to paint its colours again. A mask applies to all
-channels, and is saved with the project and used for exports.
-
-**+ Fill** adds a fill layer: one value per channel everywhere on the model
-(it starts with the brush's colour, roughness and metallic; tick which channels
-it fills and change the values under the layer list). A fill layer isn't
-painted on directly, as in Substance Painter. Add a mask and paint that to say
-where the fill shows.
-
-Tick **Mix in a second look** on a fill layer to give it two sets of values:
-the fill's own where a pattern is black and the second colour, roughness and
-metallic where it is white, with a blend in between (colours blend in linear
-light). The pattern has the same choices and controls as a generator mask, and
-is worked out the same way. For rust, make a fill layer in a light orange-brown,
-mix in a dark brown with Perlin noise, and add a mask (or another layer with
-edge wear) to say where the rust sits.
-
-**Presets** (the button under the layer list) add ready-made stacks of fill
-layers above the selected layer, in one undo step: **Rust** (patches plus rust
-in the creases), **Dirt in creases**, **Worn edges** (bare metal along the
-edges) and **Dust from below**. Their patterns are worked out from each model's
-own shape, so they fit any model; then change anything about the layers as
-usual. **Save layers as preset...** keeps fill layers you made as your own
-preset: pick a name and which fill layers go in. Painted layers and painted
-masks aren't kept, only settings. Your presets are small `.rustpreset` files in
-a `presets` folder next to the program's settings (see below), so you can copy
-them between computers or share them; **Delete preset** removes one.
-
-A mask can also be made by a **generator**: **Mask > Add generator mask**. It
-fills the mask with Perlin or value noise, cells, a gradient along the X, Y
-or Z axis of the model, **edge wear**: light along the model's convex edges,
-broken up by noise, for chipped paint. **Cavity** is its
-counterpart: light in the concave creases, for dirt and rust that collects
-where parts meet. Both need sharp folds in the mesh (10 degrees or more, and
-the sharper the stronger); smooth surfaces get none, and edge wear skips
-creases while cavity skips edges. Their width and how much the noise breaks
-them up are set under the layer list. Scale, detail, seed, and the levels (where the pattern
-turns black and white) are set there too; the pattern is made when
-you let go of a control. The pattern is worked out from each point's position
-on the model, not from the UV layout, so it has no seams and doesn't stretch.
-Generated masks can't be painted on; **Mask > Convert to painted mask** keeps
-the pixels as they are and lets you paint. Fill layers and generated masks are
-saved as their settings, and made again when the project opens.
-
-The brush size is in screen pixels, so zooming in paints a smaller part of the
-model, and parts further away get a bigger share of it. Tick **Keep size on
-model** to give the brush one size on the model instead: it scales with zooming
-and is the same on near and far parts.
-
-The brush panel has four tools:
-
-- **Paint** puts the ticked channels' values onto the selected layer.
-- **Smear** pushes the layer's paint along the stroke, like a finger in wet
-  paint.
-- **Blur** softens the layer's paint under the brush; the further you move,
-  the more it blurs. It stays within the model's UV islands.
-- **Fill** fills in one click: the whole layer, the material under the cursor,
-  or the UV island under the cursor (the connected piece of the UV layout).
-
-Turn on **Erase** to make Paint and Fill remove paint instead. Smear and Blur
-work on the selected layer's own paint and on the ticked channels; for them
-the brush's opacity is its strength.
-
-When a stroke changes metallic with a soft brush, its edge mixes the two
-materials' values: painting dielectric over a white metal gives a pale ring,
-because the metal's white base color becomes visible as a diffuse color there.
-Engines show the same with the exported textures. Use a hard brush (hardness
-near 1) where metal meets non-metal.
-
-The brush paints the channels ticked under **Channels**: base color, roughness,
-and metallic, each with its own value. Imported models bring their glTF
-roughness and metallic along. **View** switches the viewport between the lit
-material and a single channel.
-
-The viewport is lit by an HDR environment. Two come built in, both from
-[Poly Haven](https://polyhaven.com) (CC0, see `assets/environments/`): an
-outdoor scene (the default) and a studio. **View** switches between them, loads
-your own `.hdr` or `.exr` file, rotates the environment, changes its intensity,
-and shows or hides it as a blurred background.
-
-Closing the window, or opening another file, with unsaved changes asks whether
-to save them first. **File > Open recent** lists the last files you opened or
-saved. **File > New project** (Ctrl+N) starts again with the cube RustPaint
-opens with: in a second window, which leaves this one alone, or here, after
-asking about unsaved changes. Open a model into the new project from the File
-menu as usual.
-
-The program remembers your recent files, environment, view, brush and
-autosave settings, and window size between runs (in `~/.local/share/rustpaint/` on Linux, the
-user's app data folder on Windows and macOS).
-
-Undo and redo strokes and layer changes with **Ctrl+Z** and **Ctrl+Shift+Z**
-(or **Ctrl+Y**).
-The **History** panel under the layers lists every step; click one to go back
-(or forward) to it.
-History isn't saved with the project.
-
-**File > Export model (.glb)...** writes the model with its painted textures
-in one file, for Blender, Godot, Unity, Unreal or a web viewer. Each material
-gets a base color texture and a metallic-roughness texture (roughness in green,
-metallic in blue, as glTF expects).
-
-While there are unsaved changes, a recovery copy is autosaved every 30 seconds
-(in a `recovery` folder next to the settings; **Settings** in the menu bar turns
-it off or changes how often). If RustPaint crashes, it offers to restore that
-work on the next start. Saving or closing normally removes the copy.
-
-**File > Export textures...** writes, for each material slot, one PNG per
-channel with its visible layers combined: `<model>_<material>_BaseColor.png`,
-`_Roughness.png`, and `_Metallic.png` (greyscale). It asks before replacing
-existing files.
-
-Normal and height maps are not implemented yet, and the project file format may
-still change (a project doesn't open in older versions of RustPaint than the
-one that saved it). Textures that are one colour everywhere, such as the canvas
-of an untextured material, take almost no space in the file.
-Avoid using it as the only copy of important work.
-
-## Run
-
-Install the stable Rust toolchain, then run:
+Install the stable [Rust toolchain](https://rustup.rs), then:
 
 ```sh
 git clone https://github.com/PaperShreds/rustpaint.git
 cd rustpaint
-cargo run
+cargo run --release
 ```
 
-On Linux, run `assets/linux/install.sh` once (after `cargo build --release`) so
-the desktop shows RustPaint's name and icon in the dock and top bar: Wayland
-desktops find them through a launcher file, not from the program itself.
-`assets/linux/install.sh --uninstall` removes it again.
+Then use **File > Open model...** to open a `.glb` or `.gltf` file (or drag one
+into the window), pick a layer, and paint. Save your work as a `.rustpaint`
+project with **File > Save project**.
 
-Use **File > Open model...** to open a `.glb` or `.gltf` file. On supported
-platforms, you can also drag a model file into the application window.
+On Linux, run `assets/linux/install.sh` once after building so the desktop
+shows RustPaint's name and icon in the dock and top bar (Wayland desktops find
+them through a launcher file, not from the program). `--uninstall` removes it.
+
+### Controls
+
+| Input | Action |
+| --- | --- |
+| Left drag | Paint |
+| Right drag, or Alt + left drag | Orbit |
+| Middle drag, or Shift + right drag | Pan |
+| Scroll | Zoom |
+| Ctrl+Z, Ctrl+Shift+Z (or Ctrl+Y) | Undo, redo |
+| Ctrl+S, Ctrl+Shift+S, Ctrl+N | Save, save as, new project |
+
+The panels: brush settings and the undo history on the left, layers (with the
+selected layer's details below) on the right. The **Add** button above the
+layer list adds paint layers, fill layers, presets and masks.
+
+### Good to know
+
+- Painting a non-metal over metal with a soft brush leaves a pale ring where
+  the two mix. That is how the values blend, and engines show the same with the
+  exported textures. Use a hard brush where metal meets non-metal.
+- Edge wear and cavity need sharp folds in the mesh (10 degrees or more);
+  smooth surfaces get none.
+- The program remembers its settings, presets, recovery copies and autosaves in
+  a `rustpaint` folder in your user data directory (`~/.local/share/rustpaint/`
+  on Linux).
 
 ## Development
-
-Build and run the test suite with:
 
 ```sh
 cargo build
 cargo test
 ```
 
+Dependencies are built with optimizations even in debug builds, because
+painting runs on the CPU and would be too slow otherwise. If `target/` grows
+large over time, `cargo clean` clears it.
+
+## License
+
+RustPaint is free software under the [GNU GPL v3](LICENSE).
+
 ## Credits
 
-The logo (`assets/logo/`) uses the cog ring of the Rust programming language
-logo, which is owned by the Rust Foundation and distributed under
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); see
-`assets/logo/README.md`. The viewport environments are from Poly Haven (CC0),
-see `assets/environments/`.
-
-## Next milestone
-
-The next useful milestone is a small, complete painting workflow: paint on a
-model's texture, then save and reopen that work. Establishing a project format
-and reliable save behavior early will also provide a foundation for autosave
-and crash recovery.
+- The logo (`assets/logo/`) uses the cog ring of the Rust programming language
+  logo, owned by the Rust Foundation and distributed under
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See
+  `assets/logo/README.md`.
+- The built-in environments are from [Poly Haven](https://polyhaven.com) (CC0).
+  See `assets/environments/`.

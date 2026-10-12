@@ -9,7 +9,7 @@
 //! live in the code.
 
 use crate::document::{BlendMode, FillMix, FillValues, Layer};
-use crate::generator::{Axis, Generator, Pattern};
+use crate::generator::{Axis, Generator, Op, Pattern, Recipe, Step};
 use crate::project;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +25,7 @@ pub struct PresetLayer {
     pub blend: BlendMode,
     pub fill: FillValues,
     /// The pattern that decides where the layer shows (as its mask).
-    pub generator: Option<Generator>,
+    pub generator: Option<Recipe>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -160,13 +160,33 @@ fn load_all(directory: &Path) -> Vec<Preset> {
     presets
 }
 
-fn layer(name: &str, fill: FillValues, generator: Generator) -> PresetLayer {
+fn layer(name: &str, fill: FillValues, generator: impl Into<Recipe>) -> PresetLayer {
     PresetLayer {
         name: name.to_string(),
         opacity: 1.0,
         blend: BlendMode::Normal,
         fill,
-        generator: Some(generator),
+        generator: Some(generator.into()),
+    }
+}
+
+/// A layer that shows everywhere (no mask).
+fn everywhere(name: &str, fill: FillValues) -> PresetLayer {
+    PresetLayer {
+        name: name.to_string(),
+        opacity: 1.0,
+        blend: BlendMode::Normal,
+        fill,
+        generator: None,
+    }
+}
+
+/// One pattern laid over the ones before it.
+fn over(op: Op, amount: f32, generator: Generator) -> Step {
+    Step {
+        op,
+        amount,
+        generator,
     }
 }
 
@@ -195,7 +215,8 @@ fn built_in() -> Vec<Preset> {
                 low: 0.35,
                 high: 0.65,
                 ..Generator::default()
-            },
+            }
+            .into(),
         }),
         ..paint([156, 78, 34], 0.9, 0.0)
     };
@@ -206,13 +227,28 @@ fn built_in() -> Vec<Preset> {
                 layer(
                     "Rust patches",
                     patches,
-                    Generator {
-                        scale: 2.5,
-                        seed: 7,
-                        low: 0.5,
-                        high: 0.62,
-                        ..Generator::default()
-                    },
+                    // Big blotches, eaten into by fine grain so their edges
+                    // are rough.
+                    Recipe::with_steps(
+                        Generator {
+                            scale: 2.5,
+                            seed: 7,
+                            low: 0.5,
+                            high: 0.62,
+                            ..Generator::default()
+                        },
+                        [Step {
+                            op: Op::Multiply,
+                            amount: 0.75,
+                            generator: Generator {
+                                scale: 22.0,
+                                seed: 11,
+                                low: 0.3,
+                                high: 0.6,
+                                ..Generator::default()
+                            },
+                        }],
+                    ),
                 ),
                 layer(
                     "Rust in creases",
@@ -285,6 +321,153 @@ fn built_in() -> Vec<Preset> {
                 )
             }],
         },
+        Preset {
+            name: "Chipped paint".to_string(),
+            layers: vec![
+                everywhere("Paint", paint([158, 42, 32], 0.45, 0.0)),
+                layer(
+                    "Chips",
+                    paint([178, 178, 184], 0.4, 1.0),
+                    // Bare metal along the edges, plus flecks on the flats.
+                    Recipe::with_steps(
+                        Generator {
+                            pattern: Pattern::EdgeWear,
+                            edge_width: 0.025,
+                            breakup: 0.6,
+                            scale: 14.0,
+                            octaves: 5,
+                            low: 0.25,
+                            high: 0.6,
+                            ..Generator::default()
+                        },
+                        [over(
+                            Op::Add,
+                            0.6,
+                            Generator {
+                                scale: 30.0,
+                                seed: 4,
+                                low: 0.68,
+                                high: 0.74,
+                                ..Generator::default()
+                            },
+                        )],
+                    ),
+                ),
+            ],
+        },
+        Preset {
+            name: "Grime".to_string(),
+            layers: vec![PresetLayer {
+                opacity: 0.85,
+                ..layer(
+                    "Grime",
+                    paint([44, 38, 32], 0.9, 0.0),
+                    // Heavier towards the bottom, in patches, and in creases.
+                    Recipe::with_steps(
+                        Generator {
+                            pattern: Pattern::Gradient,
+                            axis: Axis::Y,
+                            invert: true,
+                            low: 0.0,
+                            high: 0.9,
+                            ..Generator::default()
+                        },
+                        [
+                            over(
+                                Op::Multiply,
+                                1.0,
+                                Generator {
+                                    scale: 7.0,
+                                    seed: 9,
+                                    low: 0.3,
+                                    high: 0.7,
+                                    ..Generator::default()
+                                },
+                            ),
+                            over(
+                                Op::Lighter,
+                                0.8,
+                                Generator {
+                                    pattern: Pattern::Cavity,
+                                    edge_width: 0.07,
+                                    breakup: 0.5,
+                                    scale: 12.0,
+                                    octaves: 5,
+                                    low: 0.1,
+                                    high: 0.75,
+                                    ..Generator::default()
+                                },
+                            ),
+                        ],
+                    ),
+                )
+            }],
+        },
+        Preset {
+            name: "Moss".to_string(),
+            layers: vec![layer(
+                "Moss",
+                FillValues {
+                    mix: Some(FillMix {
+                        color: [92, 118, 42],
+                        roughness: 0.95,
+                        metallic: 0.0,
+                        generator: Generator {
+                            scale: 20.0,
+                            octaves: 5,
+                            seed: 2,
+                            low: 0.3,
+                            high: 0.7,
+                            ..Generator::default()
+                        }
+                        .into(),
+                    }),
+                    ..paint([50, 76, 28], 1.0, 0.0)
+                },
+                // Collects in the creases, and grows in patches.
+                Recipe::with_steps(
+                    Generator {
+                        pattern: Pattern::Cavity,
+                        edge_width: 0.1,
+                        breakup: 0.6,
+                        scale: 8.0,
+                        octaves: 5,
+                        low: 0.15,
+                        high: 0.7,
+                        ..Generator::default()
+                    },
+                    [over(
+                        Op::Add,
+                        0.7,
+                        Generator {
+                            scale: 3.5,
+                            seed: 5,
+                            low: 0.62,
+                            high: 0.72,
+                            ..Generator::default()
+                        },
+                    )],
+                ),
+            )],
+        },
+        Preset {
+            name: "Oil stains".to_string(),
+            layers: vec![PresetLayer {
+                opacity: 0.9,
+                ..layer(
+                    "Oil",
+                    paint([18, 16, 14], 0.12, 0.0),
+                    Generator {
+                        pattern: Pattern::Value,
+                        scale: 5.0,
+                        seed: 13,
+                        low: 0.64,
+                        high: 0.72,
+                        ..Generator::default()
+                    },
+                )
+            }],
+        },
     ]
 }
 
@@ -305,14 +488,18 @@ mod tests {
     fn built_in_presets_make_layers_with_patterns() {
         let mut document = Document::new(primitives::cube());
         let library = Library::load(None);
-        assert!(library.built_in().len() >= 3);
+        assert!(library.built_in().len() >= 8);
         for preset in library.built_in() {
             let layers = document.new_preset_layers(preset);
             assert_eq!(layers.len(), preset.layers.len());
-            for layer in &layers {
-                assert!(layer.fill.is_some() && layer.mask.is_some());
-                assert!(layer.mask_generator.is_some());
-                assert!(layer.textures[0][crate::document::Plane::Mask.index()].is_some());
+            for (layer, made) in layers.iter().zip(&preset.layers) {
+                assert!(layer.fill.is_some());
+                // Layers with a pattern get a generated mask; the others show everywhere.
+                let masked = made.generator.is_some();
+                assert_eq!(layer.mask.is_some(), masked, "{}", preset.name);
+                assert_eq!(layer.mask_generator.is_some(), masked);
+                let mask = &layer.textures[0][crate::document::Plane::Mask.index()];
+                assert_eq!(mask.is_some(), masked);
             }
         }
     }

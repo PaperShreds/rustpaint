@@ -9,13 +9,13 @@
 //! the channels as the layer's `Plane::Mask`.
 //!
 //! A layer can also be procedural. A fill layer's images are one value per
-//! channel, everywhere; a mask can come from a `Generator`. Their pixels are
+//! channel, everywhere; a mask can come from a `Recipe`. Their pixels are
 //! made from the settings (`refresh_layer`), so undo only stores the settings.
 //!
 //! The viewport blends the visible layers on the GPU. `composite` does the same
 //! on the CPU, for export.
 
-use crate::generator::Generator;
+use crate::generator::Recipe;
 use crate::generator::bake::Bake;
 pub use crate::mesh::{Channel, Encoding};
 use crate::mesh::{Image, ImageRegion, Mesh};
@@ -148,7 +148,7 @@ pub struct FillMix {
     pub color: [u8; 3],
     pub roughness: f32,
     pub metallic: f32,
-    pub generator: Generator,
+    pub generator: Recipe,
 }
 
 impl Default for FillMix {
@@ -157,7 +157,7 @@ impl Default for FillMix {
             color: [90, 90, 90],
             roughness: 0.5,
             metallic: 0.0,
-            generator: Generator::default(),
+            generator: Recipe::default(),
         }
     }
 }
@@ -238,7 +238,7 @@ pub struct Layer {
     pub fill: Option<FillValues>,
     /// If set, the mask's images are made by this generator, not painted.
     /// Needs a mask.
-    pub mask_generator: Option<Generator>,
+    pub mask_generator: Option<Recipe>,
 }
 
 impl Layer {
@@ -326,7 +326,7 @@ pub struct LayerProps {
     pub targets: Vec<bool>,
     /// Changing these remakes the layer's procedural images.
     pub fill: Option<FillValues>,
-    pub generator: Option<Generator>,
+    pub generator: Option<Recipe>,
 }
 
 /// Which procedural images to make again.
@@ -1272,7 +1272,7 @@ mod tests {
         );
 
         let generator = Generator::default();
-        with_props(&mut document, 1, |p| p.generator = Some(generator));
+        with_props(&mut document, 1, |p| p.generator = Some(generator.into()));
         let first = mask_pixels(&document, 1).expect("generated");
         assert!(
             first.chunks_exact(4).any(|p| p[0] != first[0]),
@@ -1283,7 +1283,7 @@ mod tests {
             seed: 5,
             ..generator
         };
-        let mut change = with_props(&mut document, 1, |p| p.generator = Some(other));
+        let mut change = with_props(&mut document, 1, |p| p.generator = Some(other.into()));
         let second = mask_pixels(&document, 1).unwrap();
         assert_ne!(first, second);
         document.apply(&mut change).unwrap();
@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(mask_pixels(&document, 1).unwrap(), second);
         // ...and undoing that makes it procedural again.
         document.apply(&mut convert).unwrap();
-        assert_eq!(document.layers[1].mask_generator, Some(other));
+        assert_eq!(document.layers[1].mask_generator, Some(other.into()));
         assert_eq!(mask_pixels(&document, 1).unwrap(), second);
     }
 
@@ -1306,11 +1306,14 @@ mod tests {
         document.layers[1].textures[0][0] = Some(Image::filled(768, 512, [0, 255, 0, 255]));
         document.set_mask(1, Some(255)).unwrap();
         with_props(&mut document, 1, |p| {
-            p.generator = Some(Generator {
-                low: 0.45,
-                high: 0.55,
-                ..Generator::default()
-            })
+            p.generator = Some(
+                Generator {
+                    low: 0.45,
+                    high: 0.55,
+                    ..Generator::default()
+                }
+                .into(),
+            )
         });
         let mask = mask_pixels(&document, 1).unwrap();
         let composite = document.composite(0, Channel::BaseColor).unwrap();
@@ -1340,7 +1343,7 @@ mod tests {
         document.layers[1].targets[1] = false;
         document.set_mask(1, Some(255)).unwrap();
         with_props(&mut document, 1, |p| {
-            p.generator = Some(Generator::default())
+            p.generator = Some(Generator::default().into())
         });
         assert!(document.layers[1].textures[0][Plane::Mask.index()].is_some());
         assert!(document.layers[1].textures[1][Plane::Mask.index()].is_none());
@@ -1390,7 +1393,8 @@ mod tests {
                     low: 0.4,
                     high: 0.6,
                     ..Generator::default()
-                },
+                }
+                .into(),
                 ..FillMix::default()
             }),
             ..FillValues::default()

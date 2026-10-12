@@ -1,6 +1,7 @@
+use crate::autosaves::{self, Kept};
 use crate::document::{Change, Dirty, Document, FillValues, LayerProps, Remake};
 use crate::export;
-use crate::generator::Generator;
+use crate::generator::Recipe;
 use crate::mesh::{self, Image, Mesh};
 use crate::painting::brush::{self, Brush, FillMode, Tool};
 use crate::painting::history::History;
@@ -31,6 +32,8 @@ enum Pending {
     Quit,
     /// File > New project.
     New,
+    /// File > Autosaves: open the kept copy at this path.
+    Autosave(PathBuf),
     Open(PathBuf),
 }
 
@@ -55,6 +58,9 @@ pub struct RustPaintApp {
     /// Shown as the "Save changes?" dialog while set.
     pending: Option<Pending>,
     presets: presets::Library,
+    /// Where File > Autosaves keeps its copies, and what is in there now.
+    autosave_directory: Option<PathBuf>,
+    kept_autosaves: Vec<Kept>,
     /// Shown as the "Save layers as preset" dialog while set.
     preset_draft: Option<PresetDraft>,
     /// Set once the user agreed to close, so the next close request goes through.
@@ -129,6 +135,8 @@ impl RustPaintApp {
             },
             None => (None, Vec::new()),
         };
+        let autosave_directory =
+            eframe::storage_dir("RustPaint").map(|directory| directory.join("autosaves"));
         let document = Document::new(mesh::primitives::cube());
         renderer::viewport::init(cc, &document, &environment);
         Self {
@@ -144,6 +152,11 @@ impl RustPaintApp {
                 eframe::storage_dir("RustPaint").map(|directory| directory.join("presets")),
             ),
             preset_draft: None,
+            kept_autosaves: autosave_directory
+                .as_deref()
+                .map(autosaves::list)
+                .unwrap_or_default(),
+            autosave_directory,
             allow_close: false,
             status,
             selected_layer: document.layers[document.layers.len() - 1].id,
@@ -734,7 +747,7 @@ impl RustPaintApp {
                     return;
                 };
                 let Some(mut generate) = props_change(layer, &self.document, &|p| {
-                    p.generator = Some(Generator::default())
+                    p.generator = Some(Recipe::default())
                 }) else {
                     return;
                 };
@@ -965,6 +978,54 @@ impl RustPaintApp {
             }
             Pending::Open(path) => self.open(&path, frame),
             Pending::New => self.new_project(frame),
+            Pending::Autosave(path) => self.open_autosave(&path, frame),
+        }
+    }
+
+    /// Keeps a copy of the unsaved work for File > Autosaves, when the user
+    /// is about to let go of it. Does nothing with autosave turned off.
+    fn keep_autosave(&mut self) {
+        self.finish_stroke();
+        let Some(directory) = self.autosave_directory.clone() else {
+            return;
+        };
+        if !self.autosave_options.enabled || !self.has_unsaved_changes() {
+            return;
+        }
+        let info = recovery::Info {
+            project_path: self.project_path.clone(),
+            model_name: self.model_name.clone(),
+        };
+        match autosaves::keep(&directory, &self.document, &info) {
+            Ok(()) => {
+                self.kept_autosaves = autosaves::list(&directory);
+                self.status = "Kept an autosave of the unsaved work (File > Autosaves)".into();
+            }
+            Err(error) => self.status = format!("Could not keep an autosave: {error}"),
+        }
+    }
+
+    fn refresh_autosaves(&mut self) {
+        self.kept_autosaves = self
+            .autosave_directory
+            .as_deref()
+            .map(autosaves::list)
+            .unwrap_or_default();
+    }
+
+    /// Opens a kept autosave as unsaved work, like a restored recovery copy.
+    fn open_autosave(&mut self, path: &Path, frame: &eframe::Frame) {
+        let Some(kept) = self.kept_autosaves.iter().find(|kept| kept.path() == path) else {
+            self.status = "That autosave is gone".into();
+            return;
+        };
+        match kept.load() {
+            Ok(document) => {
+                let info = kept.info.clone();
+                self.use_recovered(document, info, frame);
+                self.status = "Opened the autosave. Save it to keep it as a project.".into();
+            }
+            Err(error) => self.status = format!("Could not open the autosave: {error}"),
         }
     }
 
@@ -994,6 +1055,7 @@ impl RustPaintApp {
         let verb = match pending {
             Pending::Quit => "closing",
             Pending::Open(_) => "opening another file",
+            Pending::Autosave(_) => "opening an autosave",
             Pending::New => return self.new_project_dialog(ctx, frame),
         };
         let document = self
@@ -1043,7 +1105,10 @@ impl RustPaintApp {
                     self.proceed(pending, ctx, frame);
                 }
             }
-            Choice::Discard => self.proceed(pending, ctx, frame),
+            Choice::Discard => {
+                self.keep_autosave();
+                self.proceed(pending, ctx, frame);
+            }
             Choice::Cancel => {}
         }
     }
@@ -1112,7 +1177,10 @@ impl RustPaintApp {
                     self.new_project(frame);
                 }
             }
-            Choice::Replace => self.new_project(frame),
+            Choice::Replace => {
+                self.keep_autosave();
+                self.new_project(frame);
+            }
             Choice::Cancel => {}
         }
     }
@@ -1333,6 +1401,18 @@ impl RustPaintApp {
         }
     }
 
+    /// Makes `document` the open one, as work that isn't saved anywhere yet.
+    fn use_recovered(&mut self, document: Document, info: recovery::Info, frame: &eframe::Frame) {
+        self.set_document(document, frame);
+        if let Some(path) = &info.project_path {
+            self.remember_source(path);
+        }
+        self.model_name = info.model_name;
+        self.project_path = info.project_path;
+        // Not saved anywhere yet: keep it marked as unsaved.
+        self.saved_state = u64::MAX;
+    }
+
     fn restore(&mut self, offer: Recovered, frame: &eframe::Frame) {
         let document = match offer.load() {
             Ok(document) => document,
@@ -1341,15 +1421,7 @@ impl RustPaintApp {
                 return;
             }
         };
-        self.set_document(document, frame);
-        let info = offer.info.clone();
-        if let Some(path) = &info.project_path {
-            self.remember_source(path);
-        }
-        self.model_name = info.model_name;
-        self.project_path = info.project_path;
-        // Not saved anywhere yet: keep it marked as unsaved.
-        self.saved_state = u64::MAX;
+        self.use_recovered(document, offer.info.clone(), frame);
         if let Some(session) = self.session.as_mut() {
             match session.adopt(offer) {
                 Ok(()) => self.autosaved_state = Some(self.history.state()),
@@ -1397,6 +1469,7 @@ impl eframe::App for RustPaintApp {
             can_redo: self.history.can_redo(),
             view_mode: self.view_mode,
             recent_files: &self.recent_files,
+            autosaves: &self.kept_autosaves,
             environment_source: &self.environment_source,
         };
         // Closing with unsaved work: stop, and ask first.
@@ -1432,6 +1505,36 @@ impl eframe::App for RustPaintApp {
             }
             Some(MenuAction::OpenRecent(path)) => self.request_open(path, frame),
             Some(MenuAction::ClearRecent) => self.recent_files.clear(),
+            Some(MenuAction::OpenAutosave(index)) => {
+                if let Some(kept) = self.kept_autosaves.get(index) {
+                    let path = kept.path().to_path_buf();
+                    if self.has_unsaved_changes() {
+                        self.pending = Some(Pending::Autosave(path));
+                    } else {
+                        self.open_autosave(&path, frame);
+                    }
+                }
+            }
+            Some(MenuAction::DeleteAutosave(index)) => {
+                if let Some(kept) = self.kept_autosaves.get(index) {
+                    kept.delete();
+                    self.refresh_autosaves();
+                }
+            }
+            Some(MenuAction::DeleteAllAutosaves) => {
+                let answer = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("Delete all autosaves?")
+                    .set_description("This can't be undone.")
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if answer == rfd::MessageDialogResult::Yes
+                    && let Some(directory) = &self.autosave_directory
+                {
+                    autosaves::delete_all(directory);
+                    self.refresh_autosaves();
+                }
+            }
             Some(MenuAction::LoadEnvironment) => self.load_environment(frame),
             Some(MenuAction::SetEnvironment(built_in)) => {
                 self.set_environment(EnvironmentSource::BuiltIn(built_in), frame)
@@ -1455,16 +1558,15 @@ impl eframe::App for RustPaintApp {
         // Outer panels first, central panel last.
         ui::status_bar::show(ui, &self.status);
         let on_mask = self.painting_mask();
-        ui::tools_panel::show(ui, &mut self.brush, on_mask);
+        let history_pick = ui::tools_panel::show(ui, &mut self.brush, on_mask, &self.history);
         self.update_thumbnails(ui.ctx());
         let selected = self.selected_index();
-        // Right column: layers, with the undo history docked below them.
-        let (actions, history_pick) = egui::Panel::right("layers_panel")
+        // Right column: the layers, with the selected one's details below.
+        let actions = egui::Panel::right("layers_panel")
             .resizable(true)
             .default_size(300.0)
             .show(ui, |ui| {
-                let history_pick = ui::history_panel::show(ui, &self.history);
-                let actions = ui::layers_panel::show(
+                ui::layers_panel::show(
                     ui,
                     &self.document,
                     selected,
@@ -1472,8 +1574,7 @@ impl eframe::App for RustPaintApp {
                     &self.thumbnails,
                     &mut self.layers_panel,
                     &self.presets,
-                );
-                (actions, history_pick)
+                )
             })
             .inner;
         for action in actions {

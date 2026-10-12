@@ -13,6 +13,7 @@
 //! small.
 //! Version 7 adds the settings of the edge wear generator.
 //! Version 8 adds the second colour (and its pattern) of a fill layer.
+//! Version 9 adds the patterns combined into a generator's first one.
 //! Older versions still open: version 1 has no layers, version 2 has base
 //! colour layers only and no blend modes, version 3 has no masks, version 4
 //! has no fill layers or generators, version 5 stores every texture in full.
@@ -24,7 +25,7 @@ use crate::document::{
 };
 use crate::files;
 use crate::generator::edges;
-use crate::generator::{Axis, Generator, Pattern};
+use crate::generator::{Axis, Generator, MAX_STEPS, Op, Pattern, Recipe, Step};
 use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
 use crate::painting::history::TILE_SIZE;
 use crate::presets::{Preset, PresetLayer};
@@ -39,6 +40,7 @@ const MAGIC_V5: &[u8; 8] = b"RPAINT05";
 const MAGIC_V6: &[u8; 8] = b"RPAINT06";
 const MAGIC_V7: &[u8; 8] = b"RPAINT07";
 const MAGIC_V8: &[u8; 8] = b"RPAINT08";
+const MAGIC_V9: &[u8; 8] = b"RPAINT09";
 /// Channels after base colour, stored one byte per pixel per material.
 const DATA_CHANNELS: [Channel; 2] = [Channel::Roughness, Channel::Metallic];
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -81,7 +83,7 @@ pub fn save(path: &Path, document: &Document) -> Result<(), String> {
 /// The project file's contents for `document`.
 pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
     let mut bytes = encode_mesh(&document.mesh, true)?;
-    bytes[..MAGIC_V8.len()].copy_from_slice(MAGIC_V8);
+    bytes[..MAGIC_V9.len()].copy_from_slice(MAGIC_V9);
     for material in &document.mesh.materials {
         for channel in DATA_CHANNELS {
             let image = material.channel(channel);
@@ -177,7 +179,7 @@ fn decode(bytes: &[u8]) -> Result<Document, String> {
     let mut reader = Reader { bytes, offset: 0 };
     let magic = reader.take(MAGIC_V1.len())?;
     let version = [
-        MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8,
+        MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8, MAGIC_V9,
     ]
     .iter()
     .position(|known| magic == *known)
@@ -324,7 +326,7 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
         bytes.push(layer.mask.is_some() as u8);
         bytes.push(layer.mask.unwrap_or(0));
         encode_fill(bytes, layer.fill.as_ref());
-        encode_generator(bytes, layer.mask_generator.as_ref());
+        encode_recipe(bytes, layer.mask_generator.as_ref());
         for (slot, channel) in
             (0..slots).flat_map(|slot| Channel::ALL.map(|channel| (slot, channel)))
         {
@@ -368,7 +370,7 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
 /// Marks a preset file.
 const PRESET_MAGIC: &[u8; 8] = b"RPPRESET";
 /// The project version whose fill and generator layout a preset file uses.
-const PRESET_FORMAT: u8 = 8;
+const PRESET_FORMAT: u8 = 9;
 const MAX_PRESET_LAYERS: usize = 64;
 
 /// A preset's file contents: magic, the format number, its name, then each
@@ -391,7 +393,7 @@ pub fn encode_preset(preset: &Preset) -> Result<Vec<u8>, String> {
         bytes.extend_from_slice(&layer.opacity.to_le_bytes());
         bytes.push(layer.blend.index());
         encode_fill(&mut bytes, Some(&layer.fill));
-        encode_generator(&mut bytes, layer.generator.as_ref());
+        encode_recipe(&mut bytes, layer.generator.as_ref());
     }
     Ok(bytes)
 }
@@ -431,7 +433,7 @@ pub fn decode_preset(bytes: &[u8]) -> Result<Preset, String> {
             opacity: opacity.clamp(0.0, 1.0),
             blend,
             fill,
-            generator: decode_generator(&mut reader, version)?,
+            generator: decode_recipe(&mut reader, version)?,
         });
     }
     Ok(Preset { name, layers })
@@ -449,7 +451,7 @@ fn encode_fill(bytes: &mut Vec<u8>, fill: Option<&FillValues>) {
     bytes.extend_from_slice(&mix.color);
     bytes.extend_from_slice(&mix.roughness.to_le_bytes());
     bytes.extend_from_slice(&mix.metallic.to_le_bytes());
-    encode_generator(bytes, Some(&mix.generator));
+    encode_recipe(bytes, Some(&mix.generator));
 }
 
 fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>, String> {
@@ -466,7 +468,7 @@ fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>
         let color = reader.array::<3>()?;
         let roughness = f32::from_le_bytes(reader.array()?);
         let metallic = f32::from_le_bytes(reader.array()?);
-        let generator = decode_generator(reader, version)?.unwrap_or_default();
+        let generator = decode_recipe(reader, version)?.unwrap_or_default();
         if !roughness.is_finite() || !metallic.is_finite() {
             return Err("project contains an invalid fill value".into());
         }
@@ -489,6 +491,43 @@ fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>
         channels,
         mix,
     }))
+}
+
+/// A recipe: its first pattern, then (from version 9) the patterns combined
+/// into it.
+fn encode_recipe(bytes: &mut Vec<u8>, recipe: Option<&Recipe>) {
+    encode_generator(bytes, recipe.map(|recipe| &recipe.base));
+    let recipe = recipe.copied().unwrap_or_default();
+    bytes.push(recipe.step_count() as u8);
+    for step in recipe.steps() {
+        bytes.push(step.op.index());
+        bytes.extend_from_slice(&step.amount.to_le_bytes());
+        encode_generator(bytes, Some(&step.generator));
+    }
+}
+
+fn decode_recipe(reader: &mut Reader, version: usize) -> Result<Option<Recipe>, String> {
+    let base = decode_generator(reader, version)?;
+    let mut steps = Vec::new();
+    if version >= 9 {
+        let count = reader.take(1)?[0] as usize;
+        if count > MAX_STEPS {
+            return Err("project has too many combined patterns".into());
+        }
+        for _ in 0..count {
+            let op = Op::from_index(reader.take(1)?[0]).ok_or("project has an unknown mix mode")?;
+            let amount = f32::from_le_bytes(reader.array()?);
+            if !amount.is_finite() {
+                return Err("project contains an invalid pattern amount".into());
+            }
+            steps.push(Step {
+                op,
+                amount: amount.clamp(0.0, 1.0),
+                generator: decode_generator(reader, version)?.unwrap_or_default(),
+            });
+        }
+    }
+    Ok(base.map(|base| Recipe::with_steps(base, steps)))
 }
 
 fn encode_generator(bytes: &mut Vec<u8>, generator: Option<&Generator>) {
@@ -675,7 +714,7 @@ fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Docu
         let (fill, generator) = if version >= 5 {
             (
                 decode_fill(reader, version)?,
-                decode_generator(reader, version)?,
+                decode_recipe(reader, version)?,
             )
         } else {
             (None, None)
@@ -1101,7 +1140,7 @@ mod tests {
     #[test]
     fn fill_layers_and_generated_masks_are_stored_as_settings() {
         use crate::document::{Change, FillValues, Plane};
-        use crate::generator::{Generator, Pattern};
+        use crate::generator::{Generator, Op, Pattern, Recipe, Step};
         let mut document = Document::new(primitives::cube());
         let fill = FillValues {
             color: [10, 200, 30],
@@ -1116,7 +1155,8 @@ mod tests {
                     pattern: Pattern::EdgeWear,
                     seed: 5,
                     ..Generator::default()
-                },
+                }
+                .into(),
             }),
         };
         let layer = document.new_fill_layer(fill);
@@ -1138,7 +1178,27 @@ mod tests {
             ..Generator::default()
         };
         let mut props = document.layers[2].props();
-        props.generator = Some(generator);
+        // Two more patterns combined into the first.
+        let recipe = Recipe::with_steps(
+            generator,
+            [
+                Step {
+                    op: Op::Subtract,
+                    amount: 0.7,
+                    generator: Generator {
+                        pattern: Pattern::Cavity,
+                        seed: 3,
+                        ..Generator::default()
+                    },
+                },
+                Step {
+                    op: Op::Lighter,
+                    amount: 0.25,
+                    generator: Generator::default(),
+                },
+            ],
+        );
+        props.generator = Some(recipe);
         document
             .apply(&mut Change::Props {
                 layer: document.layers[2].id,
@@ -1156,7 +1216,7 @@ mod tests {
         );
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.layers[2].fill, Some(fill));
-        assert_eq!(decoded.layers[2].mask_generator, Some(generator));
+        assert_eq!(decoded.layers[2].mask_generator, Some(recipe));
         let planes = |document: &Document| {
             Plane::ALL.map(|plane| {
                 document.layers[2].textures[0][plane.index()]

@@ -31,7 +31,7 @@ pub struct Info {
 }
 
 impl Info {
-    fn to_text(&self) -> String {
+    pub(crate) fn to_text(&self) -> String {
         let mut text = format!("model = {}\n", self.model_name);
         if let Some(path) = &self.project_path {
             text += &format!("project = {}\n", path.display());
@@ -39,7 +39,7 @@ impl Info {
         text
     }
 
-    fn from_text(text: &str) -> Self {
+    pub(crate) fn from_text(text: &str) -> Self {
         let mut info = Self::default();
         for (key, value) in text.lines().filter_map(|line| line.split_once(" = ")) {
             match key {

@@ -1,6 +1,6 @@
 use crate::document::{BlendMode, Document, FillMix, FillValues, Layer, LayerMask};
 use crate::generator::edges;
-use crate::generator::{Axis, Generator, Pattern};
+use crate::generator::{Axis, Generator, MAX_STEPS, Op, Pattern, Recipe};
 use crate::mesh::{Channel, Image};
 use crate::presets::Library;
 use eframe::egui;
@@ -30,7 +30,7 @@ pub enum LayerAction {
     /// New generator settings, once the user has let go of the control.
     Generator {
         layer: usize,
-        generator: Generator,
+        generator: Recipe,
     },
     /// Add the layers of preset `0` (counting the built-in ones first) above
     /// the selected layer.
@@ -75,9 +75,9 @@ pub struct LayersPanelState {
     renaming: Option<(u64, String)>,
     /// Generator settings being dragged: they apply once the control is
     /// let go, because making the pattern takes a moment.
-    draft: Option<(u64, Generator)>,
+    draft: Option<(u64, Recipe)>,
     /// The same for the pattern of a fill layer's second colour.
-    mix_draft: Option<(u64, Generator)>,
+    mix_draft: Option<(u64, Recipe)>,
 }
 
 /// Layer thumbnails by (layer id, whether it shows the mask).
@@ -95,102 +95,65 @@ pub fn show(
     presets: &Library,
 ) -> Vec<LayerAction> {
     let mut actions = Vec::new();
-    ui.heading("Layers");
-    ui.separator();
-
     let count = document.layers.len();
     let current = &document.layers[selected];
-    let editable = !current.is_base();
-    ui.horizontal(|ui| {
-        if ui
-            .button("+ Add")
-            .on_hover_text("Add a layer above the selected one")
-            .clicked()
-        {
-            actions.push(LayerAction::Add);
-        }
-        if ui
-            .add_enabled(editable, egui::Button::new("Delete"))
-            .clicked()
-        {
-            actions.push(LayerAction::Delete(selected));
-        }
-        if ui
-            .button("+ Fill")
-            .on_hover_text("Add a fill layer: the brush's values everywhere, shown through a mask")
-            .clicked()
-        {
-            actions.push(LayerAction::AddFill);
-        }
-        let up = ui.add_enabled(editable && selected + 1 < count, egui::Button::new("⬆"));
-        if up.on_hover_text("Move up").clicked() {
-            actions.push(LayerAction::Move {
-                from: selected,
-                to: selected + 1,
+
+    // The selected layer's settings live in their own panel below the list,
+    // so a long stack of generators can't push the layers around.
+    egui::Panel::bottom("details_panel")
+        .resizable(true)
+        .default_size(ui.available_height() * 0.55)
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("Details");
+                ui.weak(&current.name);
             });
-        }
-        let down = ui.add_enabled(editable && selected > 1, egui::Button::new("⬇"));
-        if down.on_hover_text("Move down").clicked() {
-            actions.push(LayerAction::Move {
-                from: selected,
-                to: selected - 1,
-            });
-        }
-        let has_mask = current.mask.is_some();
-        ui.add_enabled_ui(editable, |ui| {
-            ui.menu_button("Mask ⏷", |ui| {
-                let add = |ui: &mut egui::Ui, label, hint| {
-                    ui.add_enabled(!has_mask, egui::Button::new(label))
-                        .on_hover_text(hint)
-                        .clicked()
-                };
-                if add(
-                    ui,
-                    "Add mask (show all)",
-                    "Then paint with Erase on to hide parts",
-                ) {
-                    actions.push(LayerAction::AddMask {
-                        layer: selected,
-                        hide: false,
-                    });
-                }
-                if add(ui, "Add mask (hide all)", "Then paint to reveal parts") {
-                    actions.push(LayerAction::AddMask {
-                        layer: selected,
-                        hide: true,
-                    });
-                }
-                if add(
-                    ui,
-                    "Add generator mask",
-                    "A mask made from noise or a gradient, set in the layer's settings",
-                ) {
-                    actions.push(LayerAction::AddGeneratorMask(selected));
-                }
-                let generated = current.mask_generator.is_some();
-                if ui
-                    .add_enabled(generated, egui::Button::new("Convert to painted mask"))
-                    .on_hover_text("Keep the pattern's pixels and paint on them")
-                    .clicked()
-                {
-                    actions.push(LayerAction::ConvertGeneratorMask(selected));
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(has_mask, egui::Button::new("Delete mask"))
-                    .clicked()
-                {
-                    actions.push(LayerAction::DeleteMask(selected));
-                }
-            })
-            .response
-            .on_hover_text("A mask hides parts of a layer without erasing its paint")
-            .on_disabled_hover_text("The base layer can't have a mask");
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    super::fit_widths(ui);
+                    details(ui, current, selected, state, &mut actions);
+                });
         });
-    });
 
-    presets_menu(ui, presets, &mut actions);
+    ui.heading("Layers");
+    ui.separator();
+    layer_buttons(ui, current, (selected, count), presets, &mut actions);
+    ui.separator();
 
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            // Top layer first, like other paint programs.
+            for index in (0..count).rev() {
+                let layer = &document.layers[index];
+                ui.horizontal(|ui| {
+                    layer_row(
+                        ui,
+                        document,
+                        layer,
+                        index,
+                        (selected, on_mask),
+                        thumbnails,
+                        state,
+                        &mut actions,
+                    );
+                });
+            }
+        });
+    actions
+}
+
+/// The selected layer's blend mode and opacity, then what makes its pixels.
+fn details(
+    ui: &mut egui::Ui,
+    current: &Layer,
+    selected: usize,
+    state: &mut LayersPanelState,
+    actions: &mut Vec<LayerAction>,
+) {
     let mut blend = current.blend;
     egui::ComboBox::from_label("Blend")
         .selected_text(blend.name())
@@ -219,36 +182,134 @@ pub fn show(
             done: true,
         });
     }
-    settings(ui, current, selected, state, &mut actions);
-    ui.separator();
-
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("layers_grid")
-            .num_columns(4)
-            .striped(true)
-            .spacing([6.0, 4.0])
-            .show(ui, |ui| {
-                // Top layer first, like other paint programs.
-                for index in (0..count).rev() {
-                    let layer = &document.layers[index];
-                    layer_row(
-                        ui,
-                        document,
-                        layer,
-                        index,
-                        (selected, on_mask),
-                        thumbnails,
-                        state,
-                        &mut actions,
-                    );
-                    ui.end_row();
-                }
-            });
-    });
-    actions
+    settings(ui, current, selected, state, actions);
 }
 
-/// The button that adds, saves and deletes presets.
+/// Height of the buttons above the layer list, like the brush tool buttons.
+const BUTTON_HEIGHT: f32 = 28.0;
+
+/// Add (layers, presets and masks), delete and move, for the selected layer.
+fn layer_buttons(
+    ui: &mut egui::Ui,
+    current: &Layer,
+    (selected, count): (usize, usize),
+    presets: &Library,
+    actions: &mut Vec<LayerAction>,
+) {
+    let editable = !current.is_base();
+    let spacing = ui.spacing().item_spacing.x;
+    let room = ui.available_width() - 3.0 * spacing;
+    let (wide, narrow) = (room * 0.32, room * 0.18);
+    let size = |width: f32| egui::vec2(width, BUTTON_HEIGHT);
+    ui.horizontal(|ui| {
+        let add = egui::Button::new("Add ⏷").min_size(size(wide));
+        let (response, _) = MenuButton::from_button(add)
+            .ui(ui, |ui| add_menu(ui, current, selected, presets, actions));
+        response.on_hover_text(
+            "Add layers and presets above the selected layer, or work with its mask",
+        );
+
+        let delete = ui.add_enabled(editable, egui::Button::new("Delete").min_size(size(wide)));
+        if delete.on_hover_text("Delete the selected layer").clicked() {
+            actions.push(LayerAction::Delete(selected));
+        }
+        let up = egui::Button::new("⬆").min_size(size(narrow));
+        let up = ui.add_enabled(editable && selected + 1 < count, up);
+        if up.on_hover_text("Move up").clicked() {
+            actions.push(LayerAction::Move {
+                from: selected,
+                to: selected + 1,
+            });
+        }
+        let down = egui::Button::new("⬇").min_size(size(narrow));
+        let down = ui.add_enabled(editable && selected > 1, down);
+        if down.on_hover_text("Move down").clicked() {
+            actions.push(LayerAction::Move {
+                from: selected,
+                to: selected - 1,
+            });
+        }
+    });
+}
+
+/// What the Add button's menu offers: new layers, then the selected layer's mask.
+fn add_menu(
+    ui: &mut egui::Ui,
+    current: &Layer,
+    selected: usize,
+    presets: &Library,
+    actions: &mut Vec<LayerAction>,
+) {
+    ui.weak("Layers");
+    if ui
+        .button("Paint layer")
+        .on_hover_text("An empty layer to paint on, above the selected one")
+        .clicked()
+    {
+        actions.push(LayerAction::Add);
+    }
+    if ui
+        .button("Fill layer")
+        .on_hover_text("The brush's values everywhere, shown through a mask")
+        .clicked()
+    {
+        actions.push(LayerAction::AddFill);
+    }
+    presets_menu(ui, presets, actions);
+
+    ui.separator();
+    ui.weak("Mask of the selected layer");
+    let has_mask = current.mask.is_some();
+    ui.add_enabled_ui(!current.is_base(), |ui| {
+        let add = |ui: &mut egui::Ui, label, hint| {
+            ui.add_enabled(!has_mask, egui::Button::new(label))
+                .on_hover_text(hint)
+                .clicked()
+        };
+        if add(
+            ui,
+            "Add mask (show all)",
+            "Then paint with Erase on to hide parts",
+        ) {
+            actions.push(LayerAction::AddMask {
+                layer: selected,
+                hide: false,
+            });
+        }
+        if add(ui, "Add mask (hide all)", "Then paint to reveal parts") {
+            actions.push(LayerAction::AddMask {
+                layer: selected,
+                hide: true,
+            });
+        }
+        if add(
+            ui,
+            "Add generator mask",
+            "A mask made from noise or a gradient, set in the layer's details",
+        ) {
+            actions.push(LayerAction::AddGeneratorMask(selected));
+        }
+        let generated = current.mask_generator.is_some();
+        if ui
+            .add_enabled(generated, egui::Button::new("Convert to painted mask"))
+            .on_hover_text("Keep the pattern's pixels and paint on them")
+            .clicked()
+        {
+            actions.push(LayerAction::ConvertGeneratorMask(selected));
+        }
+        ui.separator();
+        if ui
+            .add_enabled(has_mask, egui::Button::new("Delete mask"))
+            .clicked()
+        {
+            actions.push(LayerAction::DeleteMask(selected));
+        }
+    })
+    .response
+    .on_disabled_hover_text("The base layer can't have a mask");
+}
+
+/// Adds, saves and deletes presets.
 fn presets_menu(ui: &mut egui::Ui, presets: &Library, actions: &mut Vec<LayerAction>) {
     ui.menu_button("Presets ⏷", |ui| {
         let built_in = presets.built_in().len();
@@ -346,7 +407,7 @@ fn settings(
             {
                 mix.generator = draft;
             }
-            generator_controls(ui, "mix", &mut mix.generator, &mut released);
+            recipe_controls(ui, "mix", &mut mix.generator, &mut released);
         }
         let wanted = edited.mix.map(|mix| mix.generator);
         if released || mixed != fill.mix.is_some() {
@@ -383,7 +444,7 @@ fn settings(
         let mut edited = shown;
         // Whether the user let go of a control, and whether something changed.
         let mut released = false;
-        generator_controls(ui, "mask", &mut edited, &mut released);
+        recipe_controls(ui, "mask", &mut edited, &mut released);
         if released {
             state.draft = None;
             if edited != applied {
@@ -399,6 +460,67 @@ fn settings(
             ui.weak("Applies when you let go.");
         }
     }
+}
+
+/// The controls of a recipe: its first pattern, the patterns combined into
+/// it, and a button to combine one more. Sets `released` like
+/// `generator_controls`, and at once when patterns are added, removed or
+/// combined differently.
+fn recipe_controls(ui: &mut egui::Ui, id: &str, recipe: &mut Recipe, released: &mut bool) {
+    ui.push_id(id, |ui| {
+        let combined = recipe.step_count() > 0;
+        if combined {
+            ui.strong("Pattern 1");
+        }
+        generator_controls(ui, "first", &mut recipe.base, released);
+        let mut remove = None;
+        for index in 0..recipe.step_count() {
+            let Some(step) = recipe.step_mut(index) else {
+                break;
+            };
+            ui.push_id(index, |ui| {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong(format!("Pattern {}", index + 2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                });
+                let before = step.op;
+                egui::ComboBox::from_label("Combine")
+                    .selected_text(step.op.name())
+                    .show_ui(ui, |ui| {
+                        for op in Op::ALL {
+                            ui.selectable_value(&mut step.op, op, op.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Multiply cuts holes in what came before, Add and Lighter grow it, \
+                         Subtract and Darker carve it away",
+                    );
+                *released |= step.op != before;
+                let amount = ui.add(egui::Slider::new(&mut step.amount, 0.0..=1.0).text("Amount"));
+                *released |= amount.drag_stopped() || (amount.changed() && !amount.dragged());
+                generator_controls(ui, "pattern", &mut step.generator, released);
+            });
+        }
+        if let Some(index) = remove {
+            recipe.remove_step(index);
+            *released = true;
+        }
+        if recipe.step_count() < MAX_STEPS
+            && ui
+                .button("+ Combine another pattern")
+                .on_hover_text("Mix a second pattern into this one, e.g. fine grain into blotches")
+                .clicked()
+        {
+            recipe.add_step();
+            *released = true;
+        }
+    });
 }
 
 /// The pattern's controls. Sets `released` once the user has let go of one
@@ -553,20 +675,23 @@ fn layer_row(
 
     // Keep the dropdown open while ticking several slots.
     let config = MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-    MenuButton::new(slot_summary(document, layer))
-        .config(config)
-        .ui(ui, |ui| {
-            for (slot, material) in document.mesh.materials.iter().enumerate() {
-                let mut on = layer.targets.get(slot).copied().unwrap_or(false);
-                if ui.checkbox(&mut on, &material.name).changed() {
-                    actions.push(LayerAction::SetTarget {
-                        layer: index,
-                        slot,
-                        on,
-                    });
+    // The slot dropdown sits at the right edge, whatever the panel's width.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        MenuButton::new(slot_summary(document, layer))
+            .config(config)
+            .ui(ui, |ui| {
+                for (slot, material) in document.mesh.materials.iter().enumerate() {
+                    let mut on = layer.targets.get(slot).copied().unwrap_or(false);
+                    if ui.checkbox(&mut on, &material.name).changed() {
+                        actions.push(LayerAction::SetTarget {
+                            layer: index,
+                            slot,
+                            on,
+                        });
+                    }
                 }
-            }
-        });
+            });
+    });
 }
 
 fn slot_summary(document: &Document, layer: &Layer) -> String {

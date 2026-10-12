@@ -216,6 +216,158 @@ impl Generator {
     }
 }
 
+/// How a pattern is combined with the result so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Op {
+    /// Keeps only what both have: the second pattern cuts holes in the first.
+    #[default]
+    Multiply,
+    Add,
+    Subtract,
+    /// The brighter of the two at every point.
+    Lighter,
+    /// The darker of the two at every point.
+    Darker,
+}
+
+impl Op {
+    pub const ALL: [Op; 5] = [Op::Multiply, Op::Add, Op::Subtract, Op::Lighter, Op::Darker];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Op::Multiply => "Multiply",
+            Op::Add => "Add",
+            Op::Subtract => "Subtract",
+            Op::Lighter => "Lighter",
+            Op::Darker => "Darker",
+        }
+    }
+
+    /// Stable number for files.
+    pub fn index(self) -> u8 {
+        Self::ALL.iter().position(|op| *op == self).unwrap_or(0) as u8
+    }
+
+    pub fn from_index(index: u8) -> Option<Self> {
+        Self::ALL.get(index as usize).copied()
+    }
+
+    /// Combines the result so far (`below`) with a pattern's value (`top`).
+    pub fn apply(self, below: f32, top: f32) -> f32 {
+        match self {
+            Op::Multiply => below * top,
+            Op::Add => (below + top).min(1.0),
+            Op::Subtract => (below - top).max(0.0),
+            Op::Lighter => below.max(top),
+            Op::Darker => below.min(top),
+        }
+    }
+}
+
+/// A pattern laid over the ones before it in a `Recipe`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Step {
+    pub op: Op,
+    /// 0..1: how much of the combined result replaces what was there.
+    pub amount: f32,
+    pub generator: Generator,
+}
+
+/// The most patterns that go on top of a recipe's first one.
+pub const MAX_STEPS: usize = 3;
+
+/// What decides a value from 0 to 1 at every point of the model: one pattern,
+/// with up to `MAX_STEPS` more combined into it one after the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Recipe {
+    pub base: Generator,
+    /// Filled from the front.
+    steps: [Option<Step>; MAX_STEPS],
+}
+
+impl From<Generator> for Recipe {
+    fn from(base: Generator) -> Self {
+        Self {
+            base,
+            steps: [None; MAX_STEPS],
+        }
+    }
+}
+
+impl Recipe {
+    /// A recipe from a first pattern and the patterns combined into it
+    /// (those beyond `MAX_STEPS` are left out).
+    pub fn with_steps(base: Generator, steps: impl IntoIterator<Item = Step>) -> Self {
+        let mut recipe = Self::from(base);
+        for (slot, step) in recipe.steps.iter_mut().zip(steps) {
+            *slot = Some(step);
+        }
+        recipe
+    }
+
+    pub fn steps(&self) -> impl Iterator<Item = &Step> {
+        self.steps.iter().flatten()
+    }
+
+    pub fn step_count(&self) -> usize {
+        self.steps().count()
+    }
+
+    pub fn step_mut(&mut self, index: usize) -> Option<&mut Step> {
+        self.steps.get_mut(index)?.as_mut()
+    }
+
+    /// Adds a pattern: finer noise that cuts into the result, to start from.
+    /// Returns false if the recipe is full.
+    pub fn add_step(&mut self) -> bool {
+        let count = self.step_count();
+        let Some(slot) = self.steps.get_mut(count) else {
+            return false;
+        };
+        *slot = Some(Step {
+            op: Op::Multiply,
+            amount: 1.0,
+            generator: Generator {
+                scale: 16.0,
+                seed: self.base.seed.wrapping_add(count as u32 + 1),
+                ..Generator::default()
+            },
+        });
+        true
+    }
+
+    pub fn remove_step(&mut self, index: usize) {
+        if index < MAX_STEPS {
+            self.steps[index] = None;
+            // Close the gap.
+            self.steps[index..].rotate_left(1);
+        }
+    }
+
+    /// Whether any pattern follows folds of this kind (so needs distances).
+    pub fn uses(&self, fold: edges::Fold) -> bool {
+        std::iter::once(&self.base)
+            .chain(self.steps().map(|step| &step.generator))
+            .any(|generator| generator.pattern.fold() == Some(fold))
+    }
+
+    /// The value (0..1) at `point`; `near` is how far it is from the nearest
+    /// convex edge and the nearest crease (see `Generator::sample`).
+    pub fn sample(&self, point: Vec3, frame: &Frame, near: [f32; 2]) -> f32 {
+        let value = |generator: &Generator| {
+            let distance = generator
+                .pattern
+                .fold()
+                .map_or(f32::INFINITY, |fold| near[fold as usize]);
+            generator.sample(point, frame, distance)
+        };
+        self.steps().fold(value(&self.base), |below, step| {
+            let combined = step.op.apply(below, value(&step.generator));
+            below + (combined - below) * step.amount.clamp(0.0, 1.0)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +455,95 @@ mod tests {
             assert_eq!(Axis::from_index(axis.index()), Some(axis));
         }
         assert_eq!(Pattern::from_index(99), None);
+    }
+
+    #[test]
+    fn a_second_pattern_cuts_into_the_first() {
+        let blotches = Generator {
+            low: 0.4,
+            high: 0.6,
+            ..Generator::default()
+        };
+        let mut recipe = Recipe::from(blotches);
+        assert!(recipe.add_step());
+        assert_eq!(recipe.step_count(), 1);
+        let none = [f32::INFINITY; 2];
+        let (mut cut, mut equal) = (0, 0);
+        for i in 0..400 {
+            let p = Vec3::new(i as f32 * 0.031, i as f32 * 0.017, i as f32 * 0.009);
+            let alone = Recipe::from(blotches).sample(p, &FRAME, none);
+            let combined = recipe.sample(p, &FRAME, none);
+            assert!(combined <= alone + 1e-6, "multiplying never adds");
+            if combined < alone - 0.01 {
+                cut += 1;
+            } else {
+                equal += 1;
+            }
+        }
+        assert!(cut > 20 && equal > 20, "{cut} cut, {equal} untouched");
+    }
+
+    #[test]
+    fn steps_combine_in_order_and_by_their_amount() {
+        let flat = |value: f32| Generator {
+            pattern: Pattern::Gradient,
+            axis: Axis::Y,
+            // A gradient squeezed by its levels to 1 wherever it is above `value`.
+            low: value,
+            high: value,
+            ..Generator::default()
+        };
+        let at = Vec3::new(0.0, 4.0, 0.0); // the top: the gradient is 1, so above 0.5
+        let near = [f32::INFINITY; 2];
+        let make = |op, amount| {
+            Recipe::with_steps(
+                flat(0.5),
+                [Step {
+                    op,
+                    amount,
+                    generator: Generator {
+                        invert: true,
+                        ..flat(0.5)
+                    },
+                }],
+            )
+        };
+        // Base 1, step 0 (the inverted gradient).
+        assert_eq!(make(Op::Multiply, 1.0).sample(at, &FRAME, near), 0.0);
+        assert_eq!(make(Op::Add, 1.0).sample(at, &FRAME, near), 1.0);
+        assert_eq!(make(Op::Subtract, 1.0).sample(at, &FRAME, near), 1.0);
+        assert_eq!(make(Op::Darker, 1.0).sample(at, &FRAME, near), 0.0);
+        assert_eq!(make(Op::Lighter, 1.0).sample(at, &FRAME, near), 1.0);
+        // Half the amount: halfway between the base and the combined result.
+        assert_eq!(make(Op::Multiply, 0.5).sample(at, &FRAME, near), 0.5);
+        assert_eq!(make(Op::Multiply, 0.0).sample(at, &FRAME, near), 1.0);
+    }
+
+    #[test]
+    fn steps_can_be_added_removed_and_are_limited() {
+        let mut recipe = Recipe::default();
+        for _ in 0..MAX_STEPS {
+            assert!(recipe.add_step());
+        }
+        assert!(!recipe.add_step(), "full");
+        let seeds: Vec<u32> = recipe.steps().map(|s| s.generator.seed).collect();
+        assert!(seeds.windows(2).all(|pair| pair[0] != pair[1]), "{seeds:?}");
+        recipe.remove_step(0);
+        let left: Vec<u32> = recipe.steps().map(|s| s.generator.seed).collect();
+        assert_eq!(left, seeds[1..]);
+        assert!(recipe.add_step());
+        assert_eq!(recipe.step_count(), MAX_STEPS);
+        recipe.remove_step(MAX_STEPS + 5); // nothing there
+        assert_eq!(Recipe::from(Generator::default()).step_count(), 0);
+        assert!(recipe.step_mut(MAX_STEPS).is_none());
+        assert!(!Recipe::default().uses(edges::Fold::Concave));
+    }
+
+    #[test]
+    fn op_numbers_round_trip() {
+        for op in Op::ALL {
+            assert_eq!(Op::from_index(op.index()), Some(op));
+        }
+        assert_eq!(Op::from_index(99), None);
     }
 }

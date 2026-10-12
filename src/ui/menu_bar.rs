@@ -1,3 +1,4 @@
+use crate::autosaves::Kept;
 use crate::renderer::environment::{BuiltIn, EnvironmentSource};
 use crate::renderer::viewport::{EnvironmentSettings, ViewMode};
 use crate::settings::Autosave;
@@ -10,6 +11,10 @@ pub enum MenuAction {
     OpenProject,
     OpenRecent(PathBuf),
     ClearRecent,
+    /// Open the kept autosave at this index of `MenuState::autosaves`.
+    OpenAutosave(usize),
+    DeleteAutosave(usize),
+    DeleteAllAutosaves,
     SaveProject,
     SaveProjectAs,
     ExportTextures,
@@ -44,6 +49,8 @@ pub struct MenuState<'a> {
     pub can_redo: bool,
     pub view_mode: ViewMode,
     pub recent_files: &'a [PathBuf],
+    /// Newest first.
+    pub autosaves: &'a [Kept],
     pub environment_source: &'a EnvironmentSource,
 }
 
@@ -104,6 +111,14 @@ pub fn show(
                             action = Some(MenuAction::ClearRecent);
                         }
                     });
+                });
+                ui.add_enabled_ui(!state.autosaves.is_empty(), |ui| {
+                    ui.menu_button("Autosaves", |ui| {
+                        autosaves_menu(ui, state.autosaves, &mut action)
+                    })
+                    .response
+                    .on_hover_text("Work you chose not to save is kept here for a while")
+                    .on_disabled_hover_text("Nothing kept yet");
                 });
                 ui.separator();
                 let shortcut = ui.ctx().format_shortcut(&SAVE);
@@ -189,7 +204,8 @@ pub fn show(
                 ui.checkbox(&mut autosave.enabled, "Autosave")
                     .on_hover_text(
                         "While there are unsaved changes, keep a recovery copy that is \
-                         offered for restoring if RustPaint crashes",
+                         offered for restoring if RustPaint crashes. Work you \
+                         choose not to save is kept under File > Autosaves",
                     );
                 ui.add_enabled(
                     autosave.enabled,
@@ -207,4 +223,48 @@ pub fn show(
     });
 
     action
+}
+
+/// The newest kept autosaves, as "model - date and time".
+fn autosaves_menu(ui: &mut egui::Ui, autosaves: &[Kept], action: &mut Option<MenuAction>) {
+    for (index, kept) in autosaves.iter().enumerate() {
+        let hover = format!(
+            "{}{:.1} MB",
+            kept.info
+                .project_path
+                .as_ref()
+                .map_or(String::new(), |path| format!("From {}\n", path.display())),
+            kept.bytes as f64 / (1024.0 * 1024.0)
+        );
+        if ui
+            .button(autosave_label(kept))
+            .on_hover_text(hover)
+            .clicked()
+        {
+            *action = Some(MenuAction::OpenAutosave(index));
+        }
+    }
+    ui.separator();
+    ui.menu_button("Delete autosave", |ui| {
+        for (index, kept) in autosaves.iter().enumerate() {
+            if ui.button(autosave_label(kept)).clicked() {
+                *action = Some(MenuAction::DeleteAutosave(index));
+            }
+        }
+        ui.separator();
+        if ui.button("Delete all").clicked() {
+            *action = Some(MenuAction::DeleteAllAutosaves);
+        }
+    });
+}
+
+/// "car - 2026-10-12 18:42": the model's name and when the copy was kept.
+pub fn autosave_label(kept: &Kept) -> String {
+    let when = chrono::DateTime::<chrono::Local>::from(kept.kept_at);
+    let name = if kept.info.model_name.is_empty() {
+        "Untitled"
+    } else {
+        &kept.info.model_name
+    };
+    format!("{name} - {}", when.format("%Y-%m-%d %H:%M"))
 }
