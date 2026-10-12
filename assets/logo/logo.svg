@@ -1,0 +1,134 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 20010904//EN" "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd">
+<!-- Created using Krita: https://krita.org -->
+<svg xmlns="http://www.w3.org/2000/svg" 
+    xmlns:xlink="http://www.w3.org/1999/xlink"
+    xmlns:krita="http://krita.org/namespaces/svg/krita"
+    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+    width="76.32pt"
+    height="76.32pt"
+    viewBox="0 0 76.32 76.32">
+<defs>
+  <linearGradient id="gradient0" gradientUnits="objectBoundingBox" x1="0" y1="0" x2="1.15454893498538" y2="1.1082564373247" spreadMethod="pad">
+   <stop stop-color="#ff0000" offset="0.132286995515695" stop-opacity="1"/>
+   <stop stop-color="#f94000" offset="0.273542600896861" stop-opacity="1"/>
+   <stop stop-color="#86e200" offset="0.383408071748879" stop-opacity="1"/>
+   <stop stop-color="#00ff00" offset="0.482062780269058" stop-opacity="1"/>
+   <stop stop-color="#0000ff" offset="0.728699551569507" stop-opacity="1"/>
+  </linearGradient>
+ </defs>
+<ellipse id="shape0" transform="matrix(0.999857224766942 -0.0168976353775193 0.0168976353775193 0.999857224766942 7.82999999999998 10.8000000000001)" rx="29.896937994487" ry="28.5442629709333" cx="29.896937994487" cy="28.5442629709333" fill="url(#gradient0)" fill-rule="evenodd" stroke="none" stroke-width="43.2" stroke-linecap="square" stroke-linejoin="bevel"/><g id="gear" transform="matrix(0.72 0 0 0.72 38.115 38.295)" fill="none">
+  <circle id="shape1" transform="translate(-43, -43)" r="43" cx="43" cy="43" fill="none" stroke="#000000" stroke-width="9" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="2"/>
+  <g id="cogs" fill="none">
+   <path id="cog" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   <g id="group0" transform="matrix(0.98078528040323 0.195090322016128 -0.195090322016128 0.98078528040323 0 0)" fill="none">
+    <path id="cog_32bd970e" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group1" transform="matrix(0.923879532511287 0.38268343236509 -0.38268343236509 0.923879532511287 0 0)" fill="none">
+    <path id="cog_46b79cfe" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group2" transform="matrix(0.831469612302545 0.555570233019602 -0.555570233019602 0.831469612302545 7.105427357601e-15 0)" fill="none">
+    <path id="cog_54aebf73" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group3" transform="matrix(0.707106781186547 0.707106781186547 -0.707106781186547 0.707106781186547 0 0)" fill="none">
+    <path id="cog_1ab2c09e" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group4" transform="matrix(0.555570233019602 0.831469612302545 -0.831469612302545 0.555570233019602 0 0)" fill="none">
+    <path id="cog_255240ae" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group5" transform="matrix(0.38268343236509 0.923879532511287 -0.923879532511287 0.38268343236509 0 7.105427357601e-15)" fill="none">
+    <path id="cog_77b6ddef" transform="translate(46, -3.00000000000001)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group6" transform="matrix(0.195090322016128 0.98078528040323 -0.98078528040323 0.195090322016128 0 7.105427357601e-15)" fill="none">
+    <path id="cog_4192cc8d" transform="translate(46, -3.00000000000001)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group7" transform="matrix(0 1 -1 0 0 0)" fill="none">
+    <path id="cog_43a2adb3" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group8" transform="matrix(-0.195090322016128 0.98078528040323 -0.98078528040323 -0.195090322016128 0 0)" fill="none">
+    <path id="cog_287eef86" transform="translate(46, -3.00000000000003)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group9" transform="matrix(-0.38268343236509 0.923879532511287 -0.923879532511287 -0.38268343236509 0 0)" fill="none">
+    <path id="cog_39a96c81" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group10" transform="matrix(-0.555570233019602 0.831469612302545 -0.831469612302545 -0.555570233019602 0 0)" fill="none">
+    <path id="cog_11b68612" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group11" transform="matrix(-0.707106781186547 0.707106781186547 -0.707106781186547 -0.707106781186547 0 0)" fill="none">
+    <path id="cog_5646f54a" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group12" transform="matrix(-0.831469612302545 0.555570233019602 -0.555570233019602 -0.831469612302545 -7.105427357601e-15 0)" fill="none">
+    <path id="cog_49ce8ebe" transform="translate(46, -3.00000000000001)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group13" transform="matrix(-0.923879532511287 0.38268343236509 -0.38268343236509 -0.923879532511287 0 7.105427357601e-15)" fill="none">
+    <path id="cog_622f5079" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group14" transform="matrix(-0.98078528040323 0.195090322016128 -0.195090322016128 -0.98078528040323 0 0)" fill="none">
+    <path id="cog_5ab48e12" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group15" transform="matrix(-1 0 0 -1 0 0)" fill="none">
+    <path id="cog_2364f905" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group16" transform="matrix(-0.98078528040323 -0.195090322016128 0.195090322016128 -0.98078528040323 7.105427357601e-15 0)" fill="none">
+    <path id="cog_4fbc1712" transform="translate(46, -3.00000000000001)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group17" transform="matrix(-0.923879532511287 -0.38268343236509 0.38268343236509 -0.923879532511287 7.105427357601e-15 7.105427357601e-15)" fill="none">
+    <path id="cog_2e3513cf" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group18" transform="matrix(-0.831469612302545 -0.555570233019602 0.555570233019602 -0.831469612302545 0 0)" fill="none">
+    <path id="cog_3b67b10a" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group19" transform="matrix(-0.707106781186547 -0.707106781186548 0.707106781186548 -0.707106781186547 0 7.105427357601e-15)" fill="none">
+    <path id="cog_4c8b9eba" transform="translate(46, -3.00000000000001)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group20" transform="matrix(-0.555570233019602 -0.831469612302545 0.831469612302545 -0.555570233019602 0 7.105427357601e-15)" fill="none">
+    <path id="cog_22ee2bd3" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group21" transform="matrix(-0.38268343236509 -0.923879532511287 0.923879532511287 -0.38268343236509 0 7.105427357601e-15)" fill="none">
+    <path id="cog_44be43a4" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group22" transform="matrix(-0.195090322016129 -0.98078528040323 0.98078528040323 -0.195090322016129 0 0)" fill="none">
+    <path id="cog_3baf7269" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group23" transform="matrix(0 -1 1 0 0 0)" fill="none">
+    <path id="cog_185ed69d" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group24" transform="matrix(0.195090322016128 -0.98078528040323 0.98078528040323 0.195090322016128 7.105427357601e-15 0)" fill="none">
+    <path id="cog_5a9cfe54" transform="translate(46, -2.99999999999998)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group25" transform="matrix(0.38268343236509 -0.923879532511286 0.923879532511286 0.38268343236509 7.105427357601e-15 7.105427357601e-15)" fill="none">
+    <path id="cog_6eaa1e83" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group26" transform="matrix(0.555570233019602 -0.831469612302545 0.831469612302545 0.555570233019602 7.105427357601e-15 0)" fill="none">
+    <path id="cog_11eb240b" transform="translate(46, -2.99999999999998)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group27" transform="matrix(0.707106781186547 -0.707106781186547 0.707106781186547 0.707106781186547 0 0)" fill="none">
+    <path id="cog_65e1496b" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group28" transform="matrix(0.831469612302545 -0.555570233019602 0.555570233019602 0.831469612302545 0 7.105427357601e-15)" fill="none">
+    <path id="cog_2f45cd29" transform="translate(46, -3)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group29" transform="matrix(0.923879532511287 -0.38268343236509 0.38268343236509 0.923879532511287 0 7.105427357601e-15)" fill="none">
+    <path id="cog_3d8d2bbb" transform="translate(46, -3.00000000000001)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group30" transform="matrix(0.98078528040323 -0.195090322016129 0.195090322016129 0.98078528040323 0 0)" fill="none">
+    <path id="cog_267d2c9d" transform="translate(46, -2.99999999999999)" fill="#000000" stroke="#000000" stroke-width="3" stroke-linecap="butt" stroke-linejoin="round" d="M0 6L5 3L0 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+  </g>
+  <g id="mounts" fill="none">
+   <path id="mount" transform="translate(-6.99999999999999, -42)" fill="#000000" stroke="#000000" stroke-width="6" stroke-linecap="butt" stroke-linejoin="round" d="M0 0L7 7L14 0Z" sodipodi:nodetypes="cccc"/>
+   <g id="group31" transform="matrix(0.309016994374947 0.951056516295154 -0.951056516295154 0.309016994374947 0 0)" fill="none">
+    <path id="mount_4dda6356" transform="translate(-7, -42)" fill="#000000" stroke="#000000" stroke-width="6" stroke-linecap="butt" stroke-linejoin="round" d="M0 0L7 7L14 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group32" transform="matrix(-0.809016994374947 0.587785252292473 -0.587785252292473 -0.809016994374947 0 7.105427357601e-15)" fill="none">
+    <path id="mount_2ed648f4" transform="translate(-6.99999999999999, -42)" fill="#000000" stroke="#000000" stroke-width="6" stroke-linecap="butt" stroke-linejoin="round" d="M0 0L7 7L14 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group33" transform="matrix(-0.809016994374948 -0.587785252292473 0.587785252292473 -0.809016994374948 1.4210854715202e-14 7.105427357601e-15)" fill="none">
+    <path id="mount_427853f8" transform="translate(-7.00000000000001, -42)" fill="#000000" stroke="#000000" stroke-width="6" stroke-linecap="butt" stroke-linejoin="round" d="M0 0L7 7L14 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+   <g id="group34" transform="matrix(0.309016994374947 -0.951056516295154 0.951056516295154 0.309016994374947 0 -7.105427357601e-15)" fill="none">
+    <path id="mount_51d9fae4" transform="translate(-7, -42)" fill="#000000" stroke="#000000" stroke-width="6" stroke-linecap="butt" stroke-linejoin="round" d="M0 0L7 7L14 0Z" sodipodi:nodetypes="cccc"/>
+   </g>
+  </g>
+ </g>
+</svg>

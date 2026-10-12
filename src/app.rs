@@ -28,6 +28,8 @@ const DEFAULT_CANVAS_SIZE: u32 = 2048;
 /// An action waiting for the user to decide what happens to unsaved changes.
 enum Pending {
     Quit,
+    /// File > New project.
+    New,
     Open(PathBuf),
 }
 
@@ -894,6 +896,25 @@ impl RustPaintApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Pending::Open(path) => self.open(&path, frame),
+            Pending::New => self.new_project(frame),
+        }
+    }
+
+    /// Starts over with the cube RustPaint opens with, in this window.
+    fn new_project(&mut self, frame: &eframe::Frame) {
+        self.set_document(Document::new(mesh::primitives::cube()), frame);
+        self.model_name = "cube".to_string();
+        self.export_directory = None;
+        self.project_path = None;
+        self.status = "New project".to_string();
+    }
+
+    /// Runs RustPaint again in its own window.
+    fn open_new_window(&mut self) {
+        let started = std::env::current_exe()
+            .and_then(|exe| std::process::Command::new(exe).spawn().map(|_| ()));
+        if let Err(error) = started {
+            self.status = format!("Could not start another RustPaint: {error}");
         }
     }
 
@@ -905,6 +926,7 @@ impl RustPaintApp {
         let verb = match pending {
             Pending::Quit => "closing",
             Pending::Open(_) => "opening another file",
+            Pending::New => return self.new_project_dialog(ctx, frame),
         };
         let document = self
             .project_path
@@ -954,6 +976,75 @@ impl RustPaintApp {
                 }
             }
             Choice::Discard => self.proceed(pending, ctx, frame),
+            Choice::Cancel => {}
+        }
+    }
+
+    /// "New project": in a new window, or here (asking about unsaved changes).
+    fn new_project_dialog(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let unsaved = self.has_unsaved_changes();
+        let document = self
+            .project_path
+            .as_deref()
+            .map_or_else(|| "Untitled".to_string(), file_name);
+
+        #[derive(Clone, Copy)]
+        enum Choice {
+            NewWindow,
+            SaveAndReplace,
+            Replace,
+            Cancel,
+        }
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("new_project")).show(ctx, |ui| {
+            ui.heading("New project");
+            if unsaved {
+                ui.label(format!("{document} has unsaved changes."));
+            } else {
+                ui.label("Where should the new project open?");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("New window")
+                    .on_hover_text("Open it in a second RustPaint and keep this one as it is")
+                    .clicked()
+                {
+                    choice = Some(Choice::NewWindow);
+                }
+                if unsaved {
+                    if ui.button("Save and open here").clicked() {
+                        choice = Some(Choice::SaveAndReplace);
+                    }
+                    if ui.button("Don't save and open here").clicked() {
+                        choice = Some(Choice::Replace);
+                    }
+                } else if ui.button("Open here").clicked() {
+                    choice = Some(Choice::Replace);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(Choice::Cancel);
+                }
+            });
+        });
+        // Escape or a click outside counts as Cancel.
+        if modal.should_close() && choice.is_none() {
+            choice = Some(Choice::Cancel);
+        }
+        let Some(choice) = choice else {
+            return;
+        };
+        self.pending = None;
+        match choice {
+            Choice::NewWindow => self.open_new_window(),
+            Choice::SaveAndReplace => {
+                self.save_project(false);
+                // Only go ahead if the save actually happened (not cancelled or failed).
+                if !self.has_unsaved_changes() {
+                    self.new_project(frame);
+                }
+            }
+            Choice::Replace => self.new_project(frame),
             Choice::Cancel => {}
         }
     }
@@ -1177,6 +1268,7 @@ impl eframe::App for RustPaintApp {
             &mut self.environment,
             &mut self.autosave_options,
         ) {
+            Some(MenuAction::NewProject) => self.pending = Some(Pending::New),
             Some(MenuAction::OpenModel) => {
                 let picked = rfd::FileDialog::new()
                     .add_filter("glTF", &["glb", "gltf"])

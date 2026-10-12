@@ -24,3 +24,4 @@ rustc-ice-*.txt
 #.idea/
 # Local test models
 car.glb
+pressure_vessel.glb

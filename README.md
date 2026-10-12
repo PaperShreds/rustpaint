@@ -113,7 +113,10 @@ and shows or hides it as a blurred background.
 
 Closing the window, or opening another file, with unsaved changes asks whether
 to save them first. **File > Open recent** lists the last files you opened or
-saved.
+saved. **File > New project** (Ctrl+N) starts again with the cube RustPaint
+opens with: in a second window, which leaves this one alone, or here, after
+asking about unsaved changes. Open a model into the new project from the File
+menu as usual.
 
 The program remembers your recent files, environment, view, brush and
 autosave settings, and window size between runs (in `~/.local/share/rustpaint/` on Linux, the
@@ -167,6 +170,14 @@ Build and run the test suite with:
 cargo build
 cargo test
 ```
+
+## Credits
+
+The logo (`assets/logo/`) uses the cog ring of the Rust programming language
+logo, which is owned by the Rust Foundation and distributed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); see
+`assets/logo/README.md`. The viewport environments are from Poly Haven (CC0),
+see `assets/environments/`.
 
 ## Next milestone
 

@@ -5,6 +5,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 pub enum MenuAction {
+    NewProject,
     OpenModel,
     OpenProject,
     OpenRecent(PathBuf),
@@ -20,6 +21,8 @@ pub enum MenuAction {
     SetEnvironment(BuiltIn),
 }
 
+const NEW: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
 const SAVE: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
 const SAVE_AS: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
@@ -56,6 +59,8 @@ pub fn show(
             Some(MenuAction::SaveProjectAs)
         } else if i.consume_shortcut(&SAVE) {
             Some(MenuAction::SaveProject)
+        } else if i.consume_shortcut(&NEW) {
+            Some(MenuAction::NewProject)
         } else if i.consume_shortcut(&REDO) || i.consume_shortcut(&REDO_ALT) {
             Some(MenuAction::Redo)
         } else if i.consume_shortcut(&UNDO) {
@@ -68,6 +73,14 @@ pub fn show(
     egui::Panel::top("menu_bar").show(ui, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                let shortcut = ui.ctx().format_shortcut(&NEW);
+                if ui
+                    .add(egui::Button::new("New project").shortcut_text(shortcut))
+                    .on_hover_text("Start again with an empty cube")
+                    .clicked()
+                {
+                    action = Some(MenuAction::NewProject);
+                }
                 if ui.button("Open model...").clicked() {
                     action = Some(MenuAction::OpenModel);
                 }
