@@ -7,7 +7,8 @@
 @group(1) @binding(0) var base_color_texture: texture_2d<f32>;
 @group(1) @binding(1) var roughness_texture: texture_2d<f32>;
 @group(1) @binding(2) var metallic_texture: texture_2d<f32>;
-@group(1) @binding(3) var material_sampler: sampler;
+@group(1) @binding(3) var height_texture: texture_2d<f32>;
+@group(1) @binding(4) var material_sampler: sampler;
 
 // Equirectangular HDR environment with a mip chain (blurrier with each level).
 @group(2) @binding(0) var environment_texture: texture_2d<f32>;
@@ -40,6 +41,58 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 fn sample_channel(texture: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
     let texel = textureSample(texture, material_sampler, uv);
     return select(texel.rgb / texel.a, vec3<f32>(0.0), texel.a <= 0.0);
+}
+
+// The straight height at `uv`, `offset` texels away, from mip `level`.
+fn height_at(uv: vec2<f32>, offset: vec2<f32>, texel: vec2<f32>, level: f32) -> f32 {
+    let t = textureSampleLevel(height_texture, material_sampler, uv + offset * texel, level);
+    return select(t.r / t.a, 0.5, t.a <= 0.0);
+}
+
+// The surface normal bent by the bumps of the height channel, using the
+// surface gradient (Mikkelsen 2010): no tangents needed. Same slopes as
+// `Bake::normal_map`, so the viewport matches the exported normal map.
+fn bumped_normal(in: VertexOutput) -> vec3<f32> {
+    let n = normalize(in.normal);
+    let dp_x = dpdx(in.world_position);
+    let dp_y = dpdy(in.world_position);
+    let duv_x = dpdx(in.uv);
+    let duv_y = dpdy(in.uv);
+    let depth = camera.background.y;
+    if depth <= 0.0 {
+        return n;
+    }
+    // The mip whose texels are about a pixel, so distant bumps don't shimmer.
+    let size = vec2<f32>(textureDimensions(height_texture));
+    let footprint = max(length(duv_x * size), length(duv_y * size));
+    let top = f32(textureNumLevels(height_texture) - 1u);
+    let level = clamp(log2(max(footprint, 1.0)), 0.0, top);
+    let texel = exp2(floor(level)) / size;
+    // Sobel: slopes per UV unit, smoothed across.
+    let h = array<f32, 9>(
+        height_at(in.uv, vec2(-1.0, -1.0), texel, level),
+        height_at(in.uv, vec2(0.0, -1.0), texel, level),
+        height_at(in.uv, vec2(1.0, -1.0), texel, level),
+        height_at(in.uv, vec2(-1.0, 0.0), texel, level),
+        0.0,
+        height_at(in.uv, vec2(1.0, 0.0), texel, level),
+        height_at(in.uv, vec2(-1.0, 1.0), texel, level),
+        height_at(in.uv, vec2(0.0, 1.0), texel, level),
+        height_at(in.uv, vec2(1.0, 1.0), texel, level),
+    );
+    let slope_u = ((h[2] - h[0]) + 2.0 * (h[5] - h[3]) + (h[8] - h[6])) / (8.0 * texel.x);
+    let slope_v = ((h[6] - h[0]) + 2.0 * (h[7] - h[1]) + (h[8] - h[2])) / (8.0 * texel.y);
+    // How u and v change across the surface, from their screen derivatives.
+    let r1 = cross(dp_y, n);
+    let r2 = cross(n, dp_x);
+    let det = dot(dp_x, r1);
+    if abs(det) < 1e-20 {
+        return n;
+    }
+    let grad_u = (r1 * duv_x.x + r2 * duv_y.x) / det;
+    let grad_v = (r1 * duv_x.y + r2 * duv_y.y) / det;
+    let bumped = n - depth * (slope_u * grad_u + slope_v * grad_v);
+    return select(normalize(bumped), n, dot(bumped, bumped) < 1e-12);
 }
 
 // Environment light arriving from `direction`, blurred by `blur` (0 sharp, 1 fully).
@@ -77,9 +130,17 @@ fn shade(in: VertexOutput) -> vec3<f32> {
     if mode == 3u {
         return vec3<f32>(metallic);
     }
+    if mode == 4u {
+        return vec3<f32>(sample_channel(height_texture, in.uv).r);
+    }
+    let n = bumped_normal(in);
+    if mode == 5u {
+        // Shown as stored colour, so undo the display encoding to come.
+        let color = n * 0.5 + 0.5;
+        return color * color;
+    }
 
     let roughness = clamp(roughness_value, 0.02, 1.0);
-    let n = normalize(in.normal);
     let v = normalize(camera.eye.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 1e-4);
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);

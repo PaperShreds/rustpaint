@@ -110,12 +110,21 @@ pub enum Channel {
     BaseColor,
     Roughness,
     Metallic,
+    /// How far the surface is raised: 0.5 is level, higher values bulge out
+    /// and lower ones sink in. Shown as bumps; exported as a normal map.
+    Height,
 }
 
 impl Channel {
-    pub const COUNT: usize = 3;
-    pub const ALL: [Channel; Channel::COUNT] =
-        [Channel::BaseColor, Channel::Roughness, Channel::Metallic];
+    pub const COUNT: usize = 4;
+    pub const ALL: [Channel; Channel::COUNT] = [
+        Channel::BaseColor,
+        Channel::Roughness,
+        Channel::Metallic,
+        Channel::Height,
+    ];
+    /// The channels that hold a plain value rather than a colour.
+    pub const DATA: [Channel; 3] = [Channel::Roughness, Channel::Metallic, Channel::Height];
 
     pub fn index(self) -> usize {
         self as usize
@@ -126,6 +135,7 @@ impl Channel {
             Channel::BaseColor => "Base color",
             Channel::Roughness => "Roughness",
             Channel::Metallic => "Metallic",
+            Channel::Height => "Height",
         }
     }
 
@@ -135,16 +145,20 @@ impl Channel {
             Channel::BaseColor => "BaseColor",
             Channel::Roughness => "Roughness",
             Channel::Metallic => "Metallic",
+            Channel::Height => "Height",
         }
     }
 
     pub fn encoding(self) -> Encoding {
         match self {
             Channel::BaseColor => Encoding::Srgb,
-            Channel::Roughness | Channel::Metallic => Encoding::Linear,
+            Channel::Roughness | Channel::Metallic | Channel::Height => Encoding::Linear,
         }
     }
 }
+
+/// The height of a level surface, neither raised nor sunk.
+pub const LEVEL: f32 = 0.5;
 
 /// A grey image holding one data value (such as roughness) in every pixel.
 pub fn data_image(width: u32, height: u32, value: f32) -> Image {
@@ -159,6 +173,7 @@ pub struct Material {
     /// Data channels hold their value in the red (and green, blue) bytes.
     pub roughness: Image,
     pub metallic: Image,
+    pub height: Image,
 }
 
 impl Material {
@@ -179,6 +194,7 @@ impl Material {
             base_color,
             roughness: data_image(width, height, roughness),
             metallic: data_image(width, height, metallic),
+            height: data_image(width, height, LEVEL),
         }
     }
 
@@ -187,6 +203,7 @@ impl Material {
             Channel::BaseColor => &self.base_color,
             Channel::Roughness => &self.roughness,
             Channel::Metallic => &self.metallic,
+            Channel::Height => &self.height,
         }
     }
 
@@ -195,6 +212,7 @@ impl Material {
             Channel::BaseColor => &mut self.base_color,
             Channel::Roughness => &mut self.roughness,
             Channel::Metallic => &mut self.metallic,
+            Channel::Height => &mut self.height,
         }
     }
 
@@ -202,7 +220,7 @@ impl Material {
     /// layer of this slot uses.
     pub fn conform_channels(&mut self) {
         let (width, height) = (self.base_color.width, self.base_color.height);
-        for channel in [Channel::Roughness, Channel::Metallic] {
+        for channel in Channel::DATA {
             let image = self.channel_mut(channel);
             if (image.width, image.height) != (width, height) {
                 *image = resize(image, width, height);

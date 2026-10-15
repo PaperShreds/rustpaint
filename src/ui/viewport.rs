@@ -32,6 +32,7 @@ pub fn show(
     camera: &mut OrbitCamera,
     view_mode: ViewMode,
     environment: EnvironmentSettings,
+    bump_depth: f32,
 ) -> ViewportInput {
     egui::CentralPanel::default()
         .show(ui, |ui| {
@@ -87,6 +88,7 @@ pub fn show(
                     eye: camera.eye().to_array(),
                     view_mode,
                     environment,
+                    bump_depth,
                 },
             ));
 

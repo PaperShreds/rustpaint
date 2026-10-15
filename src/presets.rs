@@ -10,6 +10,7 @@
 
 use crate::document::{BlendMode, FillMix, FillValues, Layer};
 use crate::generator::{Axis, Generator, Op, Pattern, Recipe, Step};
+use crate::mesh::LEVEL;
 use crate::project;
 use std::path::{Path, PathBuf};
 
@@ -190,13 +191,14 @@ fn over(op: Op, amount: f32, generator: Generator) -> Step {
     }
 }
 
-/// Paint that is the same on every channel it fills.
+/// Paint that is the same on every channel it fills (all but height).
 fn paint(color: [u8; 3], roughness: f32, metallic: f32) -> FillValues {
     FillValues {
         color,
         roughness,
         metallic,
-        channels: [true; 3],
+        height: LEVEL,
+        channels: [true, true, true, false],
         mix: None,
     }
 }
@@ -207,6 +209,7 @@ fn built_in() -> Vec<Preset> {
             color: [86, 38, 14],
             roughness: 0.75,
             metallic: 0.0,
+            height: LEVEL,
             generator: Generator {
                 pattern: Pattern::Perlin,
                 scale: 7.0,
@@ -412,6 +415,7 @@ fn built_in() -> Vec<Preset> {
                         color: [92, 118, 42],
                         roughness: 0.95,
                         metallic: 0.0,
+                        height: LEVEL,
                         generator: Generator {
                             scale: 20.0,
                             octaves: 5,
@@ -468,7 +472,81 @@ fn built_in() -> Vec<Preset> {
                 )
             }],
         },
+        Preset {
+            name: "Brick wall".to_string(),
+            layers: vec![
+                everywhere(
+                    "Bricks",
+                    raised(
+                        // Sunken, rough mortar between raised bricks.
+                        ([168, 162, 150], 0.95, 0.2),
+                        ([150, 62, 40], 0.85, 0.8),
+                        Generator {
+                            pattern: Pattern::Bricks,
+                            scale: 6.0,
+                            line_width: 0.12,
+                            bevel: 0.1,
+                            ..Generator::default()
+                        },
+                    ),
+                ),
+                PresetLayer {
+                    opacity: 0.6,
+                    ..layer(
+                        "Brick colour variation",
+                        FillValues {
+                            channels: [true, false, false, false],
+                            ..paint([96, 40, 28], 0.85, 0.0)
+                        },
+                        Generator {
+                            pattern: Pattern::Cells,
+                            scale: 9.0,
+                            octaves: 2,
+                            seed: 4,
+                            low: 0.3,
+                            high: 0.9,
+                            ..Generator::default()
+                        },
+                    )
+                },
+            ],
+        },
+        Preset {
+            name: "Tiles".to_string(),
+            layers: vec![everywhere(
+                "Tiles",
+                raised(
+                    // Glossy tiles standing out of matte grout.
+                    ([120, 116, 110], 0.9, 0.3),
+                    ([226, 230, 232], 0.15, 0.7),
+                    Generator {
+                        pattern: Pattern::Tiles,
+                        scale: 5.0,
+                        line_width: 0.06,
+                        bevel: 0.06,
+                        ..Generator::default()
+                    },
+                ),
+            )],
+        },
     ]
+}
+
+/// A fill of every channel but metallic, from `low` where `shapes` is 0 to
+/// `high` where it is 1: (colour, roughness, height) each.
+fn raised(low: ([u8; 3], f32, f32), high: ([u8; 3], f32, f32), shapes: Generator) -> FillValues {
+    FillValues {
+        height: low.2,
+        channels: [true, true, false, true],
+        mix: Some(FillMix {
+            color: high.0,
+            roughness: high.1,
+            metallic: 0.0,
+            height: high.2,
+            generator: shapes.into(),
+        }),
+        ..paint(low.0, low.1, 0.0)
+    }
 }
 
 #[cfg(test)]

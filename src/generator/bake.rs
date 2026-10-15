@@ -6,7 +6,7 @@
 
 use super::edges::{Edges, Fold};
 use super::{Frame, Recipe};
-use crate::mesh::Mesh;
+use crate::mesh::{Image, LEVEL, Mesh};
 use crate::painting::raster::{
     SEAM_MARGIN_TEXELS, barycentric_2d, edge_margins, interpolate, texel_range, uv_bounds,
 };
@@ -28,6 +28,12 @@ pub struct Bake {
     pub height: u32,
     pub frame: Frame,
     positions: Vec<Vec3>,
+    /// The surface's direction at each texel: unit length, or zero where
+    /// the model has no normal.
+    normals: Vec<Vec3>,
+    /// How far one UV unit along u and along v reaches across the model at
+    /// each texel, in the model's units.
+    stretch: Vec<[f32; 2]>,
     cover: Vec<Cover>,
     edges: Edges,
     /// Distance from each texel to the nearest convex edge and the nearest
@@ -51,6 +57,8 @@ impl Bake {
             fold_distance: [OnceLock::new(), OnceLock::new()],
             recent: Mutex::new(Vec::new()),
             positions: vec![Vec3::ZERO; count],
+            normals: vec![Vec3::ZERO; count],
+            stretch: vec![[0.0; 2]; count],
             cover: vec![Cover::None; count],
         };
         let size = Vec2::new(width as f32, height as f32);
@@ -68,19 +76,21 @@ impl Bake {
                     continue;
                 };
                 let position = [0, 1, 2].map(|i| Vec3::from(vertices[i].position));
+                let normal = [0, 1, 2].map(|i| Vec3::from(vertices[i].normal));
                 let uv = [0, 1, 2].map(|i| Vec2::from(vertices[i].uv) * size);
                 if position.iter().all(|v| v.is_finite()) {
-                    bake.rasterize(position, uv);
+                    bake.rasterize(position, normal, uv);
                 }
             }
         }
         bake
     }
 
-    fn rasterize(&mut self, position: [Vec3; 3], corners: [Vec2; 3]) {
+    fn rasterize(&mut self, position: [Vec3; 3], normal: [Vec3; 3], corners: [Vec2; 3]) {
         let Some(margins) = edge_margins(corners, SEAM_MARGIN_TEXELS) else {
             return;
         };
+        let stretch = uv_stretch(position, corners, self.width, self.height);
         let (lo, hi) = uv_bounds(&corners);
         let (min_x, max_x) = texel_range(
             lo.x - SEAM_MARGIN_TEXELS,
@@ -112,6 +122,13 @@ impl Bake {
                 if cover > self.cover[texel] {
                     self.cover[texel] = cover;
                     self.positions[texel] = interpolate(position, weights);
+                    let normal = interpolate(normal, weights).normalize_or_zero();
+                    self.normals[texel] = if normal.is_finite() {
+                        normal
+                    } else {
+                        Vec3::ZERO
+                    };
+                    self.stretch[texel] = stretch;
                 }
             }
         }
@@ -121,6 +138,13 @@ impl Bake {
     /// Whether the texel at (`x`, `y`) lies on the model (or in a seam margin).
     pub fn covers(&self, x: u32, y: u32) -> bool {
         self.cover[y as usize * self.width as usize + x as usize] != Cover::None
+    }
+
+    #[cfg(test)]
+    /// How far one UV unit along u and along v reaches across the model at
+    /// the texel at (`x`, `y`), in the model's units; zero off the model.
+    pub fn stretch(&self, x: u32, y: u32) -> [f32; 2] {
+        self.stretch[y as usize * self.width as usize + x as usize]
     }
 
     #[cfg(test)]
@@ -146,10 +170,70 @@ impl Bake {
         let mut values = vec![0u8; self.cover.len()];
         self.for_each_texel(&mut values, |texel, value| {
             let near = folds.map(|distances| distances.map_or(f32::INFINITY, |d| d[texel]));
-            let v = recipe.sample(self.positions[texel], &self.frame, near);
+            let v = recipe.sample(
+                self.positions[texel],
+                self.normals[texel],
+                &self.frame,
+                near,
+            );
             *value = (v * 255.0).round() as u8;
         });
         values
+    }
+
+    /// A tangent-space normal map of `height` (an image of this bake's size,
+    /// value in red): the bumps the heights make on the surface, where a
+    /// height of 1 stands `depth` model units out from one of 0. As glTF
+    /// expects: red to +u, green "up" in the image (to -v), blue out of
+    /// the surface. Texels off the model face straight out.
+    pub fn normal_map(&self, height: &Image, depth: f32) -> Image {
+        const FLAT: [u8; 4] = [128, 128, 255, 255];
+        let mut normals = Image::filled(self.width, self.height, FLAT);
+        if (height.width, height.height) != (self.width, self.height) {
+            return normals;
+        }
+        let (width, rows) = (self.width as i64, self.height as i64);
+        let value = |x: i64, y: i64| {
+            let pixel = &height.rgba[(y * width + x) as usize * 4..][..4];
+            if pixel[3] == 0 {
+                LEVEL
+            } else {
+                pixel[0] as f32 / 255.0
+            }
+        };
+        self.for_each_texel(normals.rgba.as_chunks_mut::<4>().0, |texel, out| {
+            let (x, y) = ((texel as i64) % width, (texel as i64) / width);
+            let [along_u, along_v] = self.stretch[texel];
+            if along_u <= 0.0 || along_v <= 0.0 {
+                return;
+            }
+            let center = value(x, y);
+            // Off the model a neighbour's height means nothing: use this one's.
+            let at = |dx: i64, dy: i64| {
+                let (nx, ny) = ((x + dx).rem_euclid(width), (y + dy).rem_euclid(rows));
+                if self.cover[(ny * width + nx) as usize] == Cover::None {
+                    center
+                } else {
+                    value(nx, ny)
+                }
+            };
+            // Sobel: the slope per texel, smoothed across, so 8-bit steps
+            // don't show as stripes. Opposite texels are subtracted first,
+            // so level ground gives exactly zero.
+            let slope_x =
+                ((at(1, -1) - at(-1, -1)) + 2.0 * (at(1, 0) - at(-1, 0)) + (at(1, 1) - at(-1, 1)))
+                    / 8.0;
+            let slope_y =
+                ((at(-1, 1) - at(-1, -1)) + 2.0 * (at(0, 1) - at(0, -1)) + (at(1, 1) - at(1, -1)))
+                    / 8.0;
+            // Per UV unit, then per model unit along the surface.
+            let per_u = slope_x * self.width as f32 / along_u;
+            let per_v = slope_y * self.height as f32 / along_v;
+            let normal = Vec3::new(-depth * per_u, depth * per_v, 1.0).normalize();
+            let encode = |c: f32| ((c * 0.5 + 0.5) * 255.0).round() as u8;
+            *out = [encode(normal.x), encode(normal.y), encode(normal.z), 255];
+        });
+        normals
     }
 
     /// `generate_recipe`, but remembers the last few results: changing only
@@ -196,6 +280,25 @@ impl Bake {
             }
         });
     }
+}
+
+/// How far a triangle reaches across the model per UV unit along u and
+/// along v: the lengths of its position's derivatives. `corners` are in
+/// texels of a `width` x `height` texture.
+fn uv_stretch(position: [Vec3; 3], corners: [Vec2; 3], width: u32, height: u32) -> [f32; 2] {
+    let scale = Vec2::new(width as f32, height as f32);
+    let (e1, e2) = (position[1] - position[0], position[2] - position[0]);
+    let (d1, d2) = (
+        (corners[1] - corners[0]) / scale,
+        (corners[2] - corners[0]) / scale,
+    );
+    let area = d1.x * d2.y - d2.x * d1.y;
+    if area.abs() < 1e-12 {
+        return [0.0; 2];
+    }
+    let along_u = (e1 * d2.y - e2 * d1.y) / area;
+    let along_v = (e2 * d1.x - e1 * d2.x) / area;
+    [along_u.length(), along_v.length()].map(|l| if l.is_finite() { l } else { 0.0 })
 }
 
 #[cfg(test)]
@@ -354,6 +457,83 @@ mod tests {
         assert_eq!(lit(&outside, Pattern::Cavity), 0);
         assert_eq!(lit(&inside, Pattern::EdgeWear), 0);
         assert!(lit(&inside, Pattern::Cavity) > 1000);
+    }
+
+    #[test]
+    fn bricks_cover_every_face_with_mortar_between_them() {
+        let bake = bake();
+        let values = bake.generate(&Generator {
+            pattern: Pattern::Bricks,
+            bevel: 0.0,
+            ..Generator::default()
+        });
+        // Count brick and mortar texels on each of the cube's six faces.
+        let mut faces = [[0usize; 2]; 6];
+        for y in 0..bake.height {
+            for x in 0..bake.width {
+                if !bake.covers(x, y) {
+                    continue;
+                }
+                let p = bake.position(x, y);
+                let axis = (0..3)
+                    .max_by(|&a, &b| p[a].abs().total_cmp(&p[b].abs()))
+                    .unwrap();
+                let face = axis * 2 + (p[axis] > 0.0) as usize;
+                let value = values[(y * bake.width + x) as usize];
+                assert!(value == 0 || value == 255, "a hard edge: {value}");
+                faces[face][(value == 255) as usize] += 1;
+            }
+        }
+        for [mortar, bricks] in faces {
+            // Walls: mortar on 0.1 of each row and of each brick's length,
+            // about 15%. The top and bottom cut through a row, so only show
+            // the joints between bricks, about 10%.
+            let share = mortar as f32 / (mortar + bricks) as f32;
+            assert!(
+                (0.05..0.25).contains(&share),
+                "{mortar} mortar, {bricks} brick"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stretch_is_how_far_the_texture_spans_across_the_model() {
+        let bake = bake();
+        // Each face is a 1x1 square in a 256-texel cell of a 768x512 atlas
+        // (with a few texels of padding): about 3 and 2 per UV unit.
+        let [along_u, along_v] = bake.stretch(128, 128);
+        assert!((along_u - 3.0).abs() < 0.2, "{along_u}");
+        assert!((along_v - 2.0).abs() < 0.2, "{along_v}");
+        assert_eq!(bake.stretch(0, 0), [0.0; 2], "off the model");
+    }
+
+    #[test]
+    fn a_normal_map_leans_away_from_rising_ground() {
+        let bake = bake();
+        let ramp = |slope_x: f32, slope_y: f32| {
+            let mut height = Image::filled(bake.width, bake.height, [0, 0, 0, 255]);
+            for (texel, pixel) in height.rgba.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (texel as u32 % bake.width, texel as u32 / bake.width);
+                let value = 0.5 + slope_x * x as f32 + slope_y * y as f32;
+                pixel[..3].fill((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            bake.normal_map(&height, 0.5)
+        };
+        let at = |image: &Image, x: u32, y: u32| {
+            let i = ((y * image.width + x) * 4) as usize;
+            [image.rgba[i], image.rgba[i + 1], image.rgba[i + 2]]
+        };
+        // Level ground faces straight out.
+        assert_eq!(at(&ramp(0.0, 0.0), 128, 128), [128, 128, 255]);
+        // Rising 1.2 per UV unit to the right (+u), which spans 3 model
+        // units: a slope of 0.4 * depth 0.5. The surface leans left: red
+        // about 0.5 - 0.2 / 2.
+        let [red, green, _] = at(&ramp(0.4 / 256.0, 0.0), 128, 128);
+        assert!((95..115).contains(&red) && green == 128, "{red} {green}");
+        // Rising downwards in the image (+v): it leans up, green above half.
+        let [red, green, _] = at(&ramp(0.0, 0.4 / 256.0), 128, 128);
+        assert!(red == 128 && (140..160).contains(&green), "{red} {green}");
+        assert_eq!(at(&ramp(0.4, 0.4), 0, 0), [128, 128, 255], "off the model");
     }
 
     #[test]

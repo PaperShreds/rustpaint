@@ -111,6 +111,8 @@ impl Settings {
         put("brush_roughness", brush.roughness.to_string());
         put("brush_paint_metallic", brush.paint_metallic.to_string());
         put("brush_metallic", brush.metallic.to_string());
+        put("brush_paint_height", brush.paint_height.to_string());
+        put("brush_height", brush.height.to_string());
         put("brush_screen_space", brush.screen_space.to_string());
         put("brush_paint_over_edges", brush.paint_over_edges.to_string());
         put(
@@ -201,6 +203,8 @@ impl Settings {
             "brush_roughness" => number(value, &mut brush.roughness, 0.0..=1.0),
             "brush_paint_metallic" => flag(value, &mut brush.paint_metallic),
             "brush_metallic" => number(value, &mut brush.metallic, 0.0..=1.0),
+            "brush_paint_height" => flag(value, &mut brush.paint_height),
+            "brush_height" => number(value, &mut brush.height, 0.0..=1.0),
             "brush_screen_space" => flag(value, &mut brush.screen_space),
             "brush_paint_over_edges" => flag(value, &mut brush.paint_over_edges),
             "brush_keep_size_on_model" => flag(value, &mut brush.keep_size_on_model),

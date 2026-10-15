@@ -23,7 +23,7 @@ struct CameraUniform {
     /// x = `ViewMode` as a number, y = environment rotation (radians),
     /// z = environment intensity, w = environment mip count.
     settings: [f32; 4],
-    /// x = background blur, 0..1.
+    /// x = background blur, 0..1; y = bump depth, in model units.
     background: [f32; 4],
 }
 
@@ -58,20 +58,26 @@ pub enum ViewMode {
     Lit,
     /// One channel, unlit.
     Channel(Channel),
+    /// The direction the surface faces, bumps included, as a colour.
+    Normals,
 }
 
 impl ViewMode {
-    pub const ALL: [ViewMode; 4] = [
+    /// Stored in the settings by position: new modes go at the end.
+    pub const ALL: [ViewMode; 6] = [
         ViewMode::Lit,
         ViewMode::Channel(Channel::BaseColor),
         ViewMode::Channel(Channel::Roughness),
         ViewMode::Channel(Channel::Metallic),
+        ViewMode::Channel(Channel::Height),
+        ViewMode::Normals,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
             ViewMode::Lit => "Material",
             ViewMode::Channel(channel) => channel.name(),
+            ViewMode::Normals => "Normals",
         }
     }
 
@@ -80,6 +86,7 @@ impl ViewMode {
         match self {
             ViewMode::Lit => 0.0,
             ViewMode::Channel(channel) => 1.0 + channel.index() as f32,
+            ViewMode::Normals => 1.0 + Channel::COUNT as f32,
         }
     }
 }
@@ -181,6 +188,7 @@ fn create_gpu_materials(
                     texture(Channel::BaseColor),
                     texture(Channel::Roughness),
                     texture(Channel::Metallic),
+                    texture(Channel::Height),
                     wgpu::BindGroupEntry {
                         binding: Channel::COUNT as u32,
                         resource: wgpu::BindingResource::Sampler(sampler),
@@ -511,7 +519,8 @@ pub fn init(cc: &eframe::CreationContext<'_>, document: &Document, environment: 
     });
 
     // --- Material layout: one texture + one sampler per material ---
-    // One composite per channel (base colour, roughness, metallic), then the sampler.
+    // One composite per channel (base colour, roughness, metallic, height),
+    // then the sampler.
     let channel_texture = |binding| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -528,8 +537,9 @@ pub fn init(cc: &eframe::CreationContext<'_>, document: &Document, environment: 
             channel_texture(0),
             channel_texture(1),
             channel_texture(2),
+            channel_texture(3),
             wgpu::BindGroupLayoutEntry {
-                binding: 3,
+                binding: Channel::COUNT as u32,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
@@ -707,6 +717,8 @@ pub struct ViewportCallback {
     pub eye: [f32; 3],
     pub view_mode: ViewMode,
     pub environment: EnvironmentSettings,
+    /// How far a height of 1 stands out from 0, in model units.
+    pub bump_depth: f32,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -734,7 +746,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     ],
                     background: [
                         self.environment.background_blur.clamp(0.0, 1.0),
-                        0.0,
+                        self.bump_depth.max(0.0),
                         0.0,
                         0.0,
                     ],
@@ -769,6 +781,41 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 render_pass.set_bind_group(1, &material.bind_group, &[]);
                 render_pass.draw_indexed(submesh.indices.clone(), 0, 0..1);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui_wgpu::wgpu::naga;
+
+    /// The shaders are only compiled when the app starts; check them here.
+    #[test]
+    fn shaders_are_valid() {
+        for (name, source) in [
+            (
+                "mesh",
+                concat!(
+                    include_str!("shaders/common.wgsl"),
+                    include_str!("shaders/mesh.wgsl")
+                ),
+            ),
+            (
+                "background",
+                concat!(
+                    include_str!("shaders/common.wgsl"),
+                    include_str!("shaders/background.wgsl")
+                ),
+            ),
+        ] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
         }
     }
 }

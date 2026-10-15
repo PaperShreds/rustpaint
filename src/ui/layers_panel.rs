@@ -1,4 +1,4 @@
-use crate::document::{BlendMode, Document, FillMix, FillValues, Layer, LayerMask};
+use crate::document::{BlendMode, Document, FillMix, FillValues, Layer, LayerMask, MAX_BUMP_DEPTH};
 use crate::generator::edges;
 use crate::generator::{Axis, Generator, MAX_STEPS, Op, Pattern, Recipe};
 use crate::mesh::{Channel, Image};
@@ -66,6 +66,11 @@ pub enum LayerAction {
         value: f32,
         done: bool,
     },
+    /// The project's bump depth; `done` as for `Opacity`.
+    BumpDepth {
+        value: f32,
+        done: bool,
+    },
 }
 
 /// UI state that lives between frames.
@@ -115,6 +120,9 @@ pub fn show(
                 .show(ui, |ui| {
                     super::fit_widths(ui);
                     details(ui, current, selected, state, &mut actions);
+                    if current.is_base() {
+                        model_settings(ui, document.bump_depth, &mut actions);
+                    }
                 });
         });
 
@@ -183,6 +191,41 @@ fn details(
         });
     }
     settings(ui, current, selected, state, actions);
+}
+
+/// Settings of the whole model, shown with the base layer.
+fn model_settings(ui: &mut egui::Ui, bump_depth: f32, actions: &mut Vec<LayerAction>) {
+    ui.separator();
+    ui.strong("Model");
+    let mut value = bump_depth;
+    let slider = ui
+        .add(
+            egui::Slider::new(&mut value, 0.0..=MAX_BUMP_DEPTH)
+                .custom_formatter(|v, _| format!("{:.1}%", v * 100.0))
+                .custom_parser(|text| {
+                    let number = text
+                        .trim()
+                        .trim_end_matches('%')
+                        .trim()
+                        .parse::<f64>()
+                        .ok()?;
+                    Some(number / 100.0)
+                })
+                .text("Bump depth"),
+        )
+        .on_hover_text(
+            "How far a height of 1 stands out from a height of 0, as a share of \
+             the model's size. Applies to the viewport and to exported normal maps.",
+        );
+    if slider.changed() {
+        actions.push(LayerAction::BumpDepth {
+            value,
+            done: !slider.dragged(),
+        });
+    }
+    if slider.drag_stopped() {
+        actions.push(LayerAction::BumpDepth { value, done: true });
+    }
 }
 
 /// Height of the buttons above the layer list, like the brush tool buttons.
@@ -373,6 +416,9 @@ fn settings(
                     Channel::Metallic => {
                         ui.add(egui::Slider::new(&mut edited.metallic, 0.0..=1.0));
                     }
+                    Channel::Height => {
+                        ui.add(egui::Slider::new(&mut edited.height, 0.0..=1.0));
+                    }
                 }
             });
         }
@@ -386,6 +432,7 @@ fn settings(
                 color: edited.color.map(|c| c / 2),
                 roughness: edited.roughness,
                 metallic: edited.metallic,
+                height: edited.height,
                 ..FillMix::default()
             });
             state.mix_draft = None;
@@ -401,6 +448,7 @@ fn settings(
             });
             ui.add(egui::Slider::new(&mut mix.roughness, 0.0..=1.0).text("Roughness"));
             ui.add(egui::Slider::new(&mut mix.metallic, 0.0..=1.0).text("Metallic"));
+            ui.add(egui::Slider::new(&mut mix.height, 0.0..=1.0).text("Height"));
             ui.label("Where the pattern is white:");
             if let Some((id, draft)) = state.mix_draft
                 && id == layer.id
@@ -542,36 +590,57 @@ fn generator_widgets(ui: &mut egui::Ui, edited: &mut Generator, released: &mut b
                 ui.selectable_value(&mut edited.pattern, pattern, pattern.name());
             }
         });
-    if edited.pattern == Pattern::Gradient {
-        egui::ComboBox::from_label("Axis")
+    if edited.pattern.has_axis() {
+        let label = match edited.pattern {
+            Pattern::Stripes => "Across",
+            Pattern::Bricks | Pattern::Tiles => "Rows along",
+            _ => "Axis",
+        };
+        egui::ComboBox::from_label(label)
             .selected_text(edited.axis.name())
             .show_ui(ui, |ui| {
                 for axis in Axis::ALL {
                     ui.selectable_value(&mut edited.axis, axis, axis.name());
                 }
             });
-    } else {
-        if edited.pattern.fold().is_some() {
-            let label = match edited.pattern {
-                Pattern::Cavity => "Crease width",
-                _ => "Edge width",
-            };
-            let response = ui.add(
-                egui::Slider::new(&mut edited.edge_width, 0.002..=edges::MAX_REACH)
-                    .logarithmic(true)
-                    .text(label),
-            );
-            *released |= let_go(response);
-            let response =
-                ui.add(egui::Slider::new(&mut edited.breakup, 0.0..=1.0).text("Breakup"));
-            *released |= let_go(response);
-        }
+    }
+    if edited.pattern.fold().is_some() {
+        let label = match edited.pattern {
+            Pattern::Cavity => "Crease width",
+            _ => "Edge width",
+        };
+        let response = ui.add(
+            egui::Slider::new(&mut edited.edge_width, 0.002..=edges::MAX_REACH)
+                .logarithmic(true)
+                .text(label),
+        );
+        *released |= let_go(response);
+        let response = ui.add(egui::Slider::new(&mut edited.breakup, 0.0..=1.0).text("Breakup"));
+        *released |= let_go(response);
+    }
+    if edited.pattern != Pattern::Gradient {
         let response = ui.add(
             egui::Slider::new(&mut edited.scale, 0.25..=64.0)
                 .logarithmic(true)
                 .text("Scale"),
         );
         *released |= let_go(response);
+    }
+    if edited.pattern.is_tiling() {
+        if edited.pattern != Pattern::Checker {
+            let label = match edited.pattern {
+                Pattern::Stripes => "Line width",
+                _ => "Mortar width",
+            };
+            let response = ui.add(egui::Slider::new(&mut edited.line_width, 0.0..=1.0).text(label));
+            *released |= let_go(response);
+        }
+        let response = ui
+            .add(egui::Slider::new(&mut edited.bevel, 0.0..=0.5).text("Bevel"))
+            .on_hover_text("Soften the edges; as a height, a rounded bevel");
+        *released |= let_go(response);
+    }
+    if edited.pattern.is_noisy() {
         let response = ui.add(egui::Slider::new(&mut edited.octaves, 1..=8).text("Detail"));
         *released |= let_go(response);
         let response = ui.add(egui::DragValue::new(&mut edited.seed).prefix("Seed "));

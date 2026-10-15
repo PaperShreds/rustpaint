@@ -121,6 +121,12 @@ fn brush_settings(ui: &mut egui::Ui, brush: &mut Brush, on_mask: bool) {
                 ui.checkbox(&mut brush.paint_metallic, "Metallic");
                 ui.add_enabled(values, egui::Slider::new(&mut brush.metallic, 0.0..=1.0));
                 ui.end_row();
+                ui.checkbox(&mut brush.paint_height, "Height")
+                    .on_hover_text(
+                        "Raise (above 0.5) or sink (below) the surface: bumps and dents",
+                    );
+                ui.add_enabled(values, egui::Slider::new(&mut brush.height, 0.0..=1.0));
+                ui.end_row();
             });
     });
     ui.add_space(8.0);

@@ -15,13 +15,19 @@
 //! The viewport blends the visible layers on the GPU. `composite` does the same
 //! on the CPU, for export.
 
-use crate::generator::Recipe;
 use crate::generator::bake::Bake;
+use crate::generator::{Frame, Recipe};
 pub use crate::mesh::{Channel, Encoding};
-use crate::mesh::{Image, ImageRegion, Mesh};
+use crate::mesh::{Image, ImageRegion, LEVEL, Mesh};
 use crate::presets::Preset;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// `Document::bump_depth` of a new project: a height of 1 stands 2% of the
+/// model's size out from a height of 0.
+pub const DEFAULT_BUMP_DEPTH: f32 = 0.02;
+/// The deepest `Document::bump_depth` allowed.
+pub const MAX_BUMP_DEPTH: f32 = 0.25;
 
 /// A transparent pixel, the starting content of a paint layer.
 pub const CLEAR: [u8; 4] = [0, 0, 0, 0];
@@ -39,6 +45,7 @@ impl Plane {
         Plane::Channel(Channel::BaseColor),
         Plane::Channel(Channel::Roughness),
         Plane::Channel(Channel::Metallic),
+        Plane::Channel(Channel::Height),
         Plane::Mask,
     ];
 
@@ -134,6 +141,7 @@ pub struct FillValues {
     pub color: [u8; 3],
     pub roughness: f32,
     pub metallic: f32,
+    pub height: f32,
     /// Which channels the layer fills (the others are left to the layers below).
     pub channels: [bool; Channel::COUNT],
     /// A second set of values and the pattern that mixes them in.
@@ -148,6 +156,7 @@ pub struct FillMix {
     pub color: [u8; 3],
     pub roughness: f32,
     pub metallic: f32,
+    pub height: f32,
     pub generator: Recipe,
 }
 
@@ -157,6 +166,7 @@ impl Default for FillMix {
             color: [90, 90, 90],
             roughness: 0.5,
             metallic: 0.0,
+            height: LEVEL,
             generator: Recipe::default(),
         }
     }
@@ -168,7 +178,8 @@ impl Default for FillValues {
             color: [200, 200, 200],
             roughness: 0.5,
             metallic: 0.0,
-            channels: [true, false, false],
+            height: LEVEL,
+            channels: [true, false, false, false],
             mix: None,
         }
     }
@@ -185,6 +196,7 @@ impl FillValues {
             Channel::BaseColor => [self.color[0], self.color[1], self.color[2], 255],
             Channel::Roughness => data(self.roughness),
             Channel::Metallic => data(self.metallic),
+            Channel::Height => data(self.height),
         }
     }
 
@@ -199,6 +211,7 @@ impl FillValues {
             color: mix.color,
             roughness: mix.roughness,
             metallic: mix.metallic,
+            height: mix.height,
             ..*self
         }
         .pixel(channel);
@@ -381,6 +394,8 @@ pub enum Change {
         mask: Option<u8>,
         images: Vec<Option<Image>>,
     },
+    /// Swap the document's bump depth with the stored one.
+    BumpDepth(f32),
 }
 
 impl Change {
@@ -419,6 +434,11 @@ pub struct Document {
     /// Bottom to top; `layers[0]` is the base layer.
     pub layers: Vec<Layer>,
     next_layer_id: u64,
+    /// How deep the height channel goes: a height of 1 stands this far out
+    /// from one of 0, as a fraction of the model's size (`Frame::radius`).
+    pub bump_depth: f32,
+    /// The model's bounding box, which `bump_depth` is measured against.
+    frame: Frame,
     /// Texel positions per (material slot, width, height), made when a
     /// generator first needs them.
     bakes: BakeCache,
@@ -455,10 +475,13 @@ impl Document {
             mask_generator: None,
         };
         let next_layer_id = layers.iter().map(|layer| layer.id).max().unwrap_or(0) + 1;
+        let frame = Frame::of(&mesh);
         let mut document = Self {
             mesh,
             layers: std::iter::once(base).chain(layers).collect(),
             next_layer_id,
+            bump_depth: DEFAULT_BUMP_DEPTH,
+            frame,
             bakes: BakeCache::default(),
         };
         // Procedural layers are stored as settings only.
@@ -734,7 +757,31 @@ impl Document {
                 }
                 Some(Dirty::Mask { layer: *layer })
             }
+            Change::BumpDepth(depth) => {
+                // Read every frame by the viewport: no pixels to update.
+                std::mem::swap(&mut self.bump_depth, depth);
+                None
+            }
         }
+    }
+
+    /// Where each texel of material slot `slot` is on the model.
+    pub fn bake(&self, slot: usize) -> Option<Arc<Bake>> {
+        (slot < self.mesh.materials.len()).then(|| cached_bake(&self.bakes, &self.mesh, slot))
+    }
+
+    /// The normal map of material slot `material`'s bumps, from `height`,
+    /// its composited height channel.
+    pub fn normal_map(&self, material: usize, height: &Image) -> Option<Image> {
+        Some(
+            self.bake(material)?
+                .normal_map(height, self.bump_depth_in_model()),
+        )
+    }
+
+    /// `bump_depth` in the model's own units.
+    pub fn bump_depth_in_model(&self) -> f32 {
+        self.bump_depth * self.frame.radius()
     }
 
     /// The visible layers of one channel of `material`, blended into one image (on the CPU).
@@ -814,6 +861,19 @@ fn composite_pixel(sources: &[VisibleLayer], offset: usize, encoding: Encoding) 
     ]
 }
 
+/// The bake of material slot `slot` at its texture size, made the first time
+/// it is asked for.
+fn cached_bake(bakes: &BakeCache, mesh: &Mesh, slot: usize) -> Arc<Bake> {
+    let material = &mesh.materials[slot];
+    let (width, height) = (material.base_color.width, material.base_color.height);
+    bakes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry((slot, width, height))
+        .or_insert_with(|| Arc::new(Bake::new(mesh, slot, width, height)))
+        .clone()
+}
+
 /// Makes the images of `layer`'s fill and generated mask that `remake` asks
 /// for. Images on slots the layer doesn't target are dropped, so they can't
 /// go stale.
@@ -831,14 +891,7 @@ fn refresh_layer(layer: &mut Layer, mesh: &Mesh, bakes: &BakeCache, remake: Rema
                 .as_ref()
                 .is_some_and(|image| (image.width, image.height) == (width, height))
         };
-        let bake = || {
-            bakes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry((slot, width, height))
-                .or_insert_with(|| Arc::new(Bake::new(mesh, slot, width, height)))
-                .clone()
-        };
+        let bake = || cached_bake(bakes, mesh, slot);
         if let Some(fill) = layer.fill.filter(|_| remake.fill) {
             // Only a mixed fill needs the pattern, and only on a slot it fills.
             let mut mixed = None;
@@ -1204,7 +1257,7 @@ mod tests {
         let fill = FillValues {
             color: [0, 255, 0],
             roughness: 1.0,
-            channels: [true, true, false],
+            channels: [true, true, false, false],
             ..FillValues::default()
         };
         let layer = document.new_fill_layer(fill);

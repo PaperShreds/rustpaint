@@ -6,10 +6,12 @@ struct Camera {
     inverse_view_proj: mat4x4<f32>,
     // xyz = camera position.
     eye: vec4<f32>,
-    // x = view mode (0 lit, 1 base colour, 2 roughness, 3 metallic),
+    // x = view mode (0 lit, 1 base colour, 2 roughness, 3 metallic, 4 height,
+    // 5 normals),
     // y = environment rotation (radians), z = intensity, w = environment mip count.
     settings: vec4<f32>,
-    // x = background blur (0 sharp .. 1 very blurry).
+    // x = background blur (0 sharp .. 1 very blurry), y = bump depth (how
+    // far a height of 1 stands out from 0, in model units).
     background: vec4<f32>,
 };
 

@@ -12,14 +12,41 @@ use std::path::{Path, PathBuf};
 /// One texture file to write.
 pub struct ExportFile {
     pub path: PathBuf,
-    /// The material slot and channel whose combined layers go into this file.
+    /// The material slot whose combined layers go into this file.
     pub material: usize,
-    pub channel: Channel,
+    pub texture: Texture,
+}
+
+/// What an exported file holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Texture {
+    Channel(Channel),
+    /// The bumps of the height channel as a tangent-space normal map
+    /// (OpenGL convention, as glTF, Blender and Godot expect).
+    Normal,
+}
+
+impl Texture {
+    pub const ALL: [Texture; Channel::COUNT + 1] = [
+        Texture::Channel(Channel::BaseColor),
+        Texture::Channel(Channel::Roughness),
+        Texture::Channel(Channel::Metallic),
+        Texture::Channel(Channel::Height),
+        Texture::Normal,
+    ];
+
+    fn file_suffix(self) -> &'static str {
+        match self {
+            Texture::Channel(channel) => channel.file_suffix(),
+            Texture::Normal => "Normal",
+        }
+    }
 }
 
 /// The PNG files exporting `document` into `directory` would write: one per
-/// material slot and channel, with its visible layers combined, named
-/// `<model>_<material>_<Channel>.png` (e.g. `_BaseColor`, `_Roughness`).
+/// material slot and channel, plus a normal map, with its visible layers
+/// combined, named `<model>_<material>_<Channel>.png` (e.g. `_BaseColor`,
+/// `_Roughness`, `_Normal`).
 pub fn plan(directory: &Path, model_name: &str, document: &Document) -> Vec<ExportFile> {
     let model = sanitize(model_name);
     let mut used = HashSet::new();
@@ -37,10 +64,10 @@ pub fn plan(directory: &Path, model_name: &str, document: &Document) -> Vec<Expo
                 stem = format!("{base}_{suffix}");
                 suffix += 1;
             }
-            Channel::ALL.map(|channel| ExportFile {
-                path: directory.join(format!("{stem}_{}.png", channel.file_suffix())),
+            Texture::ALL.map(|texture| ExportFile {
+                path: directory.join(format!("{stem}_{}.png", texture.file_suffix())),
                 material: index,
-                channel,
+                texture,
             })
         })
         .collect()
@@ -55,10 +82,24 @@ pub fn write(files: &[ExportFile], document: &Document) -> Result<(), String> {
             .iter()
             .map(|file| {
                 scope.spawn(move || {
+                    let channel = match file.texture {
+                        Texture::Channel(channel) => channel,
+                        Texture::Normal => Channel::Height,
+                    };
                     let image = document
-                        .composite(file.material, file.channel)
+                        .composite(file.material, channel)
                         .ok_or("material slot not found")?;
-                    write_png(&file.path, &image, file.channel.encoding())
+                    match file.texture {
+                        Texture::Channel(channel) => {
+                            write_png(&file.path, &image, Some(channel.encoding()))
+                        }
+                        Texture::Normal => {
+                            let normals = document
+                                .normal_map(file.material, &image)
+                                .ok_or("material slot not found")?;
+                            write_png(&file.path, &normals, None)
+                        }
+                    }
                 })
             })
             .collect();
@@ -71,15 +112,23 @@ pub fn write(files: &[ExportFile], document: &Document) -> Result<(), String> {
     })
 }
 
-/// Colour is written as RGBA; data channels as greyscale, as engines expect.
-fn write_png(path: &Path, image: &Image, encoding: Encoding) -> Result<(), String> {
+/// Colour is written as RGBA; data channels as greyscale, as engines
+/// expect; a normal map (no encoding) as RGB.
+fn write_png(path: &Path, image: &Image, encoding: Option<Encoding>) -> Result<(), String> {
     let buffer: image::DynamicImage = match encoding {
-        Encoding::Srgb => image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
-            .map(image::DynamicImage::ImageRgba8),
-        Encoding::Linear => {
+        Some(Encoding::Srgb) => {
+            image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+                .map(image::DynamicImage::ImageRgba8)
+        }
+        Some(Encoding::Linear) => {
             let values = image.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect();
             image::GrayImage::from_raw(image.width, image.height, values)
                 .map(image::DynamicImage::ImageLuma8)
+        }
+        None => {
+            let values = image.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]);
+            image::RgbImage::from_raw(image.width, image.height, values.collect())
+                .map(image::DynamicImage::ImageRgb8)
         }
     }
     .ok_or("texture data does not match its size")?;
@@ -120,7 +169,7 @@ fn sanitize(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan, sanitize, write};
+    use super::{Texture, plan, sanitize, write};
     use crate::document::Document;
     use crate::mesh::Channel;
     use crate::mesh::{Image, Material, primitives};
@@ -154,12 +203,18 @@ mod tests {
                 "My_Model_Metal_BaseColor.png",
                 "My_Model_Metal_Roughness.png",
                 "My_Model_Metal_Metallic.png",
+                "My_Model_Metal_Height.png",
+                "My_Model_Metal_Normal.png",
                 "My_Model_metal_2_BaseColor.png",
                 "My_Model_metal_2_Roughness.png",
                 "My_Model_metal_2_Metallic.png",
+                "My_Model_metal_2_Height.png",
+                "My_Model_metal_2_Normal.png",
                 "My_Model_Metal_3_BaseColor.png",
                 "My_Model_Metal_3_Roughness.png",
                 "My_Model_Metal_3_Metallic.png",
+                "My_Model_Metal_3_Height.png",
+                "My_Model_Metal_3_Normal.png",
             ]
         );
     }
@@ -186,7 +241,7 @@ mod tests {
         assert_eq!(saved.as_raw(), &texture.rgba);
 
         // Data channels are greyscale, holding the raw values.
-        assert_eq!(files[1].channel, Channel::Roughness);
+        assert_eq!(files[1].texture, Texture::Channel(Channel::Roughness));
         let roughness = image::open(&files[1].path).unwrap();
         assert!(matches!(roughness, image::DynamicImage::ImageLuma8(_)));
         let expected = crate::mesh::Encoding::Linear.encode(0.5);
@@ -197,8 +252,16 @@ mod tests {
                 .all(|pixel| pixel.0[0] == expected)
         );
 
+        // Nothing raised: the normal map faces straight out everywhere.
+        assert_eq!(files[4].texture, Texture::Normal);
+        let normals = image::open(&files[4].path).unwrap();
+        assert!(matches!(normals, image::DynamicImage::ImageRgb8(_)));
+        let odd: std::collections::HashSet<[u8; 3]> =
+            normals.to_rgb8().pixels().map(|pixel| pixel.0).collect();
+        assert_eq!(odd, [[128, 128, 255]].into());
+
         // Only the PNGs are left: no temporary files.
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 3);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 5);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

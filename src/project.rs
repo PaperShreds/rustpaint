@@ -14,6 +14,9 @@
 //! Version 7 adds the settings of the edge wear generator.
 //! Version 8 adds the second colour (and its pattern) of a fill layer.
 //! Version 9 adds the patterns combined into a generator's first one.
+//! Version 10 adds the height channel (to materials, layers and fills),
+//! the line width and bevel of the shape patterns, and, at the end of the
+//! file, the bump depth.
 //! Older versions still open: version 1 has no layers, version 2 has base
 //! colour layers only and no blend modes, version 3 has no masks, version 4
 //! has no fill layers or generators, version 5 stores every texture in full.
@@ -21,12 +24,13 @@
 //! produces an error instead of a crash.
 
 use crate::document::{
-    BlendMode, CLEAR, Channel, Document, FillMix, FillValues, Layer, LayerProps, Plane,
+    BlendMode, CLEAR, Channel, Document, FillMix, FillValues, Layer, LayerProps, MAX_BUMP_DEPTH,
+    Plane,
 };
 use crate::files;
 use crate::generator::edges;
 use crate::generator::{Axis, Generator, MAX_STEPS, Op, Pattern, Recipe, Step};
-use crate::mesh::{Image, ImageRegion, Material, Mesh, SubMesh, Vertex};
+use crate::mesh::{Image, ImageRegion, LEVEL, Material, Mesh, SubMesh, Vertex};
 use crate::painting::history::TILE_SIZE;
 use crate::presets::{Preset, PresetLayer};
 use std::io::Read;
@@ -41,8 +45,12 @@ const MAGIC_V6: &[u8; 8] = b"RPAINT06";
 const MAGIC_V7: &[u8; 8] = b"RPAINT07";
 const MAGIC_V8: &[u8; 8] = b"RPAINT08";
 const MAGIC_V9: &[u8; 8] = b"RPAINT09";
+const MAGIC_V10: &[u8; 8] = b"RPAINT10";
 /// Channels after base colour, stored one byte per pixel per material.
-const DATA_CHANNELS: [Channel; 2] = [Channel::Roughness, Channel::Metallic];
+const DATA_CHANNELS: [Channel; 3] = Channel::DATA;
+/// The channels of a project before version 10, which added height.
+const CHANNELS_BEFORE_HEIGHT: [Channel; 3] =
+    [Channel::BaseColor, Channel::Roughness, Channel::Metallic];
 const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SIZE_LIMIT_ERROR: &str = "project file exceeds the 4 GiB size limit";
 const MAX_LAYERS: usize = 4096;
@@ -83,7 +91,7 @@ pub fn save(path: &Path, document: &Document) -> Result<(), String> {
 /// The project file's contents for `document`.
 pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
     let mut bytes = encode_mesh(&document.mesh, true)?;
-    bytes[..MAGIC_V9.len()].copy_from_slice(MAGIC_V9);
+    bytes[..MAGIC_V10.len()].copy_from_slice(MAGIC_V10);
     for material in &document.mesh.materials {
         for channel in DATA_CHANNELS {
             let image = material.channel(channel);
@@ -101,6 +109,7 @@ pub fn encode(document: &Document) -> Result<Vec<u8>, String> {
         }
     }
     encode_layers(&mut bytes, document)?;
+    bytes.extend_from_slice(&document.bump_depth.to_le_bytes());
     if bytes.len() as u64 > MAX_PROJECT_BYTES {
         return Err(SIZE_LIMIT_ERROR.into());
     }
@@ -180,6 +189,7 @@ fn decode(bytes: &[u8]) -> Result<Document, String> {
     let magic = reader.take(MAGIC_V1.len())?;
     let version = [
         MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8, MAGIC_V9,
+        MAGIC_V10,
     ]
     .iter()
     .position(|known| magic == *known)
@@ -190,7 +200,12 @@ fn decode(bytes: &[u8]) -> Result<Document, String> {
     if version >= 3 {
         for material in &mut mesh.materials {
             let (width, height) = (material.base_color.width, material.base_color.height);
-            for channel in DATA_CHANNELS {
+            let channels = if version >= 10 {
+                &DATA_CHANNELS[..]
+            } else {
+                &DATA_CHANNELS[..2]
+            };
+            for &channel in channels {
                 let len = width as usize * height as usize;
                 let values = if version >= 6 {
                     read_texture(&mut reader, len, 1, &mut budget)?
@@ -204,10 +219,17 @@ fn decode(bytes: &[u8]) -> Result<Document, String> {
             }
         }
     }
-    let document = match version {
+    let mut document = match version {
         1 => Document::new(mesh),
         _ => decode_layers(&mut reader, mesh, version)?,
     };
+    if version >= 10 {
+        let depth = f32::from_le_bytes(reader.array()?);
+        if !depth.is_finite() {
+            return Err("project contains an invalid bump depth".into());
+        }
+        document.bump_depth = depth.clamp(0.0, MAX_BUMP_DEPTH);
+    }
     if reader.offset != bytes.len() {
         return Err("project file contains unexpected trailing data".into());
     }
@@ -370,7 +392,7 @@ fn encode_layers(bytes: &mut Vec<u8>, document: &Document) -> Result<(), String>
 /// Marks a preset file.
 const PRESET_MAGIC: &[u8; 8] = b"RPPRESET";
 /// The project version whose fill and generator layout a preset file uses.
-const PRESET_FORMAT: u8 = 9;
+const PRESET_FORMAT: u8 = 10;
 const MAX_PRESET_LAYERS: usize = 64;
 
 /// A preset's file contents: magic, the format number, its name, then each
@@ -445,12 +467,14 @@ fn encode_fill(bytes: &mut Vec<u8>, fill: Option<&FillValues>) {
     bytes.extend_from_slice(&fill.color);
     bytes.extend_from_slice(&fill.roughness.to_le_bytes());
     bytes.extend_from_slice(&fill.metallic.to_le_bytes());
+    bytes.extend_from_slice(&fill.height.to_le_bytes());
     bytes.extend(fill.channels.map(|on| on as u8));
     bytes.push(fill.mix.is_some() as u8);
     let mix = fill.mix.unwrap_or_default();
     bytes.extend_from_slice(&mix.color);
     bytes.extend_from_slice(&mix.roughness.to_le_bytes());
     bytes.extend_from_slice(&mix.metallic.to_le_bytes());
+    bytes.extend_from_slice(&mix.height.to_le_bytes());
     encode_recipe(bytes, Some(&mix.generator));
 }
 
@@ -459,8 +483,14 @@ fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>
     let color = reader.array::<3>()?;
     let roughness = f32::from_le_bytes(reader.array()?);
     let metallic = f32::from_le_bytes(reader.array()?);
+    let height = read_height(reader, version)?;
     let mut channels = [false; Channel::COUNT];
-    for on in &mut channels {
+    let stored = if version >= 10 {
+        Channel::COUNT
+    } else {
+        CHANNELS_BEFORE_HEIGHT.len()
+    };
+    for on in &mut channels[..stored] {
         *on = reader.flag("fill channel")?;
     }
     let mix = if version >= 8 {
@@ -468,6 +498,7 @@ fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>
         let color = reader.array::<3>()?;
         let roughness = f32::from_le_bytes(reader.array()?);
         let metallic = f32::from_le_bytes(reader.array()?);
+        let height = read_height(reader, version)?;
         let generator = decode_recipe(reader, version)?.unwrap_or_default();
         if !roughness.is_finite() || !metallic.is_finite() {
             return Err("project contains an invalid fill value".into());
@@ -476,6 +507,7 @@ fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>
             color,
             roughness: roughness.clamp(0.0, 1.0),
             metallic: metallic.clamp(0.0, 1.0),
+            height,
             generator,
         })
     } else {
@@ -488,9 +520,22 @@ fn decode_fill(reader: &mut Reader, version: usize) -> Result<Option<FillValues>
         color,
         roughness: roughness.clamp(0.0, 1.0),
         metallic: metallic.clamp(0.0, 1.0),
+        height,
         channels,
         mix,
     }))
+}
+
+/// A fill's height (from version 10; level before).
+fn read_height(reader: &mut Reader, version: usize) -> Result<f32, String> {
+    if version < 10 {
+        return Ok(LEVEL);
+    }
+    let height = f32::from_le_bytes(reader.array()?);
+    if !height.is_finite() {
+        return Err("project contains an invalid fill value".into());
+    }
+    Ok(height.clamp(0.0, 1.0))
 }
 
 /// A recipe: its first pattern, then (from version 9) the patterns combined
@@ -543,6 +588,8 @@ fn encode_generator(bytes: &mut Vec<u8>, generator: Option<&Generator>) {
     bytes.push(generator.invert as u8);
     bytes.extend_from_slice(&generator.edge_width.to_le_bytes());
     bytes.extend_from_slice(&generator.breakup.to_le_bytes());
+    bytes.extend_from_slice(&generator.line_width.to_le_bytes());
+    bytes.extend_from_slice(&generator.bevel.to_le_bytes());
 }
 
 fn decode_generator(reader: &mut Reader, version: usize) -> Result<Option<Generator>, String> {
@@ -565,7 +612,15 @@ fn decode_generator(reader: &mut Reader, version: usize) -> Result<Option<Genera
     } else {
         (defaults.edge_width, defaults.breakup)
     };
-    if ![scale, low, high, edge_width, breakup]
+    let (line_width, bevel) = if version >= 10 {
+        (
+            f32::from_le_bytes(reader.array()?),
+            f32::from_le_bytes(reader.array()?),
+        )
+    } else {
+        (defaults.line_width, defaults.bevel)
+    };
+    if ![scale, low, high, edge_width, breakup, line_width, bevel]
         .iter()
         .all(|v| v.is_finite())
     {
@@ -582,6 +637,8 @@ fn decode_generator(reader: &mut Reader, version: usize) -> Result<Option<Genera
         invert,
         edge_width: edge_width.clamp(0.001, edges::MAX_REACH),
         breakup: breakup.clamp(0.0, 1.0),
+        line_width: line_width.clamp(0.0, 1.0),
+        bevel: bevel.clamp(0.0, 1.0),
     }))
 }
 
@@ -649,8 +706,10 @@ fn decode_mask(
 
 fn decode_layers(reader: &mut Reader, mesh: Mesh, version: usize) -> Result<Document, String> {
     // Version 2 had no blend modes and only base colour paint.
-    let channels: &[Channel] = if version >= 3 {
+    let channels: &[Channel] = if version >= 10 {
         &Channel::ALL
+    } else if version >= 3 {
+        &CHANNELS_BEFORE_HEIGHT
     } else {
         &[Channel::BaseColor]
     };
@@ -1146,11 +1205,13 @@ mod tests {
             color: [10, 200, 30],
             roughness: 0.8,
             metallic: 0.0,
-            channels: [true, true, false],
+            height: 0.7,
+            channels: [true, true, false, true],
             mix: Some(crate::document::FillMix {
                 color: [90, 40, 10],
                 roughness: 0.3,
                 metallic: 0.6,
+                height: 0.2,
                 generator: Generator {
                     pattern: Pattern::EdgeWear,
                     seed: 5,
@@ -1175,6 +1236,8 @@ mod tests {
             invert: true,
             edge_width: 0.07,
             breakup: 0.25,
+            line_width: 0.3,
+            bevel: 0.15,
             ..Generator::default()
         };
         let mut props = document.layers[2].props();
@@ -1205,6 +1268,7 @@ mod tests {
                 props,
             })
             .unwrap();
+        document.bump_depth = 0.07;
 
         let bytes = encode(&document).unwrap();
         // The pixels aren't stored: a 768x512 mask alone would be 393 KB.
@@ -1227,10 +1291,13 @@ mod tests {
         assert_eq!(planes(&decoded), planes(&document), "made again on opening");
         assert!(planes(&decoded)[Plane::Mask.index()].is_some());
         assert!(planes(&decoded)[Channel::Metallic.index()].is_none());
-        assert_eq!(
-            decoded.composite(0, Channel::BaseColor).unwrap().rgba,
-            document.composite(0, Channel::BaseColor).unwrap().rgba
-        );
+        for channel in [Channel::BaseColor, Channel::Height] {
+            assert_eq!(
+                decoded.composite(0, channel).unwrap().rgba,
+                document.composite(0, channel).unwrap().rgba
+            );
+        }
+        assert_eq!(decoded.bump_depth, 0.07);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::autosaves::{self, Kept};
-use crate::document::{Change, Dirty, Document, FillValues, LayerProps, Remake};
+use crate::document::{Change, Dirty, Document, FillValues, LayerProps, MAX_BUMP_DEPTH, Remake};
 use crate::export;
 use crate::generator::Recipe;
 use crate::mesh::{self, Image, Mesh};
@@ -79,6 +79,8 @@ pub struct RustPaintApp {
     thumbnails_revision: Option<u64>,
     /// Settings of a layer before an opacity drag started, for its undo step.
     opacity_drag: Option<(u64, LayerProps)>,
+    /// The bump depth before a drag of its slider started.
+    bump_drag: Option<f32>,
     /// Same for fill values being edited: the layer, and its settings before.
     fill_edit: Option<(u64, LayerProps)>,
     /// Screen-space acceleration structure for painting; rebuilt when the view changes.
@@ -167,6 +169,7 @@ impl RustPaintApp {
             revision: 0,
             thumbnails_revision: None,
             opacity_drag: None,
+            bump_drag: None,
             fill_edit: None,
             painter: None,
             stroke: None,
@@ -199,6 +202,7 @@ impl RustPaintApp {
         self.editing_mask = false;
         self.revision += 1;
         self.opacity_drag = None;
+        self.bump_drag = None;
         self.fill_edit = None;
         self.painter = None;
         self.stroke = None;
@@ -564,6 +568,7 @@ impl RustPaintApp {
         self.finish_stroke();
         self.flush_fill_edit();
         self.opacity_drag = None;
+        self.bump_drag = None;
         let dirty = self.history.go_to(&mut self.document, position);
         self.show_changes(&dirty, frame);
     }
@@ -572,6 +577,7 @@ impl RustPaintApp {
         self.finish_stroke();
         self.flush_fill_edit();
         self.opacity_drag = None;
+        self.bump_drag = None;
         let dirty = if redo {
             self.history.redo(&mut self.document)
         } else {
@@ -660,6 +666,7 @@ impl RustPaintApp {
                     brush.paint_color,
                     brush.paint_roughness,
                     brush.paint_metallic,
+                    brush.paint_height,
                 ];
                 let fill = FillValues {
                     color: brush
@@ -667,6 +674,7 @@ impl RustPaintApp {
                         .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
                     roughness: brush.roughness.clamp(0.0, 1.0),
                     metallic: brush.metallic.clamp(0.0, 1.0),
+                    height: brush.height.clamp(0.0, 1.0),
                     channels: if channels.contains(&true) {
                         channels
                     } else {
@@ -889,6 +897,17 @@ impl RustPaintApp {
                     }
                 } else {
                     self.opacity_drag = Some((id, before));
+                }
+            }
+            LayerAction::BumpDepth { value, done } => {
+                // Like opacity: live while dragging, one undo step at the end.
+                let before = self.bump_drag.take().unwrap_or(self.document.bump_depth);
+                self.document.bump_depth = value.clamp(0.0, MAX_BUMP_DEPTH);
+                if !done {
+                    self.bump_drag = Some(before);
+                } else if before != self.document.bump_depth {
+                    let label = format!("Bump depth to {:.1}%", value * 100.0);
+                    self.history.push(label, vec![Change::BumpDepth(before)]);
                 }
             }
         }
@@ -1583,7 +1602,13 @@ impl eframe::App for RustPaintApp {
         if let Some(position) = history_pick {
             self.go_to_history(position, frame);
         }
-        let input = ui::viewport::show(ui, &mut self.camera, self.view_mode, self.environment);
+        let input = ui::viewport::show(
+            ui,
+            &mut self.camera,
+            self.view_mode,
+            self.environment,
+            self.document.bump_depth_in_model(),
+        );
         self.follow_zoom();
         if let Some((from, to)) = input.paint {
             self.paint(input.rect, from, to, frame);

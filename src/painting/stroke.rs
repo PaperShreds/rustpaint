@@ -1180,6 +1180,10 @@ fn brush_values(brush: &Brush, on_mask: bool) -> Vec<(Plane, [f32; 3])> {
         let metallic = [brush.metallic.clamp(0.0, 1.0); 3];
         values.push((Plane::Channel(Channel::Metallic), metallic));
     }
+    if brush.paint_height {
+        let height = [brush.height.clamp(0.0, 1.0); 3];
+        values.push((Plane::Channel(Channel::Height), height));
+    }
     values
 }
 

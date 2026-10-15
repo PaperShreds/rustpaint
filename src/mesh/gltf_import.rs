@@ -1,5 +1,6 @@
 use super::{
-    Channel, Image, Material, Mesh, SubMesh, Vertex, data_image, linear_to_srgb, srgb_to_linear,
+    Channel, Image, LEVEL, Material, Mesh, SubMesh, Vertex, data_image, linear_to_srgb,
+    srgb_to_linear,
 };
 use glam::{Mat3, Mat4, Vec3};
 use std::path::Path;
@@ -87,6 +88,7 @@ fn convert_material(material: &gltf::Material, images: &[gltf::image::Data]) -> 
         name,
         roughness: channel(1, pbr.roughness_factor()),
         metallic: channel(2, pbr.metallic_factor()),
+        height: data_image(1, 1, LEVEL),
         base_color,
     }
 }

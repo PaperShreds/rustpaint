@@ -85,6 +85,8 @@ pub struct Brush {
     pub roughness: f32,
     pub paint_metallic: bool,
     pub metallic: f32,
+    pub paint_height: bool,
+    pub height: f32,
     /// Measure the brush footprint in screen space instead of along the surface.
     pub screen_space: bool,
     /// Let a stroke continue across hard edges, instead of staying on the
@@ -112,6 +114,8 @@ impl Default for Brush {
             roughness: 0.5,
             paint_metallic: false,
             metallic: 0.0,
+            paint_height: false,
+            height: 0.75,
             screen_space: false,
             paint_over_edges: true,
             keep_size_on_model: false,

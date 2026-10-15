@@ -8,6 +8,7 @@
 pub mod bake;
 pub mod edges;
 pub mod noise;
+pub mod tiling;
 
 use glam::Vec3;
 
@@ -66,16 +67,29 @@ pub enum Pattern {
     EdgeWear,
     /// Light in the model's concave creases, broken up by noise: dirt.
     Cavity,
+    /// Light and dark cubes, alternating.
+    Checker,
+    /// Light lines across an axis, evenly spaced.
+    Stripes,
+    /// Light bricks in dark mortar, each row offset by half a brick.
+    Bricks,
+    /// Light square tiles in dark grout.
+    Tiles,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 6] = [
+    /// In the order of their file numbers: new patterns go at the end.
+    pub const ALL: [Pattern; 10] = [
         Pattern::Value,
         Pattern::Perlin,
         Pattern::Cells,
         Pattern::Gradient,
         Pattern::EdgeWear,
         Pattern::Cavity,
+        Pattern::Checker,
+        Pattern::Stripes,
+        Pattern::Bricks,
+        Pattern::Tiles,
     ];
 
     pub fn name(self) -> &'static str {
@@ -86,6 +100,10 @@ impl Pattern {
             Pattern::Gradient => "Gradient",
             Pattern::EdgeWear => "Edge wear",
             Pattern::Cavity => "Cavity",
+            Pattern::Checker => "Checker",
+            Pattern::Stripes => "Stripes",
+            Pattern::Bricks => "Bricks",
+            Pattern::Tiles => "Tiles",
         }
     }
 
@@ -105,6 +123,31 @@ impl Pattern {
             Pattern::Cavity => Some(edges::Fold::Concave),
             _ => None,
         }
+    }
+
+    /// Whether the pattern is noise, so has detail and a seed.
+    pub fn is_noisy(self) -> bool {
+        matches!(
+            self,
+            Pattern::Value | Pattern::Perlin | Pattern::Cells | Pattern::EdgeWear | Pattern::Cavity
+        )
+    }
+
+    /// Whether the pattern runs along `Generator::axis`.
+    pub fn has_axis(self) -> bool {
+        matches!(
+            self,
+            Pattern::Gradient | Pattern::Stripes | Pattern::Bricks | Pattern::Tiles
+        )
+    }
+
+    /// Whether the pattern is shapes with lines between them (so has a line
+    /// width and a bevel).
+    pub fn is_tiling(self) -> bool {
+        matches!(
+            self,
+            Pattern::Checker | Pattern::Stripes | Pattern::Bricks | Pattern::Tiles
+        )
     }
 }
 
@@ -139,13 +182,15 @@ impl Axis {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Generator {
     pub pattern: Pattern,
-    /// Noise: how many features fit across the model.
+    /// Noise: how many features fit across the model. Shapes: how many fit
+    /// across it, about.
     pub scale: f32,
     /// Noise: how many layers of finer detail are added.
     pub octaves: u32,
     pub seed: u32,
     /// Gradient: the direction it runs in (from 0 at the model's lowest point
-    /// on this axis to 1 at its highest).
+    /// on this axis to 1 at its highest). Stripes run across it; bricks and
+    /// tiles are stacked in rows along it.
     pub axis: Axis,
     /// Edge wear and cavity: how far from an edge or crease it reaches, in
     /// model radii.
@@ -153,6 +198,12 @@ pub struct Generator {
     /// Edge wear and cavity: how much the noise (set by scale, detail and
     /// seed) eats into the pattern, 0 for none.
     pub breakup: f32,
+    /// Stripes: the width of a line, as a fraction of the spacing. Bricks
+    /// and tiles: the width of the mortar, as a fraction of a row's height.
+    pub line_width: f32,
+    /// Shapes: how far the change from light to dark is spread, as a
+    /// fraction of a row (or cell); 0 for a hard edge. A bevel, as a height.
+    pub bevel: f32,
     /// The pattern values that become 0 and 1: raising `low` or lowering
     /// `high` adds contrast; moving them together shifts the threshold.
     pub low: f32,
@@ -170,6 +221,8 @@ impl Default for Generator {
             axis: Axis::default(),
             edge_width: 0.03,
             breakup: 0.4,
+            line_width: 0.1,
+            bevel: 0.05,
             low: 0.0,
             high: 1.0,
             invert: false,
@@ -179,16 +232,21 @@ impl Default for Generator {
 
 impl Generator {
     /// The pattern's value (0..1) at `point`, a position in the model's own
-    /// space that `frame` encloses. `edge_distance` is how far the point is
+    /// space that `frame` encloses, on a surface facing `normal` (a unit
+    /// vector, or zero if unknown). `edge_distance` is how far the point is
     /// from the nearest fold of the kind `Pattern::fold` names (see
     /// `Edges::distance`); only patterns with a fold look at it.
-    pub fn sample(&self, point: Vec3, frame: &Frame, edge_distance: f32) -> f32 {
-        let noise_at = |base: fn(Vec3, u32) -> f32| {
-            // Measured in model-radius units, so scale 1 is about one
-            // feature across the whole model.
-            let local = (point - frame.center()) / frame.radius() * self.scale;
-            noise::fractal(base, local, self.octaves, self.seed)
-        };
+    pub fn sample(&self, point: Vec3, normal: Vec3, frame: &Frame, edge_distance: f32) -> f32 {
+        // Measured in model-radius units, so scale 1 is about one feature
+        // across the whole model.
+        let local = (point - frame.center()) / frame.radius() * self.scale;
+        let noise_at =
+            |base: fn(Vec3, u32) -> f32| noise::fractal(base, local, self.octaves, self.seed);
+        let (axis, line, bevel) = (
+            self.axis as usize,
+            self.line_width.clamp(0.0, 1.0),
+            self.bevel.max(0.0),
+        );
         let raw = match self.pattern {
             Pattern::EdgeWear | Pattern::Cavity => {
                 let width = (self.edge_width * frame.radius()).max(1e-6);
@@ -205,6 +263,10 @@ impl Generator {
                     0.0
                 }
             }
+            Pattern::Checker => tiling::checker(local, normal, bevel),
+            Pattern::Stripes => tiling::stripes(local, normal, axis, line, bevel),
+            Pattern::Bricks => tiling::blocks(local, normal, axis, 2.0, 0.5, line, bevel),
+            Pattern::Tiles => tiling::blocks(local, normal, axis, 1.0, 0.0, line, bevel),
             noise_pattern => noise_at(match noise_pattern {
                 Pattern::Value => noise::value,
                 Pattern::Cells => noise::cells,
@@ -351,15 +413,16 @@ impl Recipe {
             .any(|generator| generator.pattern.fold() == Some(fold))
     }
 
-    /// The value (0..1) at `point`; `near` is how far it is from the nearest
-    /// convex edge and the nearest crease (see `Generator::sample`).
-    pub fn sample(&self, point: Vec3, frame: &Frame, near: [f32; 2]) -> f32 {
+    /// The value (0..1) at `point` on a surface facing `normal`; `near` is
+    /// how far it is from the nearest convex edge and the nearest crease
+    /// (see `Generator::sample`).
+    pub fn sample(&self, point: Vec3, normal: Vec3, frame: &Frame, near: [f32; 2]) -> f32 {
         let value = |generator: &Generator| {
             let distance = generator
                 .pattern
                 .fold()
                 .map_or(f32::INFINITY, |fold| near[fold as usize]);
-            generator.sample(point, frame, distance)
+            generator.sample(point, normal, frame, distance)
         };
         self.steps().fold(value(&self.base), |below, step| {
             let combined = step.op.apply(below, value(&step.generator));
@@ -385,15 +448,15 @@ mod tests {
             ..Generator::default()
         };
         assert_eq!(
-            generator.sample(Vec3::new(0.0, 0.0, 0.0), &FRAME, f32::INFINITY),
+            generator.sample(Vec3::new(0.0, 0.0, 0.0), Vec3::ZERO, &FRAME, f32::INFINITY),
             0.0
         );
         assert_eq!(
-            generator.sample(Vec3::new(9.0, 2.0, 0.0), &FRAME, f32::INFINITY),
+            generator.sample(Vec3::new(9.0, 2.0, 0.0), Vec3::ZERO, &FRAME, f32::INFINITY),
             0.5
         );
         assert_eq!(
-            generator.sample(Vec3::new(0.0, 4.0, 0.0), &FRAME, f32::INFINITY),
+            generator.sample(Vec3::new(0.0, 4.0, 0.0), Vec3::ZERO, &FRAME, f32::INFINITY),
             1.0
         );
         let inverted = Generator {
@@ -401,7 +464,7 @@ mod tests {
             ..generator
         };
         assert_eq!(
-            inverted.sample(Vec3::new(0.0, 4.0, 0.0), &FRAME, f32::INFINITY),
+            inverted.sample(Vec3::new(0.0, 4.0, 0.0), Vec3::ZERO, &FRAME, f32::INFINITY),
             0.0
         );
     }
@@ -418,8 +481,8 @@ mod tests {
         for i in 0..400 {
             let p = Vec3::new(i as f32 * 0.031, i as f32 * 0.017, i as f32 * 0.009);
             let (a, b) = (
-                soft.sample(p, &FRAME, f32::INFINITY),
-                hard.sample(p, &FRAME, f32::INFINITY),
+                soft.sample(p, Vec3::ZERO, &FRAME, f32::INFINITY),
+                hard.sample(p, Vec3::ZERO, &FRAME, f32::INFINITY),
             );
             assert!((0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b));
             if b == 0.0 || b == 1.0 {
@@ -439,8 +502,8 @@ mod tests {
         for i in 0..50 {
             let p = Vec3::new(i as f32 * 0.03, i as f32 * 0.05, i as f32 * 0.01);
             let (a, b) = (
-                generator.sample(p, &FRAME, f32::INFINITY),
-                generator.sample(p * 10.0, &big, f32::INFINITY),
+                generator.sample(p, Vec3::ZERO, &FRAME, f32::INFINITY),
+                generator.sample(p * 10.0, Vec3::ZERO, &big, f32::INFINITY),
             );
             assert!((a - b).abs() < 1e-4, "{a} vs {b}");
         }
@@ -471,8 +534,8 @@ mod tests {
         let (mut cut, mut equal) = (0, 0);
         for i in 0..400 {
             let p = Vec3::new(i as f32 * 0.031, i as f32 * 0.017, i as f32 * 0.009);
-            let alone = Recipe::from(blotches).sample(p, &FRAME, none);
-            let combined = recipe.sample(p, &FRAME, none);
+            let alone = Recipe::from(blotches).sample(p, Vec3::ZERO, &FRAME, none);
+            let combined = recipe.sample(p, Vec3::ZERO, &FRAME, none);
             assert!(combined <= alone + 1e-6, "multiplying never adds");
             if combined < alone - 0.01 {
                 cut += 1;
@@ -509,14 +572,32 @@ mod tests {
             )
         };
         // Base 1, step 0 (the inverted gradient).
-        assert_eq!(make(Op::Multiply, 1.0).sample(at, &FRAME, near), 0.0);
-        assert_eq!(make(Op::Add, 1.0).sample(at, &FRAME, near), 1.0);
-        assert_eq!(make(Op::Subtract, 1.0).sample(at, &FRAME, near), 1.0);
-        assert_eq!(make(Op::Darker, 1.0).sample(at, &FRAME, near), 0.0);
-        assert_eq!(make(Op::Lighter, 1.0).sample(at, &FRAME, near), 1.0);
+        assert_eq!(
+            make(Op::Multiply, 1.0).sample(at, Vec3::ZERO, &FRAME, near),
+            0.0
+        );
+        assert_eq!(make(Op::Add, 1.0).sample(at, Vec3::ZERO, &FRAME, near), 1.0);
+        assert_eq!(
+            make(Op::Subtract, 1.0).sample(at, Vec3::ZERO, &FRAME, near),
+            1.0
+        );
+        assert_eq!(
+            make(Op::Darker, 1.0).sample(at, Vec3::ZERO, &FRAME, near),
+            0.0
+        );
+        assert_eq!(
+            make(Op::Lighter, 1.0).sample(at, Vec3::ZERO, &FRAME, near),
+            1.0
+        );
         // Half the amount: halfway between the base and the combined result.
-        assert_eq!(make(Op::Multiply, 0.5).sample(at, &FRAME, near), 0.5);
-        assert_eq!(make(Op::Multiply, 0.0).sample(at, &FRAME, near), 1.0);
+        assert_eq!(
+            make(Op::Multiply, 0.5).sample(at, Vec3::ZERO, &FRAME, near),
+            0.5
+        );
+        assert_eq!(
+            make(Op::Multiply, 0.0).sample(at, Vec3::ZERO, &FRAME, near),
+            1.0
+        );
     }
 
     #[test]

@@ -722,12 +722,12 @@ mod tests {
                 pixel.copy_from_slice(&[20, 220, 90, 160]);
             }
         }
-        document.layers[1].textures[0] = [Some(paint.clone()), Some(paint), None, None];
+        document.layers[1].textures[0] = [Some(paint.clone()), Some(paint), None, None, None];
         document.layers[1].opacity = 0.6;
         let top = document.layers.len();
         document.insert_new_layer(top);
         let wash = Image::filled(width, height, [10, 10, 250, 60]);
-        document.layers[2].textures[0] = [Some(wash.clone()), Some(wash), None, None];
+        document.layers[2].textures[0] = [Some(wash.clone()), Some(wash), None, None, None];
         // Layer 1 has a painted mask (a gradient across), layer 2 one that
         // was never painted (the same value everywhere).
         document.set_mask(1, Some(255)).unwrap();
