@@ -217,15 +217,21 @@ impl Bake {
                     value(nx, ny)
                 }
             };
-            // Sobel: the slope per texel, smoothed across, so 8-bit steps
-            // don't show as stripes. Opposite texels are subtracted first,
-            // so level ground gives exactly zero.
-            let slope_x =
-                ((at(1, -1) - at(-1, -1)) + 2.0 * (at(1, 0) - at(-1, 0)) + (at(1, 1) - at(-1, 1)))
-                    / 8.0;
-            let slope_y =
-                ((at(-1, 1) - at(-1, -1)) + 2.0 * (at(0, 1) - at(0, -1)) + (at(1, 1) - at(1, -1)))
-                    / 8.0;
+            // The slope per texel of the heights smoothed by a cubic B-spline,
+            // as the viewport takes it (`height_slope` in mesh.wgsl), at this
+            // texel's centre: half the step across it along, weighted 1 4 1
+            // over 6 across. Steps between texels are taken first, so level
+            // ground gives exactly zero.
+            let along = |step: &dyn Fn(i64) -> f32| (step(1) - step(-1)) / 2.0;
+            let slope = |sample: &dyn Fn(i64, i64) -> f32| {
+                [(-1, 1.0), (0, 4.0), (1, 1.0)]
+                    .iter()
+                    .map(|&(across, weight)| weight * along(&|step| sample(step, across)))
+                    .sum::<f32>()
+                    / 6.0
+            };
+            let slope_x = slope(&|step, across| at(step, across));
+            let slope_y = slope(&|step, across| at(across, step));
             // Per UV unit, then per model unit along the surface.
             let per_u = slope_x * self.width as f32 / along_u;
             let per_v = slope_y * self.height as f32 / along_v;

@@ -43,10 +43,59 @@ fn sample_channel(texture: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
     return select(texel.rgb / texel.a, vec3<f32>(0.0), texel.a <= 0.0);
 }
 
-// The straight height at `uv`, `offset` texels away, from mip `level`.
-fn height_at(uv: vec2<f32>, offset: vec2<f32>, texel: vec2<f32>, level: f32) -> f32 {
-    let t = textureSampleLevel(height_texture, material_sampler, uv + offset * texel, level);
+// The straight height of texel `at` in mip `level` (the texture repeats).
+fn texel_height(at: vec2<i32>, size: vec2<i32>, level: i32) -> f32 {
+    let t = textureLoad(height_texture, ((at % size) + size) % size, level);
     return select(t.r / t.a, 0.5, t.a <= 0.0);
+}
+
+// Cubic B-spline weights of the four texels around a position `f` of the
+// way between the middle two.
+fn cubic_weights(f: f32) -> vec4<f32> {
+    let f2 = f * f;
+    let f3 = f2 * f;
+    return vec4<f32>(
+        (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0,
+        (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0,
+        (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0,
+        f3 / 6.0,
+    );
+}
+
+// Weights of the three steps between those texels in the cubic's slope.
+fn slope_weights(f: f32) -> vec3<f32> {
+    return vec3<f32>((1.0 - f) * (1.0 - f), 1.0 + 2.0 * f - 2.0 * f * f, f * f) * 0.5;
+}
+
+// The slope (per UV unit, along u and v) of the heights in mip `level`
+// smoothed by a cubic B-spline: it changes gently from texel to texel, so
+// magnified bumps look round instead of faceted. Exact texels and steps
+// between them rather than filtered taps, so level ground gives exactly
+// zero instead of the filtering's rounding noise.
+fn height_slope(uv: vec2<f32>, level: i32) -> vec2<f32> {
+    let size_i = vec2<i32>(textureDimensions(height_texture, level));
+    let size = vec2<f32>(size_i);
+    let p = uv * size - 0.5;
+    let first = vec2<i32>(floor(p)) - 1;
+    let f = p - floor(p);
+    var h: array<array<f32, 4>, 4>;
+    for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+            h[y][x] = texel_height(first + vec2<i32>(x, y), size_i, level);
+        }
+    }
+    let across_u = cubic_weights(f.y);
+    let across_v = cubic_weights(f.x);
+    let along_u = slope_weights(f.x);
+    let along_v = slope_weights(f.y);
+    var slope = vec2<f32>(0.0);
+    for (var a = 0; a < 4; a++) {
+        for (var b = 0; b < 3; b++) {
+            slope.x += across_u[a] * along_u[b] * (h[a][b + 1] - h[a][b]);
+            slope.y += across_v[a] * along_v[b] * (h[b + 1][a] - h[b][a]);
+        }
+    }
+    return slope * size;
 }
 
 // The surface normal bent by the bumps of the height channel, using the
@@ -66,22 +115,10 @@ fn bumped_normal(in: VertexOutput) -> vec3<f32> {
     let size = vec2<f32>(textureDimensions(height_texture));
     let footprint = max(length(duv_x * size), length(duv_y * size));
     let top = f32(textureNumLevels(height_texture) - 1u);
-    let level = clamp(log2(max(footprint, 1.0)), 0.0, top);
-    let texel = exp2(floor(level)) / size;
-    // Sobel: slopes per UV unit, smoothed across.
-    let h = array<f32, 9>(
-        height_at(in.uv, vec2(-1.0, -1.0), texel, level),
-        height_at(in.uv, vec2(0.0, -1.0), texel, level),
-        height_at(in.uv, vec2(1.0, -1.0), texel, level),
-        height_at(in.uv, vec2(-1.0, 0.0), texel, level),
-        0.0,
-        height_at(in.uv, vec2(1.0, 0.0), texel, level),
-        height_at(in.uv, vec2(-1.0, 1.0), texel, level),
-        height_at(in.uv, vec2(0.0, 1.0), texel, level),
-        height_at(in.uv, vec2(1.0, 1.0), texel, level),
-    );
-    let slope_u = ((h[2] - h[0]) + 2.0 * (h[5] - h[3]) + (h[8] - h[6])) / (8.0 * texel.x);
-    let slope_v = ((h[6] - h[0]) + 2.0 * (h[7] - h[1]) + (h[8] - h[2])) / (8.0 * texel.y);
+    let level = i32(clamp(log2(max(footprint, 1.0)), 0.0, top));
+    let slope = height_slope(in.uv, level);
+    let slope_u = slope.x;
+    let slope_v = slope.y;
     // How u and v change across the surface, from their screen derivatives.
     let r1 = cross(dp_y, n);
     let r2 = cross(n, dp_x);

@@ -899,6 +899,13 @@ impl RustPaintApp {
                     self.opacity_drag = Some((id, before));
                 }
             }
+            LayerAction::TextureSize { material, size } => {
+                if let Some(change) = self.document.resize_slot(material, size, size) {
+                    let name = &self.document.mesh.materials[material].name;
+                    let label = format!("Texture size of {name} to {size}");
+                    self.commit(label, change, frame);
+                }
+            }
             LayerAction::BumpDepth { value, done } => {
                 // Like opacity: live while dragging, one undo step at the end.
                 let before = self.bump_drag.take().unwrap_or(self.document.bump_depth);

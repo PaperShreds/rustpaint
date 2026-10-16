@@ -35,6 +35,9 @@ quick results such as rust and dirt.
 - **Bumps from height:** paint or fill height (0.5 is level) to raise and sink
   the surface. The viewport shades the bumps, and they export as a normal map.
   The bump depth is set on the Base layer.
+- **Texture size** per material, from 256 to 8192, also on the Base layer:
+  lower for low-poly work or to save memory, higher for detail. Painted layers
+  are resampled; patterns and fills are made again at the new size.
 - **Layers** with opacity, blend modes (Normal, Multiply, Screen, Overlay,
   Darken, Lighten, Add) and per-material-slot targets, composited on the GPU.
   The model's own textures stay untouched as the base layer.

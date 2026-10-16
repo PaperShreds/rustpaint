@@ -309,6 +309,17 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
     let Some(viewport) = renderer.callback_resources.get_mut::<ViewportRenderer>() else {
         return;
     };
+    if dirty.iter().any(|change| matches!(change, Dirty::Resized)) {
+        // New sizes need new textures: start the slots afresh.
+        viewport.materials = create_gpu_materials(
+            render_state,
+            &viewport.compositor,
+            &viewport.material_layout,
+            &viewport.sampler,
+            document,
+        );
+        return;
+    }
     let compositor = &viewport.compositor;
     let (device, queue) = (&render_state.device, &render_state.queue);
 
@@ -405,7 +416,7 @@ pub fn apply_changes(render_state: &egui_wgpu::RenderState, document: &Document,
                     touched.insert((*material, *channel));
                 }
             }
-            Dirty::Layers | Dirty::Mask { .. } | Dirty::Generated { .. } => {
+            Dirty::Layers | Dirty::Mask { .. } | Dirty::Generated { .. } | Dirty::Resized => {
                 for material in 0..viewport.materials.len() {
                     touched.extend(Channel::ALL.map(|channel| (material, channel)));
                 }

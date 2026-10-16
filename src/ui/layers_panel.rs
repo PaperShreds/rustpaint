@@ -71,6 +71,11 @@ pub enum LayerAction {
         value: f32,
         done: bool,
     },
+    /// Make a material slot's textures `size` x `size`.
+    TextureSize {
+        material: usize,
+        size: u32,
+    },
 }
 
 /// UI state that lives between frames.
@@ -121,7 +126,7 @@ pub fn show(
                     super::fit_widths(ui);
                     details(ui, current, selected, state, &mut actions);
                     if current.is_base() {
-                        model_settings(ui, document.bump_depth, &mut actions);
+                        model_settings(ui, document, &mut actions);
                     }
                 });
         });
@@ -193,11 +198,53 @@ fn details(
     settings(ui, current, selected, state, actions);
 }
 
+/// Texture sizes offered, in texels along each side.
+const TEXTURE_SIZES: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
+
 /// Settings of the whole model, shown with the base layer.
-fn model_settings(ui: &mut egui::Ui, bump_depth: f32, actions: &mut Vec<LayerAction>) {
+fn model_settings(ui: &mut egui::Ui, document: &Document, actions: &mut Vec<LayerAction>) {
     ui.separator();
     ui.strong("Model");
-    let mut value = bump_depth;
+    let several = document.mesh.materials.len() > 1;
+    for (material, (width, height)) in document.slot_sizes().into_iter().enumerate() {
+        let label = if several {
+            format!("{} size", document.mesh.materials[material].name)
+        } else {
+            "Texture size".to_string()
+        };
+        let current = if width == height {
+            width.to_string()
+        } else {
+            format!("{width} x {height}")
+        };
+        ui.push_id(("texture_size", material), |ui| {
+            egui::ComboBox::from_label(label)
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for size in TEXTURE_SIZES {
+                        let chosen = (width, height) == (size, size);
+                        let mut option = ui.selectable_label(chosen, size.to_string());
+                        if size >= 4096 {
+                            let megabytes = (size as u64 * size as u64 * 4) >> 20;
+                            option = option.on_hover_text(format!(
+                                "Slow to paint, and every painted channel of every layer \
+                                 takes {megabytes} MB"
+                            ));
+                        }
+                        if option.clicked() && !chosen {
+                            actions.push(LayerAction::TextureSize { material, size });
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How many texels the textures have on each side: the model's own \
+                     and every layer's. Lower is blockier but lighter and faster; \
+                     painted layers are resampled.",
+                );
+        });
+    }
+    let mut value = document.bump_depth;
     let slider = ui
         .add(
             egui::Slider::new(&mut value, 0.0..=MAX_BUMP_DEPTH)

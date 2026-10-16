@@ -254,6 +254,54 @@ pub fn resize(image: &Image, width: u32, height: u32) -> Image {
     }
 }
 
+/// Resamples an image that may be partly transparent (a layer's paint) to a
+/// new size. Blends with premultiplied alpha, so the colour of transparent
+/// pixels doesn't bleed into the edges of the paint.
+pub fn resize_premultiplied(image: &Image, width: u32, height: u32) -> Image {
+    let premultiplied: Vec<f32> = image
+        .rgba
+        .chunks_exact(4)
+        .flat_map(|pixel| {
+            let alpha = pixel[3] as f32 / 255.0;
+            [0, 1, 2]
+                .map(|c| pixel[c] as f32 / 255.0 * alpha)
+                .into_iter()
+                .chain([alpha])
+        })
+        .collect();
+    let Some(source) = ::image::Rgba32FImage::from_raw(image.width, image.height, premultiplied)
+    else {
+        return Image::filled(width, height, [0, 0, 0, 0]);
+    };
+    let resized = ::image::imageops::resize(
+        &source,
+        width,
+        height,
+        ::image::imageops::FilterType::Triangle,
+    );
+    let rgba = resized
+        .pixels()
+        .flat_map(|pixel| {
+            let [r, g, b, a] = pixel.0;
+            let straight = |c: f32| {
+                let value = if a > 1e-6 { c / a } else { 0.0 };
+                (value.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            let alpha = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
+            if alpha == 0 {
+                [0; 4]
+            } else {
+                [straight(r), straight(g), straight(b), alpha]
+            }
+        })
+        .collect();
+    Image {
+        width,
+        height,
+        rgba,
+    }
+}
+
 /// A range of indices drawn with one material.
 #[derive(Clone)]
 pub struct SubMesh {
@@ -310,4 +358,33 @@ pub fn linear_to_srgb(linear: f32) -> u8 {
         1.055 * c.powf(1.0 / 2.4) - 0.055
     };
     (s * 255.0).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampled_paint_keeps_its_colour_at_the_edges() {
+        // Opaque red on the left, clear (black, transparent) on the right.
+        let mut paint = Image::filled(8, 8, [0, 0, 0, 0]);
+        for (index, pixel) in paint.rgba.chunks_exact_mut(4).enumerate() {
+            if index % 8 < 4 {
+                pixel.copy_from_slice(&[255, 0, 0, 255]);
+            }
+        }
+        for size in [3, 5, 16, 32] {
+            let resized = resize_premultiplied(&paint, size, size);
+            assert_eq!(resized.rgba.len(), (size * size * 4) as usize);
+            let mut partly = 0;
+            for pixel in resized.rgba.chunks_exact(4) {
+                if pixel[3] > 0 {
+                    // No dark fringe where it fades out.
+                    assert_eq!(&pixel[..3], &[255, 0, 0], "{size}: {pixel:?}");
+                    partly += (pixel[3] < 255) as usize;
+                }
+            }
+            assert!(partly > 0 || size < 8, "{size}: the edge should blend");
+        }
+    }
 }

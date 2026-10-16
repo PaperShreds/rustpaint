@@ -396,6 +396,35 @@ pub enum Change {
     },
     /// Swap the document's bump depth with the stored one.
     BumpDepth(f32),
+    /// Swap every image of a material slot (the model's own and each
+    /// layer's) with the stored ones, which may be of another size.
+    Resize {
+        material: usize,
+        images: Box<SlotImages>,
+    },
+}
+
+/// Every image of one material slot, all of one size.
+pub struct SlotImages {
+    /// The model's own textures, by `Channel::index`.
+    material: [Image; Channel::COUNT],
+    /// Each layer's images on the slot, by layer id. Images a layer makes
+    /// from its settings may be missing: they are made again.
+    layers: Vec<(u64, [Option<Image>; Plane::COUNT])>,
+}
+
+impl SlotImages {
+    fn bytes(&self) -> usize {
+        let layers = self
+            .layers
+            .iter()
+            .flat_map(|(_, planes)| planes.iter().flatten());
+        self.material
+            .iter()
+            .chain(layers)
+            .map(|i| i.rgba.len())
+            .sum()
+    }
 }
 
 impl Change {
@@ -407,6 +436,7 @@ impl Change {
                 ..
             } => layer.bytes(),
             Change::Mask { images, .. } => images.iter().flatten().map(|i| i.rgba.len()).sum(),
+            Change::Resize { images, .. } => images.bytes(),
             _ => 0,
         }
     }
@@ -427,6 +457,8 @@ pub enum Dirty {
     Mask { layer: u64 },
     /// The images of a procedural layer were remade, all of its planes.
     Generated { layer: u64 },
+    /// A material slot's textures changed size.
+    Resized,
 }
 
 pub struct Document {
@@ -762,7 +794,85 @@ impl Document {
                 std::mem::swap(&mut self.bump_depth, depth);
                 None
             }
+            Change::Resize { material, images } => {
+                let slot = *material;
+                let target = self.mesh.materials.get_mut(slot)?;
+                for channel in Channel::ALL {
+                    std::mem::swap(
+                        target.channel_mut(channel),
+                        &mut images.material[channel.index()],
+                    );
+                }
+                for layer in self.layers.iter_mut().filter(|layer| !layer.is_base()) {
+                    let Some(planes) = layer.textures.get_mut(slot) else {
+                        continue;
+                    };
+                    match images.layers.iter_mut().find(|(id, _)| *id == layer.id) {
+                        Some((_, stored)) => std::mem::swap(planes, stored),
+                        // Not there when the change was made: its images can't be kept.
+                        None => *planes = Default::default(),
+                    }
+                }
+                // Made from settings: remake what is missing or of the old size.
+                let remake = Remake {
+                    only_missing: true,
+                    ..Remake::ALL
+                };
+                for index in 1..self.layers.len() {
+                    if self.layers[index].is_procedural() {
+                        self.regenerate(index, remake);
+                    }
+                }
+                // Bakes of the old size won't be needed until an undo.
+                let size = self.slot_sizes()[slot];
+                self.bakes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|&(at, width, height), _| at != slot || (width, height) == size);
+                Some(Dirty::Resized)
+            }
         }
+    }
+
+    /// The change that gives material slot `material` textures of `width`
+    /// x `height`: the model's own and every layer's, resampled. `None` if
+    /// they already are that size (or there is no such slot).
+    pub fn resize_slot(&self, material: usize, width: u32, height: u32) -> Option<Change> {
+        let current = self.mesh.materials.get(material)?;
+        if (current.base_color.width, current.base_color.height) == (width, height)
+            || width == 0
+            || height == 0
+        {
+            return None;
+        }
+        let resized = |image: &Image| crate::mesh::resize_premultiplied(image, width, height);
+        let layers = self
+            .layers
+            .iter()
+            .filter(|layer| !layer.is_base())
+            .filter_map(|layer| {
+                let planes = layer.textures.get(material)?;
+                let made = |plane: Plane| match plane {
+                    Plane::Channel(_) => layer.fill.is_some(),
+                    Plane::Mask => layer.mask_generator.is_some(),
+                };
+                let images = std::array::from_fn(|index| {
+                    let plane = Plane::ALL[index];
+                    planes[index]
+                        .as_ref()
+                        .filter(|_| !made(plane))
+                        .map(&resized)
+                });
+                Some((layer.id, images))
+            })
+            .collect();
+        Some(Change::Resize {
+            material,
+            images: Box::new(SlotImages {
+                material: Channel::ALL.map(|channel| resized(current.channel(channel))),
+                layers,
+            }),
+        })
     }
 
     /// Where each texel of material slot `slot` is on the model.
@@ -1249,6 +1359,89 @@ mod tests {
         document.layers[layer].textures[0][Plane::Mask.index()]
             .as_ref()
             .map(|image| image.rgba.clone())
+    }
+
+    #[test]
+    fn resizing_a_slot_resamples_paint_remakes_patterns_and_undoes_exactly() {
+        let mut document = Document::new(primitives::cube());
+        let (width, height) = document.slot_sizes()[0];
+        // Painted: the left half red.
+        let mut paint = Image::filled(width, height, CLEAR);
+        for (index, pixel) in paint.rgba.chunks_exact_mut(4).enumerate() {
+            if (index as u32 % width) < width / 2 {
+                pixel.copy_from_slice(&[255, 0, 0, 255]);
+            }
+        }
+        document.layers[1].textures[0][Channel::BaseColor.index()] = Some(paint.clone());
+        // Made from settings: a fill with a generated mask.
+        let fill = document.new_fill_layer(FillValues::default());
+        let mut add = Change::Layer {
+            index: 2,
+            stored: Some(fill),
+        };
+        document.apply(&mut add).unwrap();
+        document.set_mask(2, Some(255)).unwrap();
+        let mut props = document.layers[2].props();
+        props.generator = Some(Generator::default().into());
+        let id = document.layers[2].id;
+        document
+            .apply(&mut Change::Props { layer: id, props })
+            .unwrap();
+        let before: Vec<_> = Plane::ALL
+            .map(|plane| document.layers[2].textures[0][plane.index()].clone())
+            .into_iter()
+            .map(|image| image.map(|image| image.rgba))
+            .collect();
+
+        let mut change = document.resize_slot(0, 256, 256).unwrap();
+        assert!(
+            document.resize_slot(0, width, height).is_none(),
+            "already that size"
+        );
+        document.apply(&mut change).unwrap();
+        assert_eq!(document.slot_sizes()[0], (256, 256));
+        for channel in Channel::ALL {
+            let image = document.mesh.materials[0].channel(channel);
+            assert_eq!((image.width, image.height), (256, 256));
+        }
+        for layer in &document.layers[1..] {
+            for image in layer.textures[0].iter().flatten() {
+                assert_eq!((image.width, image.height), (256, 256), "{}", layer.name);
+            }
+        }
+        // The paint still covers the left half, in its own colour.
+        let red = document.layers[1].textures[0][Channel::BaseColor.index()]
+            .as_ref()
+            .unwrap();
+        assert_eq!(&red.rgba[..4], &[255, 0, 0, 255]);
+        assert_eq!(red.rgba[(255 * 4 + 3) as usize], 0, "right edge clear");
+        // The pattern was made again at the new size, not stretched.
+        let mask = document.layers[2].textures[0][Plane::Mask.index()]
+            .as_ref()
+            .unwrap();
+        let bake = document.bake(0).unwrap();
+        assert_eq!(
+            mask.rgba.len(),
+            bake.generate(&Generator::default()).len() * 4
+        );
+        let composite = document.composite(0, Channel::BaseColor).unwrap();
+        assert_eq!((composite.width, composite.height), (256, 256));
+
+        // Undo gives back the very same pixels, and redo the new ones.
+        document.apply(&mut change).unwrap();
+        assert_eq!(document.slot_sizes()[0], (width, height));
+        let restored = document.layers[1].textures[0][Channel::BaseColor.index()]
+            .as_ref()
+            .unwrap();
+        assert_eq!(restored.rgba, paint.rgba, "painted layer restored");
+        let after: Vec<_> = Plane::ALL
+            .map(|plane| document.layers[2].textures[0][plane.index()].clone())
+            .into_iter()
+            .map(|image| image.map(|image| image.rgba))
+            .collect();
+        assert_eq!(after, before);
+        document.apply(&mut change).unwrap();
+        assert_eq!(document.slot_sizes()[0], (256, 256));
     }
 
     #[test]
